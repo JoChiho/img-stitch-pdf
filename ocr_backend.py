@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""OCR backends: PaddleOCR (default) with EasyOCR fallback."""
+"""OCR backends: PaddleOCR (default) with EasyOCR fallback.
+
+On Windows, never ``import paddle`` before ``paddleocr``/``torch`` in the
+same process: paddle DLLs commonly break torch ``shm.dll`` (EasyOCR).
+Availability probes for the Paddle stack must use pip metadata, not import.
+"""
 
 from __future__ import annotations
 
@@ -75,6 +80,9 @@ def _distribution_installed(dist_name: str) -> bool:
 
 
 def _module_importable(name: str) -> bool:
+    """Try a real import. Prefer ``_distribution_installed`` / ``paddle_stack_missing``
+    for Paddle availability on Windows (importing paddle poisons torch/EasyOCR).
+    """
     if name in ("paddle", "paddleocr"):
         apply_paddle_windows_quirks()
     try:
@@ -214,9 +222,11 @@ def get_easyocr_reader(languages: Optional[Sequence[str]] = None):
         return _easyocr_reader
     try:
         import easyocr
-    except ImportError as e:
+    except Exception as e:
+        # ImportError or OSError (torch shm.dll after paddle on Windows)
         raise ImportError(
-            "easyocr is required (auto-install should have run)."
+            "easyocr is unavailable (optional when using PaddleOCR). "
+            f"Underlying error: {type(e).__name__}: {e}"
         ) from e
     langs = list(languages) if languages else ["en"]
     _easyocr_reader = easyocr.Reader(langs, gpu=False, verbose=False)
@@ -423,8 +433,15 @@ def preload_ocr(
             _msg(
                 f"PaddleOCR preload failed, falling back to EasyOCR: {e}"
             )
-            get_easyocr_reader(["en"])
-            return "easyocr(fallback)"
+            try:
+                get_easyocr_reader(["en"])
+                return "easyocr(fallback)"
+            except Exception as e2:
+                # Torch/EasyOCR often broken after paddle DLL load on Windows.
+                raise RuntimeError(
+                    "PaddleOCR preload failed and EasyOCR fallback unavailable.\n"
+                    f"Paddle: {e}\nEasyOCR: {e2}"
+                ) from e2
     _msg("Loading EasyOCR models (first run downloads)...")
     get_easyocr_reader(["en"])
     return "easyocr"

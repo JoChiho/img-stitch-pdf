@@ -833,16 +833,13 @@ def check_deps() -> dict:
         "ocr_engine": get_ocr_engine(),
         "cjk_font": find_cjk_font() is not None,
     }
-    # Prefer metadata probes (avoid fatal torch DLL loads on Windows)
+    # Prefer metadata probes (avoid loading paddle/torch DLLs on Windows).
+    # Importing paddle before torch breaks torch shm.dll; importing easyocr
+    # pulls torch. Distribution metadata is enough for availability checks.
     try:
         info["paddlepaddle"] = _ocr_backend._distribution_installed("paddlepaddle")
         info["paddleocr"] = _ocr_backend._distribution_installed("paddleocr")
-    except Exception:
-        pass
-    try:
-        import easyocr  # noqa: F401
-
-        info["easyocr"] = True
+        info["easyocr"] = _ocr_backend._distribution_installed("easyocr")
     except Exception:
         pass
     try:
@@ -862,14 +859,22 @@ def check_deps() -> dict:
 
 
 
+# Default translate export needs Paddle + Argos. EasyOCR is optional fallback
+# (torch); do not require it when paddle works — on Windows, importing paddle
+# before torch breaks torch DLLs, so probing easyocr via import is unsafe.
+EASYOCR_PIP_SPEC = ("easyocr", "easyocr>=1.7.0")
 REQUIRED_PIP_SPECS = (
     ("paddleocr", PADDLEOCR_SPEC),
-    ("easyocr", "easyocr>=1.7.0"),
     ("argostranslate", "argostranslate>=1.9.0"),
 )
 
 
 def _module_importable(name: str) -> bool:
+    """True if ``import name`` succeeds.
+
+    Avoid calling this for ``paddle`` before ``paddleocr``/``easyocr`` on
+    Windows: loading paddle first commonly breaks torch ``shm.dll``.
+    """
     if name in ("paddle", "paddleocr"):
         try:
             _ocr_backend.apply_paddle_windows_quirks()
@@ -882,21 +887,38 @@ def _module_importable(name: str) -> bool:
         return False
 
 
+def _paddle_stack_ready() -> bool:
+    """True when paddlepaddle + paddleocr distributions are installed."""
+    return not _ocr_backend.paddle_stack_missing()
+
+
 def missing_pip_packages(
     packages: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> List[Tuple[str, str]]:
-    """Return ``(import_name, pip_spec)`` pairs that fail to import.
+    """Return ``(import_name, pip_spec)`` pairs that still need installing.
 
-    When using the default list, missing ``paddle`` is reported ahead of
-    ``paddleocr`` (Paddle stack).
+    Paddle stack and EasyOCR are probed via pip *metadata* (not ``import``) so
+    we never load paddle DLLs before torch / EasyOCR on Windows. When using the
+    default list, missing ``paddle`` is reported ahead of ``paddleocr``.
+    EasyOCR is only required when the selected OCR engine is ``easyocr``.
     """
     pkgs = list(packages) if packages is not None else list(REQUIRED_PIP_SPECS)
+    if packages is None and get_ocr_engine() == "easyocr":
+        if EASYOCR_PIP_SPEC not in pkgs:
+            pkgs.append(EASYOCR_PIP_SPEC)
     missing: List[Tuple[str, str]] = []
-    need_paddle = packages is None or any(n in ("paddle", "paddleocr") for n, _ in pkgs)
-    if need_paddle and not _module_importable("paddle"):
-        missing.append(("paddle", PADDLEPADDLE_SPEC))
+    need_paddle = packages is None or any(
+        n in ("paddle", "paddleocr") for n, _ in pkgs
+    )
+    if need_paddle:
+        # Metadata only — never ``import paddle`` here (DLL clash with torch).
+        missing.extend(_ocr_backend.paddle_stack_missing())
     for name, spec in pkgs:
-        if name == "paddle":
+        if name in ("paddle", "paddleocr"):
+            continue
+        if name == "easyocr":
+            if not _ocr_backend._distribution_installed("easyocr"):
+                missing.append((name, spec))
             continue
         if not _module_importable(name):
             missing.append((name, spec))
@@ -934,6 +956,10 @@ def ensure_deps(
         for n, s in missing_pip_packages(packages)
         if n not in ("paddle", "paddleocr")
     ]
+    # Default OCR is paddle: EasyOCR is optional. Skip soft-missing easyocr when
+    # paddle stack is present so translate export does not need torch/easyocr.
+    if _paddle_stack_ready() and get_ocr_engine() != "easyocr":
+        missing = [(n, s) for n, s in missing if n != "easyocr"]
     if not missing:
         _msg("翻译依赖已就绪")
         ok_o, note_o = ensure_ollama(progress_callback=progress_callback)
@@ -987,11 +1013,28 @@ def ensure_deps(
     ]
     if still:
         still_names = ", ".join(n for n, _ in still)
-        raise RuntimeError(
-            f"pip 已运行但仍无法导入: {still_names}\n"
-            f"解释器: {py}\n"
-            f"请重启应用后再试。输出片段:\n{tail.strip()}"
-        )
+        # EasyOCR/torch import can fail after paddle DLLs are loaded (Windows).
+        # When Paddle stack is installed, EasyOCR is optional — do not abort.
+        soft = [n for n, _ in still if n == "easyocr"]
+        hard = [n for n, _ in still if n != "easyocr"]
+        if soft and _paddle_stack_ready() and not hard:
+            _msg(
+                f"EasyOCR import/probe failed but PaddleOCR is ready; "
+                f"continuing with paddle (optional: {still_names})."
+            )
+        elif hard:
+            raise RuntimeError(
+                "pip satisfied but import still fails: "
+                + ", ".join(hard)
+                + "\ninterpreter: "
+                + str(py)
+                + "\nrestart the app and retry. pip output:\n"
+                + tail.strip()
+            )
+        else:
+            _msg(
+                f"optional deps still unavailable after pip: {still_names}; continuing"
+            )
 
     _msg(f"依赖安装完成: {names}")
     ok_o, note_o = ensure_ollama(progress_callback=progress_callback)

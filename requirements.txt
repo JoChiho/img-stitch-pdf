@@ -6,7 +6,8 @@ pypdf>=4.0.0
 # Optional local EN→ZH pipeline (first run downloads OCR models; see README)
 paddlepaddle
 paddleocr>=2.7.0
-easyocr>=1.7.0
+# Optional OCR fallback (torch); not required when using default PaddleOCR
+# easyocr>=1.7.0
 # Fallback MT when Ollama is unavailable (preferred MT is Ollama — install separately)
 argostranslate>=1.9.0
 # Last-resort online MT only if Ollama and Argos both fail:

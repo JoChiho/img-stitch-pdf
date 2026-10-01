@@ -251,7 +251,7 @@ def test_check_deps_returns_keys():
 
 
 @pytest.mark.skipif(
-    not tl.check_deps().get("easyocr") or not tl.check_deps().get("argostranslate"),
+    not tl.check_deps().get("paddleocr") or not tl.check_deps().get("argostranslate"),
     reason="OCR/MT models not installed (optional smoke)",
 )
 def test_smoke_translate_real_if_models_present(tmp_path: Path):
@@ -294,12 +294,67 @@ def test_real_translate_text_hello_returns_cjk():
 def test_missing_pip_packages_reports_when_unavailable():
     from unittest.mock import patch
 
-    with patch.object(tl, "_module_importable", return_value=False):
+    # Paddle/EasyOCR use metadata probes; Argos still uses import.
+    with patch.object(
+        tl._ocr_backend,
+        "paddle_stack_missing",
+        return_value=[
+            ("paddle", tl.PADDLEPADDLE_SPEC),
+            ("paddleocr", tl.PADDLEOCR_SPEC),
+        ],
+    ), patch.object(
+        tl._ocr_backend, "_distribution_installed", return_value=False
+    ), patch.object(tl, "_module_importable", return_value=False), patch.object(
+        tl, "get_ocr_engine", return_value="paddle"
+    ):
         missing = tl.missing_pip_packages()
     assert ("paddle", tl.PADDLEPADDLE_SPEC) in missing
     assert ("paddleocr", tl.PADDLEOCR_SPEC) in missing
-    assert ("easyocr", "easyocr>=1.7.0") in missing
     assert ("argostranslate", "argostranslate>=1.9.0") in missing
+    # EasyOCR is not required for default paddle engine
+    assert ("easyocr", "easyocr>=1.7.0") not in missing
+
+
+def test_missing_pip_packages_includes_easyocr_when_engine_easyocr():
+    from unittest.mock import patch
+
+    with patch.object(
+        tl._ocr_backend, "paddle_stack_missing", return_value=[]
+    ), patch.object(
+        tl._ocr_backend, "_distribution_installed", return_value=False
+    ), patch.object(tl, "_module_importable", return_value=True), patch.object(
+        tl, "get_ocr_engine", return_value="easyocr"
+    ):
+        missing = tl.missing_pip_packages()
+    assert ("easyocr", "easyocr>=1.7.0") in missing
+
+
+def test_ensure_deps_nonfatal_when_easyocr_missing_but_paddle_ready():
+    """Translate export must not require EasyOCR/torch when Paddle is ready."""
+    from unittest.mock import patch
+
+    msgs = []
+    with patch.object(tl._ocr_backend, "ensure_paddle_stack"), patch.object(
+        tl, "_paddle_stack_ready", return_value=True
+    ), patch.object(tl, "get_ocr_engine", return_value="paddle"), patch.object(
+        tl,
+        "missing_pip_packages",
+        return_value=[("easyocr", "easyocr>=1.7.0")],
+    ), patch("subprocess.run") as run, patch.object(
+        tl,
+        "check_deps",
+        return_value={
+            "paddlepaddle": True,
+            "paddleocr": True,
+            "easyocr": False,
+            "argostranslate": True,
+            "ocr_engine": "paddle",
+        },
+    ), patch.object(tl, "ensure_ollama", return_value=(True, "ok")):
+        info = tl.ensure_deps(progress_callback=msgs.append)
+    run.assert_not_called()
+    assert info["paddleocr"] is True
+    assert info.get("easyocr") is False
 
 
 def test_ensure_deps_skips_pip_when_present():
@@ -323,27 +378,29 @@ def test_ensure_deps_runs_pip_for_missing():
     msgs = []
     fake = MagicMock()
     fake.returncode = 0
-    fake.stdout = "Successfully installed easyocr"
+    fake.stdout = "Successfully installed argostranslate"
     fake.stderr = ""
     seq = iter(
         [
-            [("easyocr", "easyocr>=1.7.0")],
+            [("argostranslate", "argostranslate>=1.9.0")],
             [],
         ]
     )
     with patch.object(
         tl, "missing_pip_packages", side_effect=lambda packages=None: next(seq)
+    ), patch.object(tl, "_paddle_stack_ready", return_value=True), patch.object(
+        tl, "get_ocr_engine", return_value="paddle"
     ), patch("subprocess.run", return_value=fake) as run, patch.object(
         tl,
         "check_deps",
-        return_value={"easyocr": True, "argostranslate": True},
-    ):
+        return_value={"paddleocr": True, "argostranslate": True, "easyocr": False},
+    ), patch.object(tl, "ensure_ollama", return_value=(True, "ok")):
         info = tl.ensure_deps(progress_callback=msgs.append)
     run.assert_called_once()
     args = run.call_args[0][0]
     assert "-m" in args and "pip" in args and "install" in args
-    assert "easyocr>=1.7.0" in args
-    assert info["easyocr"] is True
+    assert "argostranslate>=1.9.0" in args
+    assert info["argostranslate"] is True
 
 
 def test_draw_text_in_box_glyphs_fit_inside_white_rect():
