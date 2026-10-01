@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -299,6 +300,106 @@ def check_deps() -> dict:
     return info
 
 
+
+REQUIRED_PIP_SPECS = (
+    ("easyocr", "easyocr>=1.7.0"),
+    ("argostranslate", "argostranslate>=1.9.0"),
+)
+
+
+def _module_importable(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+def missing_pip_packages(
+    packages: Optional[Sequence[Tuple[str, str]]] = None,
+) -> List[Tuple[str, str]]:
+    """Return ``(import_name, pip_spec)`` pairs that fail to import."""
+    pkgs = list(packages) if packages is not None else list(REQUIRED_PIP_SPECS)
+    return [(name, spec) for name, spec in pkgs if not _module_importable(name)]
+
+
+def ensure_deps(
+    progress_callback: Optional[Callable[[str], None]] = None,
+    *,
+    packages: Optional[Sequence[Tuple[str, str]]] = None,
+) -> dict:
+    """Ensure translation deps exist in *this* interpreter (``sys.executable``).
+
+    Missing packages are installed automatically via::
+
+        python -m pip install <spec>
+
+    No manual pip required. Safe to call from a background thread.
+    Returns the same shape as :func:`check_deps` after install attempts.
+    """
+    def _msg(m: str) -> None:
+        logger.info("%s", m)
+        if progress_callback:
+            progress_callback(m)
+
+    missing = missing_pip_packages(packages)
+    if not missing:
+        _msg("翻译依赖已就绪。")
+        return check_deps()
+
+    specs = [spec for _name, spec in missing]
+    names = ", ".join(name for name, _spec in missing)
+    py = sys.executable
+    _msg(f"正在自动安装缺失依赖（{names}）到:\n{py}")
+
+    cmd = [
+        py,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        *specs,
+    ]
+    _msg("执行: " + " ".join(cmd))
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as e:
+        raise RuntimeError(
+            f"无法启动 pip（解释器: {py}）：{e}\n"
+            f"请确认该 Python 可运行，或手动执行:\n"
+            f"  \"{py}\" -m pip install {' '.join(specs)}"
+        ) from e
+
+    tail = (proc.stdout or "")[-800:] + "\n" + (proc.stderr or "")[-800:]
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"自动安装依赖失败（exit {proc.returncode}）。\n"
+            f"解释器: {py}\n"
+            f"命令: {' '.join(cmd)}\n"
+            f"输出片段:\n{tail.strip()}"
+        )
+
+    still = missing_pip_packages(packages)
+    if still:
+        still_names = ", ".join(n for n, _ in still)
+        raise RuntimeError(
+            f"pip 已运行但仍无法导入: {still_names}\n"
+            f"解释器: {py}\n"
+            f"请重启应用后再试。输出片段:\n{tail.strip()}"
+        )
+
+    _msg(f"依赖安装完成: {names}")
+    return check_deps()
+
+
+
 def _get_easyocr_reader(languages: Optional[Sequence[str]] = None):
     global _easyocr_reader
     if _easyocr_reader is not None:
@@ -307,7 +408,7 @@ def _get_easyocr_reader(languages: Optional[Sequence[str]] = None):
         import easyocr
     except ImportError as e:
         raise ImportError(
-            "本地 OCR 需要 easyocr。请执行: pip install easyocr\n"
+            "本地 OCR 需要 easyocr（应用应已自动安装）。若仍失败，请重启应用。\n"
             "首次运行会下载检测/识别模型（可能较大），请保持网络畅通。"
         ) from e
     langs = list(languages) if languages else ["en"]
@@ -404,9 +505,8 @@ def _get_translator():
         return _google_fn, _mt_backend
     except ImportError as e:
         raise ImportError(
-            "本地翻译需要 argostranslate（推荐）。请执行:\n"
-            "  pip install argostranslate\n"
-            "首次运行会下载 en→zh 语言模型。\n"
+            "本地翻译需要 argostranslate（应用应已自动安装）。\n"
+            "若仍失败请重启应用。首次运行会下载 en→zh 语言模型。\n"
             "若本地安装失败，可额外安装 deep_translator 作为联网后备。"
         ) from e
 
@@ -532,11 +632,13 @@ def preload_models(progress_callback: Optional[Callable[[str], None]] = None) ->
     """Eagerly load OCR + MT so the first real image is faster.
 
     Safe to call on a background thread. Returns a short status string.
+    Auto-installs missing pip packages into ``sys.executable`` first.
     """
     def _msg(m: str) -> None:
         if progress_callback:
             progress_callback(m)
 
+    ensure_deps(progress_callback=progress_callback)
     _msg("正在加载 EasyOCR 模型（首次会下载）…")
     _get_easyocr_reader(["en"])
     _msg("正在准备 Argos Translate en→zh（首次会下载语言包）…")

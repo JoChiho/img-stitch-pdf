@@ -45,7 +45,7 @@ $Desktop = [Environment]::GetFolderPath("Desktop")
 if (-not $Desktop) {
     $Desktop = Join-Path $env:USERPROFILE "Desktop"
 }
-$LnkPath = Join-Path $Desktop "图片导出PDF.lnk"
+$LnkPath = Join-Path $Desktop "图片拼接转PDF.lnk"
 
 $WshShell = New-Object -ComObject WScript.Shell
 $Shortcut = $WshShell.CreateShortcut($LnkPath)

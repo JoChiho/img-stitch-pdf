@@ -120,3 +120,54 @@ def test_smoke_translate_real_if_models_present(tmp_path: Path):
     out = tl.translate_image_file(src)
     assert out.is_file()
     assert out != src
+
+
+def test_missing_pip_packages_reports_when_unavailable():
+    from unittest.mock import patch
+
+    with patch.object(tl, "_module_importable", return_value=False):
+        missing = tl.missing_pip_packages()
+    assert ("easyocr", "easyocr>=1.7.0") in missing
+    assert ("argostranslate", "argostranslate>=1.9.0") in missing
+
+
+def test_ensure_deps_skips_pip_when_present():
+    from unittest.mock import patch
+
+    calls = []
+    with patch.object(tl, "missing_pip_packages", return_value=[]), patch(
+        "subprocess.run"
+    ) as run:
+        info = tl.ensure_deps(progress_callback=calls.append)
+    run.assert_not_called()
+    assert "easyocr" in info
+    assert calls
+
+
+def test_ensure_deps_runs_pip_for_missing():
+    from unittest.mock import MagicMock, patch
+
+    msgs = []
+    fake = MagicMock()
+    fake.returncode = 0
+    fake.stdout = "Successfully installed easyocr"
+    fake.stderr = ""
+    seq = iter(
+        [
+            [("easyocr", "easyocr>=1.7.0")],
+            [],
+        ]
+    )
+    with patch.object(
+        tl, "missing_pip_packages", side_effect=lambda packages=None: next(seq)
+    ), patch("subprocess.run", return_value=fake) as run, patch.object(
+        tl,
+        "check_deps",
+        return_value={"easyocr": True, "argostranslate": True},
+    ):
+        info = tl.ensure_deps(progress_callback=msgs.append)
+    run.assert_called_once()
+    args = run.call_args[0][0]
+    assert "-m" in args and "pip" in args and "install" in args
+    assert "easyocr>=1.7.0" in args
+    assert info["easyocr"] is True

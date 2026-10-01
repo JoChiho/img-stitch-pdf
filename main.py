@@ -466,7 +466,7 @@ def _which(cmd: str) -> Optional[str]:
 
 def create_desktop_shortcut(
     project_dir: Optional[Path] = None,
-    shortcut_name: str = "图片导出PDF.lnk",
+    shortcut_name: str = "图片拼接转PDF.lnk",
 ) -> Path:
     """在用户桌面创建 .lnk：用 pythonw 启动 main.py，工作目录=项目目录。"""
     project_dir = Path(project_dir or PROJECT_DIR).resolve()
@@ -986,11 +986,23 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         paths_snapshot = list(self.paths)
         self._set_exporting(True)
         self._set_status(
-            f"正在本地翻译（首次可能下载模型）… 0/{image_count}"
+            f"检查/安装翻译依赖后开始本地翻译… 0/{image_count}"
         )
 
         def worker() -> None:
             try:
+                def on_dep(msg: str) -> None:
+                    self.after(0, lambda m=msg: self._set_status(m))
+
+                # Auto-install missing packages into this interpreter (no manual pip)
+                translate_local.ensure_deps(progress_callback=on_dep)
+                on_dep("正在准备 OCR / 翻译模型（首次可能下载）…")
+                try:
+                    translate_local.preload_models(progress_callback=on_dep)
+                except Exception as warm_err:
+                    # Non-fatal: translate_image_paths will surface real failures
+                    on_dep(f"模型预加载提示：{warm_err}")
+
                 def on_tr(i: int, n: int, msg: str) -> None:
                     self.after(
                         0,
