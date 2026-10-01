@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Unit tests for local EN→ZH helpers (no OCR/MT models required)."""
 
 from __future__ import annotations
@@ -241,9 +241,12 @@ def test_translate_en_to_zh_multiple_calls_with_mock():
 def test_check_deps_returns_keys():
     info = tl.check_deps()
     assert "easyocr" in info
+    assert "paddleocr" in info
+    assert "paddlepaddle" in info
     assert "argostranslate" in info
     assert "ollama" in info
     assert "ollama_model" in info
+    assert "ocr_engine" in info
     assert "cjk_font" in info
 
 
@@ -293,6 +296,8 @@ def test_missing_pip_packages_reports_when_unavailable():
 
     with patch.object(tl, "_module_importable", return_value=False):
         missing = tl.missing_pip_packages()
+    assert ("paddle", tl.PADDLEPADDLE_SPEC) in missing
+    assert ("paddleocr", tl.PADDLEOCR_SPEC) in missing
     assert ("easyocr", "easyocr>=1.7.0") in missing
     assert ("argostranslate", "argostranslate>=1.9.0") in missing
 
@@ -307,6 +312,8 @@ def test_ensure_deps_skips_pip_when_present():
         info = tl.ensure_deps(progress_callback=calls.append)
     run.assert_not_called()
     assert "easyocr" in info
+    assert "paddleocr" in info
+    assert "ocr_engine" in info
     assert calls
 
 
@@ -661,4 +668,60 @@ def test_translate_image_file_overlay_mode_still_available(tmp_path: Path):
     with Image.open(out) as im:
         # Overlay keeps same dimensions
         assert im.size == (100, 40)
+
+
+def test_ocr_engine_get_set_normalize():
+    prev = tl.get_ocr_engine()
+    try:
+        assert tl.normalize_ocr_engine("Paddle") == "paddle"
+        assert tl.normalize_ocr_engine("EASYOCR") == "easyocr"
+        assert tl.normalize_ocr_engine("nope") == tl.DEFAULT_OCR_ENGINE
+        assert tl.set_ocr_engine("easyocr") == "easyocr"
+        assert tl.get_ocr_engine() == "easyocr"
+        assert tl.set_ocr_engine("paddle") == "paddle"
+        assert tl.get_ocr_engine() == "paddle"
+    finally:
+        tl.set_ocr_engine(prev)
+
+
+def test_ocr_image_paddle_fallback_to_easyocr():
+    boxes = [tl.OcrBox("Hi", (1, 1, 20, 10), 0.9)]
+    prev = tl.get_ocr_engine()
+    tl.set_ocr_engine("paddle")
+    try:
+        with patch.object(
+            tl._ocr_backend, "ocr_image_paddle", side_effect=RuntimeError("boom")
+        ), patch.object(
+            tl._ocr_backend, "ocr_image_easyocr", return_value=boxes
+        ) as easy:
+            out = tl.ocr_image(Path("x.png"))
+        assert out == boxes
+        easy.assert_called_once()
+        assert tl._ocr_backend.get_last_ocr_engine_used() == "easyocr"
+    finally:
+        tl.set_ocr_engine(prev)
+
+
+def test_ocr_boxes_from_paddle_page_v3_json():
+    class FakePage:
+        json = {
+            "res": {
+                "rec_texts": ["Hello", "World"],
+                "rec_scores": [0.99, 0.95],
+                "rec_boxes": [[1, 2, 30, 20], [5, 40, 40, 55]],
+            }
+        }
+
+    out = tl._ocr_backend._boxes_from_paddle_page(FakePage())
+    assert [o.text for o in out] == ["Hello", "World"]
+    assert out[0].box == (1, 2, 30, 20)
+
+
+def test_ocr_boxes_from_paddle_page_legacy():
+    page = [
+        [[[0, 0], [10, 0], [10, 8], [0, 8]], ("Alpha", 0.9)],
+        [[[0, 20], [12, 20], [12, 28], [0, 28]], ("Beta", 0.8)],
+    ]
+    out = tl._ocr_backend._boxes_from_paddle_page(page)
+    assert [o.text for o in out] == ["Alpha", "Beta"]
 

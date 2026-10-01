@@ -3,7 +3,9 @@
 """Local EN→ZH image translation pipeline (OCR → MT → caption band).
 
 Offline-first translation for screenshot / comic panels:
-  - OCR: EasyOCR (lazy import; first run downloads models)
+  - OCR: PaddleOCR EN by default (lazy import; first run downloads models),
+    with EasyOCR fallback if Paddle fails. Select via ``ocr_engine`` /
+    ``IMG_STITCH_OCR_ENGINE`` (``paddle`` | ``easyocr``).
   - MT: Ollama HTTP API (preferred, e.g. qwen2.5) with Argos en→zh fallback
   - Caption (default): after OCR reading-order, join ALL English into ONE
     paragraph (spaces), translate once via Ollama/Argos, then append that
@@ -13,7 +15,7 @@ Offline-first translation for screenshot / comic panels:
     only and are not used by the default pipeline).
 
 Heavy deps are optional at import time so unit tests for helpers can run
-without torch / argos / a running Ollama server.
+without paddle / torch / argos / a running Ollama server.
 """
 
 from __future__ import annotations
@@ -728,6 +730,7 @@ def append_caption_band(
 # OCR / MT (lazy)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class OcrBox:
     """One detected text region."""
@@ -737,7 +740,31 @@ class OcrBox:
     confidence: float = 1.0
 
 
-_easyocr_reader = None
+# PaddleOCR (default) / EasyOCR backends live in ocr_backend.py
+import ocr_backend as _ocr_backend
+
+_ocr_backend.bind_ocr_box(OcrBox)
+
+OCR_ENGINES = _ocr_backend.OCR_ENGINES
+DEFAULT_OCR_ENGINE = _ocr_backend.DEFAULT_OCR_ENGINE
+PADDLE_CPU_INDEX = _ocr_backend.PADDLE_CPU_INDEX
+PADDLEPADDLE_SPEC = _ocr_backend.PADDLEPADDLE_SPEC
+PADDLEOCR_SPEC = _ocr_backend.PADDLEOCR_SPEC
+
+
+def normalize_ocr_engine(name: Optional[str]) -> str:
+    return _ocr_backend.normalize_ocr_engine(name)
+
+
+def get_ocr_engine() -> str:
+    return _ocr_backend.get_ocr_engine()
+
+
+def set_ocr_engine(engine: str) -> str:
+    return _ocr_backend.set_ocr_engine(engine)
+
+
+_easyocr_reader = None  # legacy; cache lives in ocr_backend
 _argos_translator = None  # Argos Translation object (debug / status only)
 _translate_fn = None  # cached callable: str -> str
 _mt_backend: Optional[str] = None  # "ollama" | "argos" | "deep_translator" | None
@@ -796,30 +823,39 @@ def pick_default_ollama_model(available: Optional[Sequence[str]] = None) -> str:
 def check_deps() -> dict:
     """Return availability of optional heavy packages / Ollama (no downloads)."""
     info = {
+        "paddlepaddle": False,
+        "paddleocr": False,
         "easyocr": False,
         "argostranslate": False,
         "deep_translator": False,
         "ollama": False,
         "ollama_model": OLLAMA_MODEL,
+        "ocr_engine": get_ocr_engine(),
         "cjk_font": find_cjk_font() is not None,
     }
+    # Prefer metadata probes (avoid fatal torch DLL loads on Windows)
+    try:
+        info["paddlepaddle"] = _ocr_backend._distribution_installed("paddlepaddle")
+        info["paddleocr"] = _ocr_backend._distribution_installed("paddleocr")
+    except Exception:
+        pass
     try:
         import easyocr  # noqa: F401
 
         info["easyocr"] = True
-    except ImportError:
+    except Exception:
         pass
     try:
         import argostranslate  # noqa: F401
 
         info["argostranslate"] = True
-    except ImportError:
+    except Exception:
         pass
     try:
         import deep_translator  # noqa: F401
 
         info["deep_translator"] = True
-    except ImportError:
+    except Exception:
         pass
     info["ollama"] = ollama_is_available()
     return info
@@ -827,25 +863,44 @@ def check_deps() -> dict:
 
 
 REQUIRED_PIP_SPECS = (
+    ("paddleocr", PADDLEOCR_SPEC),
     ("easyocr", "easyocr>=1.7.0"),
     ("argostranslate", "argostranslate>=1.9.0"),
 )
 
 
 def _module_importable(name: str) -> bool:
+    if name in ("paddle", "paddleocr"):
+        try:
+            _ocr_backend.apply_paddle_windows_quirks()
+        except Exception:
+            pass
     try:
         __import__(name)
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
 def missing_pip_packages(
     packages: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> List[Tuple[str, str]]:
-    """Return ``(import_name, pip_spec)`` pairs that fail to import."""
+    """Return ``(import_name, pip_spec)`` pairs that fail to import.
+
+    When using the default list, missing ``paddle`` is reported ahead of
+    ``paddleocr`` (Paddle stack).
+    """
     pkgs = list(packages) if packages is not None else list(REQUIRED_PIP_SPECS)
-    return [(name, spec) for name, spec in pkgs if not _module_importable(name)]
+    missing: List[Tuple[str, str]] = []
+    need_paddle = packages is None or any(n in ("paddle", "paddleocr") for n, _ in pkgs)
+    if need_paddle and not _module_importable("paddle"):
+        missing.append(("paddle", PADDLEPADDLE_SPEC))
+    for name, spec in pkgs:
+        if name == "paddle":
+            continue
+        if not _module_importable(name):
+            missing.append((name, spec))
+    return missing
 
 
 def ensure_deps(
@@ -859,15 +914,26 @@ def ensure_deps(
 
         python -m pip install <spec>
 
-    No manual pip required. Safe to call from a background thread.
-    Returns the same shape as :func:`check_deps` after install attempts.
+    PaddlePaddle uses the official CPU index (important on Windows). Safe to
+    call from a background thread. Returns the same shape as :func:`check_deps`.
     """
+
     def _msg(m: str) -> None:
         logger.info("%s", m)
         if progress_callback:
             progress_callback(m)
 
-    missing = missing_pip_packages(packages)
+    if packages is None or any(n in ("paddle", "paddleocr") for n, _ in (packages or [])):
+        try:
+            _ocr_backend.ensure_paddle_stack(progress_callback=progress_callback)
+        except Exception as e:
+            _msg(f"Paddle install note: {e} (will fall back to EasyOCR if needed)")
+
+    missing = [
+        (n, s)
+        for n, s in missing_pip_packages(packages)
+        if n not in ("paddle", "paddleocr")
+    ]
     if not missing:
         _msg("翻译依赖已就绪")
         ok_o, note_o = ensure_ollama(progress_callback=progress_callback)
@@ -902,7 +968,7 @@ def ensure_deps(
         raise RuntimeError(
             f"无法启动 pip（解释器: {py}）：{e}\n"
             f"请确认该 Python 可运行，或手动执行:\n"
-            f"  \"{py}\" -m pip install {' '.join(specs)}"
+            f'  "{py}" -m pip install {" ".join(specs)}'
         ) from e
 
     tail = (proc.stdout or "")[-800:] + "\n" + (proc.stderr or "")[-800:]
@@ -914,7 +980,11 @@ def ensure_deps(
             f"输出片段:\n{tail.strip()}"
         )
 
-    still = missing_pip_packages(packages)
+    still = [
+        (n, s)
+        for n, s in missing_pip_packages(packages)
+        if n not in ("paddle", "paddleocr")
+    ]
     if still:
         still_names = ", ".join(n for n, _ in still)
         raise RuntimeError(
@@ -930,46 +1000,21 @@ def ensure_deps(
     return check_deps()
 
 
-
 def _get_easyocr_reader(languages: Optional[Sequence[str]] = None):
-    global _easyocr_reader
-    if _easyocr_reader is not None:
-        return _easyocr_reader
-    try:
-        import easyocr
-    except ImportError as e:
-        raise ImportError(
-            "本地 OCR 需要 easyocr（应用应已自动安装）。若仍失败，请重启应用。\n"
-            "首次运行会下载检测/识别模型（可能较大），请保持网络畅通。"
-        ) from e
-    langs = list(languages) if languages else ["en"]
-    # gpu=False for broader Windows CPU compatibility
-    _easyocr_reader = easyocr.Reader(langs, gpu=False, verbose=False)
-    return _easyocr_reader
+    """Compatibility wrapper around ocr_backend.get_easyocr_reader."""
+    return _ocr_backend.get_easyocr_reader(languages)
 
 
-def ocr_image(path: Path, *, min_confidence: float = 0.3) -> List[OcrBox]:
-    """Run EasyOCR on an image; return axis-aligned boxes with English text."""
-    reader = _get_easyocr_reader(["en"])
-    path = Path(path)
-    # detail=1 → (bbox, text, conf); paragraph=False keeps per-line boxes
-    raw = reader.readtext(str(path), detail=1, paragraph=False)
-    results: List[OcrBox] = []
-    for item in raw:
-        if len(item) < 3:
-            continue
-        bbox, text, conf = item[0], item[1], float(item[2])
-        text = (text or "").strip()
-        if not text or conf < min_confidence:
-            continue
-        xs = [float(p[0]) for p in bbox]
-        ys = [float(p[1]) for p in bbox]
-        left, right = int(min(xs)), int(max(xs))
-        top, bottom = int(min(ys)), int(max(ys))
-        if right - left < 2 or bottom - top < 2:
-            continue
-        results.append(OcrBox(text=text, box=(left, top, right, bottom), confidence=conf))
-    return results
+def ocr_image(
+    path: Path,
+    *,
+    min_confidence: float = 0.3,
+    engine: Optional[str] = None,
+) -> List[OcrBox]:
+    """Run OCR (PaddleOCR EN default; EasyOCR fallback) on an image."""
+    return _ocr_backend.ocr_image(
+        path, min_confidence=min_confidence, engine=engine
+    )
 
 
 def ollama_is_available(timeout: float = 1.5) -> bool:
@@ -1451,9 +1496,10 @@ def preload_models(progress_callback: Optional[Callable[[str], None]] = None) ->
             progress_callback(m)
 
     ensure_deps(progress_callback=progress_callback)
-    _msg("正在加载 EasyOCR 模型（首次会下载）…")
-    _get_easyocr_reader(["en"])
-    _msg(f"正在准备本地 MT（优先 Ollama {OLLAMA_MODEL}，否则 Argos）")
+    ocr_note = _ocr_backend.preload_ocr(
+        get_ocr_engine(), progress_callback=progress_callback
+    )
+    _msg(f"正在准备本地 MT（优先 Ollama {OLLAMA_MODEL}，否则 Argos）…")
     _get_translator()
     backend = _mt_backend or "unknown"
     if _translate_fn is None or not callable(_translate_fn):
@@ -1461,7 +1507,6 @@ def preload_models(progress_callback: Optional[Callable[[str], None]] = None) ->
             f"翻译器未就绪（backend={backend}, fn={type(_translate_fn).__name__}）。"
             "请检查 Ollama 是否运行（ollama serve）及模型是否已 pull，或 Argos en→zh 语言包是否已安装。"
         )
-    # Smoke-check: one word must become Chinese, proving the callable path works
     sample = translate_text("Hello")
     if not contains_cjk(sample):
         raise RuntimeError(
@@ -1471,7 +1516,7 @@ def preload_models(progress_callback: Optional[Callable[[str], None]] = None) ->
     _msg(f"翻译冒烟通过：Hello → {sample}（{mt_status()}）")
     font = find_cjk_font()
     font_note = str(font) if font else "未找到 CJK 字体（中文可能显示为方框）"
-    return f"就绪（OCR=easyocr, MT={backend}, font={font_note}）"
+    return f"就绪（OCR={ocr_note}, MT={backend}, font={font_note}）"
 
 
 if __name__ == "__main__":

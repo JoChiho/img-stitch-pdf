@@ -611,6 +611,47 @@ $Shortcut.Save()
     return lnk_path
 
 
+
+DEFAULT_OCR_ENGINE = "paddle"
+
+
+def get_ocr_engine_config():
+    """Return persisted ``ocr_engine`` from config.json, or None if unset."""
+    raw = load_config().get("ocr_engine")
+    if raw is None or raw == "":
+        return None
+    return str(raw).strip() or None
+
+
+def set_ocr_engine_config(engine: str) -> str:
+    """Persist ``ocr_engine`` (paddle|easyocr) and apply to translate_local."""
+    name = (engine or "").strip().lower() or DEFAULT_OCR_ENGINE
+    if name not in ("paddle", "easyocr"):
+        name = DEFAULT_OCR_ENGINE
+    data = load_config()
+    data["ocr_engine"] = name
+    save_config(data)
+    if translate_local is not None and hasattr(translate_local, "set_ocr_engine"):
+        translate_local.set_ocr_engine(name)
+    return name
+
+
+def resolve_ocr_engine_choice() -> str:
+    """Pick OCR engine: config -> translate_local default -> paddle."""
+    cfg = get_ocr_engine_config()
+    if cfg in ("paddle", "easyocr"):
+        return cfg
+    if translate_local is not None and hasattr(translate_local, "get_ocr_engine"):
+        return translate_local.get_ocr_engine()
+    return DEFAULT_OCR_ENGINE
+
+
+def apply_ocr_engine_to_runtime(engine=None) -> str:
+    """Resolve choice and push into config + translate_local."""
+    chosen = (engine or "").strip() or resolve_ocr_engine_choice()
+    return set_ocr_engine_config(chosen)
+
+
 class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__()
@@ -629,10 +670,13 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.output_dir_label_var: Optional[tk.StringVar] = None
         self.ollama_model_var: Optional[tk.StringVar] = None
         self._ollama_model_combo: Optional[ttk.Combobox] = None
+        self.ocr_engine_var: Optional[tk.StringVar] = None
+        self._ocr_engine_combo: Optional[ttk.Combobox] = None
 
         self._build_ui()
         self._refresh_output_dir_label()
         self._refresh_ollama_model_combo()
+        apply_ocr_engine_to_runtime(resolve_ocr_engine_choice())
         self._set_status(
             "请添加图片、PDF 或文件夹（含子目录）。可用「移到第…位」或双击调整顺序。"
             f"默认导出目录：{self.output_dir}"
@@ -730,6 +774,27 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             foreground="#666666",
         ).pack(side=tk.LEFT, padx=6)
 
+
+        ocr_row = ttk.Frame(self)
+        ocr_row.pack(fill=tk.X, **pad)
+        ttk.Label(ocr_row, text="OCR 引擎：").pack(side=tk.LEFT)
+        self.ocr_engine_var = tk.StringVar(value=resolve_ocr_engine_choice())
+        self._ocr_engine_combo = ttk.Combobox(
+            ocr_row,
+            textvariable=self.ocr_engine_var,
+            values=["paddle", "easyocr"],
+            width=12,
+            state="readonly",
+        )
+        self._ocr_engine_combo.pack(side=tk.LEFT, padx=(0, 4))
+        self._ocr_engine_combo.bind(
+            "<<ComboboxSelected>>", self._on_ocr_engine_selected
+        )
+        ttk.Label(
+            ocr_row,
+            text="（默认 paddle；失败时自动回退 easyocr；写入 config.json 的 ocr_engine）",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=6)
 
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, **pad)
@@ -1055,6 +1120,16 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._set_status(f"已选择 Ollama 模型：{name}（已写入配置）")
 
 
+
+    def _on_ocr_engine_selected(self, _event=None) -> None:
+        if self.ocr_engine_var is None:
+            return
+        name = (self.ocr_engine_var.get() or "").strip().lower()
+        if not name:
+            return
+        apply_ocr_engine_to_runtime(name)
+        self._set_status(f"已选择 OCR 引擎：{name}（已写入配置）")
+
     def create_shortcut(self) -> None:
         try:
             lnk = create_desktop_shortcut(PROJECT_DIR)
@@ -1137,6 +1212,10 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                     apply_ollama_model_to_runtime(self.ollama_model_var.get())
                 else:
                     apply_ollama_model_to_runtime()
+                if self.ocr_engine_var is not None:
+                    apply_ocr_engine_to_runtime(self.ocr_engine_var.get())
+                else:
+                    apply_ocr_engine_to_runtime()
                 translate_local.ensure_deps(progress_callback=on_dep)
                 on_dep("正在准备 OCR / 翻译模型（首次可能下载）…")
                 try:

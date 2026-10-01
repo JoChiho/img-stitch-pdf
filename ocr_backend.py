@@ -57,19 +57,39 @@ def get_last_ocr_engine_used() -> Optional[str]:
     return _last_ocr_engine_used
 
 
+def apply_paddle_windows_quirks() -> None:
+    os.environ.setdefault("FLAGS_use_mkldnn", "0")
+    os.environ.setdefault("FLAGS_onednn", "0")
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+
+def _distribution_installed(dist_name: str) -> bool:
+    """True if a pip distribution is installed (no import / no DLL load)."""
+    try:
+        import importlib.metadata as md
+
+        md.version(dist_name)
+        return True
+    except Exception:
+        return False
+
+
 def _module_importable(name: str) -> bool:
+    if name in ("paddle", "paddleocr"):
+        apply_paddle_windows_quirks()
     try:
         __import__(name)
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
 def paddle_stack_missing() -> List[Tuple[str, str]]:
+    """Report missing paddle packages via metadata (safe on Windows)."""
     missing: List[Tuple[str, str]] = []
-    if not _module_importable("paddle"):
+    if not _distribution_installed("paddlepaddle"):
         missing.append(("paddle", PADDLEPADDLE_SPEC))
-    if not _module_importable("paddleocr"):
+    if not _distribution_installed("paddleocr"):
         missing.append(("paddleocr", PADDLEOCR_SPEC))
     return missing
 
@@ -124,35 +144,29 @@ def ensure_paddle_stack(
         if progress_callback:
             progress_callback(m)
 
-    if not _module_importable("paddle"):
+    if not _distribution_installed("paddlepaddle"):
         _msg(f"Installing paddlepaddle (CPU) via {PADDLE_CPU_INDEX}")
         _run_pip_install(
             [PADDLEPADDLE_SPEC],
             extra_args=["-i", PADDLE_CPU_INDEX],
             progress_callback=progress_callback,
         )
-        if not _module_importable("paddle"):
+        if not _distribution_installed("paddlepaddle"):
             raise RuntimeError(
-                "paddlepaddle installed but import failed. Try:\n"
+                "paddlepaddle installed but not visible to pip metadata. Try:\n"
                 f'  "{sys.executable}" -m pip install {PADDLEPADDLE_SPEC} '
                 f"-i {PADDLE_CPU_INDEX}"
             )
         _msg("paddlepaddle ready")
 
-    if not _module_importable("paddleocr"):
+    if not _distribution_installed("paddleocr"):
         _msg("Installing paddleocr...")
         _run_pip_install([PADDLEOCR_SPEC], progress_callback=progress_callback)
-        if not _module_importable("paddleocr"):
+        if not _distribution_installed("paddleocr"):
             raise RuntimeError(
-                "paddleocr installed but import failed; restart the app."
+                "paddleocr installed but not visible to pip metadata; restart the app."
             )
         _msg("paddleocr ready")
-
-
-def apply_paddle_windows_quirks() -> None:
-    os.environ.setdefault("FLAGS_use_mkldnn", "0")
-    os.environ.setdefault("FLAGS_onednn", "0")
-    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 
 def get_paddleocr_reader(languages: Optional[Sequence[str]] = None):
