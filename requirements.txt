@@ -1,7 +1,11 @@
-﻿pillow>=10.0.0
+# OCR default: PaddleOCR (+ EasyOCR fallback). Windows paddlepaddle CPU:
+#   python -m pip install paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+pillow>=10.0.0
 img2pdf>=0.5.0
 pypdf>=4.0.0
 # Optional local EN→ZH pipeline (first run downloads OCR models; see README)
+paddlepaddle
+paddleocr>=2.7.0
 easyocr>=1.7.0
 # Fallback MT when Ollama is unavailable (preferred MT is Ollama — install separately)
 argostranslate>=1.9.0
