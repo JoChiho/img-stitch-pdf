@@ -470,12 +470,69 @@ def test_sort_ocr_boxes_reading_order_rows():
 
 
 def test_collect_english_and_join_caption():
+    # Far apart vertically -> stay separate after merge pass
     boxes = [
-        tl.OcrBox("world", (10, 40, 80, 60), 0.9),
+        tl.OcrBox("world", (10, 120, 80, 140), 0.9),
         tl.OcrBox("Hello", (10, 5, 80, 25), 0.9),
     ]
     assert tl.collect_english_in_reading_order(boxes) == ["Hello", "world"]
-    assert tl.join_chinese_caption_lines(["\u4f60\u597d", "\u4e16\u754c"]) == "\u4f60\u597d\n\u4e16\u754c"
+    assert tl.join_chinese_caption_lines(["你好", "世界"]) == "你好\n世界"
+
+
+def test_merge_nearby_ocr_boxes_same_line():
+    boxes = [
+        tl.OcrBox("world", (70, 10, 130, 30), 0.8),
+        tl.OcrBox("Hello", (10, 12, 60, 28), 0.9),
+    ]
+    merged = tl.merge_nearby_ocr_boxes(boxes)
+    assert len(merged) == 1
+    assert merged[0].text == "Hello world"
+    assert merged[0].box == (10, 10, 130, 30)
+    assert merged[0].confidence == 0.8
+
+
+def test_merge_nearby_ocr_boxes_vertical_bubble():
+    boxes = [
+        tl.OcrBox("line two", (12, 36, 100, 52), 0.85),
+        tl.OcrBox("line one", (10, 10, 98, 28), 0.9),
+    ]
+    merged = tl.merge_nearby_ocr_boxes(boxes)
+    assert len(merged) == 1
+    assert merged[0].text == "line one line two"
+    left, top, right, bottom = merged[0].box
+    assert left == 10 and top == 10 and right == 100 and bottom == 52
+
+
+def test_merge_nearby_ocr_boxes_keeps_distant_separate():
+    boxes = [
+        tl.OcrBox("Left", (10, 10, 50, 28), 0.9),
+        tl.OcrBox("Right", (200, 12, 260, 30), 0.9),  # large h gap, same line
+        tl.OcrBox("Below", (10, 120, 80, 140), 0.9),  # large v gap
+    ]
+    merged = tl.merge_nearby_ocr_boxes(boxes)
+    assert [b.text for b in merged] == ["Left", "Right", "Below"]
+
+
+def test_merge_nearby_ocr_boxes_hyphen_linebreak():
+    boxes = [
+        tl.OcrBox("some-", (10, 10, 60, 26), 0.9),
+        tl.OcrBox("thing", (12, 30, 70, 46), 0.9),
+    ]
+    merged = tl.merge_nearby_ocr_boxes(boxes)
+    assert len(merged) == 1
+    assert merged[0].text == "something"
+
+
+def test_merge_nearby_ocr_boxes_empty_and_reading_order():
+    assert tl.merge_nearby_ocr_boxes([]) == []
+    boxes = [
+        tl.OcrBox("C", (10, 80, 40, 96), 0.9),
+        tl.OcrBox("B", (55, 12, 90, 28), 0.9),
+        tl.OcrBox("A", (10, 10, 45, 26), 0.9),
+    ]
+    # A+B same line close; C far below
+    merged = tl.merge_nearby_ocr_boxes(boxes, row_tol=10)
+    assert [b.text for b in merged] == ["A B", "C"]
 
 
 def test_append_caption_band_taller_and_preserves_top():
@@ -502,6 +559,7 @@ def test_append_caption_band_empty_returns_same_size():
 def test_translate_image_file_default_is_caption_not_overlay(tmp_path: Path):
     src = tmp_path / "panel.png"
     Image.new("RGB", (120, 50), (90, 90, 90)).save(src)
+    # Nearby vertical boxes -> merged into one sentence before MT
     boxes = [
         tl.OcrBox("One", (5, 5, 50, 20), 0.95),
         tl.OcrBox("Two", (5, 25, 50, 40), 0.95),
@@ -510,7 +568,7 @@ def test_translate_image_file_default_is_caption_not_overlay(tmp_path: Path):
 
     def fake_tr(t):
         calls.append(t)
-        return {"One": "\u4e00", "Two": "\u4e8c"}.get(t, t)
+        return {"One Two": "一二", "One": "一", "Two": "二"}.get(t, t)
 
     with patch.object(tl, "ocr_image", return_value=boxes), patch.object(
         tl, "translate_en_to_zh", side_effect=fake_tr
@@ -519,11 +577,12 @@ def test_translate_image_file_default_is_caption_not_overlay(tmp_path: Path):
     ):
         out = tl.translate_image_file(src)
 
-    assert calls == ["One", "Two"]
+    assert calls == ["One Two"]
     with Image.open(out) as im:
         assert im.size[1] > 50
         # Top-left of original region still gray (not whitened by overlay)
         assert im.getpixel((2, 2)) == (90, 90, 90)
+
 
 
 def test_translate_image_file_overlay_mode_still_available(tmp_path: Path):

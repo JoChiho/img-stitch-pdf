@@ -128,7 +128,7 @@ python translate_local.py path\to\image.jpg
 
 - OCR 对小字、艺术字、低对比、倾斜文本效果有限；可能漏检或框不准
 - 默认优先 **Ollama**（如 qwen2.5）做 EN→ZH；不可用时回退 Argos。
-- 默认**不再叠字覆盖原图**：OCR 英文按阅读顺序收集 → Ollama/Argos 翻译 → 在原图下方追加浅色译文条带（`font.getbbox` 换行与量高，CJK 字体、充足边距）。旧的框内叠字路径仅保留为 `render_mode="overlay"`（非默认）。
+- 默认**不再叠字覆盖原图**：OCR 附近框合并为整句/气泡后按阅读顺序 → Ollama/Argos 翻译 → 在原图下方追加浅色译文条带（`font.getbbox` 换行与量高，CJK 字体、充足边距）。旧的框内叠字路径仅保留为 `render_mode="overlay"`（非默认）。
 - 译文条带：浅色底 + 自动换行左对齐；原图文字框保持不变；复杂排版依赖 OCR 阅读顺序
 - 翻译模式**不处理 PDF 内嵌文字**（跳过 PDF）；也不处理 GIF
 - 首次模型下载可能数百 MB；之后离线可用（Argos 路径）；EasyOCR 依赖 PyTorch，安装较慢

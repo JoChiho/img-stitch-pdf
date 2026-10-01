@@ -445,10 +445,133 @@ def sort_ocr_boxes_reading_order(
     return ordered
 
 
+def _ocr_box_height(box: Tuple[int, int, int, int]) -> int:
+    return max(1, int(box[3]) - int(box[1]))
+
+
+def _ocr_box_width(box: Tuple[int, int, int, int]) -> int:
+    return max(1, int(box[2]) - int(box[0]))
+
+
+def _combine_ocr_boxes(a: "OcrBox", b: "OcrBox") -> "OcrBox":
+    """Union geometry + join English fragments for one MT call."""
+    al, at, ar, ab = (int(v) for v in a.box)
+    bl, bt, br, bb = (int(v) for v in b.box)
+    ta = (a.text or "").strip()
+    tb = (b.text or "").strip()
+    if ta.endswith("-") and tb:
+        # Hyphenated line-break: "some-" + "thing" -> "something"
+        text = ta[:-1] + tb
+    elif ta and tb:
+        text = f"{ta} {tb}"
+    else:
+        text = ta or tb
+    return OcrBox(
+        text=text,
+        box=(min(al, bl), min(at, bt), max(ar, br), max(ab, bb)),
+        confidence=min(float(a.confidence), float(b.confidence)),
+    )
+
+
+def _ocr_boxes_nearby(
+    a: "OcrBox",
+    b: "OcrBox",
+    *,
+    same_line_y_ratio: float,
+    max_h_gap_ratio: float,
+    max_v_gap_ratio: float,
+    min_x_overlap_ratio: float,
+) -> bool:
+    """True if ``a`` and ``b`` belong to the same sentence / speech bubble.
+
+    ``a`` should already be earlier in reading order than ``b``.
+    - Same line: tops close and horizontal gap small (or overlapping).
+    - Vertical bubble: small gap below ``a``, with enough horizontal overlap
+      (or tiny x-gap) so separate columns stay separate.
+    """
+    al, at, ar, ab = (int(v) for v in a.box)
+    bl, bt, br, bb = (int(v) for v in b.box)
+    ah = _ocr_box_height(a.box)
+    bh = _ocr_box_height(b.box)
+    aw = _ocr_box_width(a.box)
+    bw = _ocr_box_width(b.box)
+    med_h = max(1.0, (ah + bh) / 2.0)
+    med_w = max(1.0, (aw + bw) / 2.0)
+
+    y_tol = max(4.0, same_line_y_ratio * min(ah, bh))
+    same_line = abs(at - bt) <= y_tol or abs((at + ab) / 2.0 - (bt + bb) / 2.0) <= y_tol
+
+    # Horizontal gap: positive = separate, negative/zero = overlap
+    h_gap = float(bl - ar)
+    max_h_gap = max(6.0, max_h_gap_ratio * med_h)
+    if same_line and h_gap <= max_h_gap:
+        # Also allow mild reverse order / overlap on the same row
+        if h_gap >= -0.5 * med_w:
+            return True
+
+    # Vertical continuation (wrapped line / bubble)
+    v_gap = float(bt - ab)
+    max_v_gap = max(6.0, max_v_gap_ratio * med_h)
+    if v_gap < -0.35 * med_h:
+        # Too much upward overlap / wrong order — not a clean stack
+        return False
+    if v_gap > max_v_gap:
+        return False
+
+    overlap_w = float(min(ar, br) - max(al, bl))
+    min_overlap = min_x_overlap_ratio * min(aw, bw)
+    x_gap = float(max(0, max(al, bl) - min(ar, br)))
+    if overlap_w >= min_overlap:
+        return True
+    # Near-aligned columns with tiny x gap still count as one bubble
+    if x_gap <= max(4.0, 0.25 * med_w) and abs(((al + ar) / 2.0) - ((bl + br) / 2.0)) <= 0.55 * med_w:
+        return True
+    return False
+
+
+def merge_nearby_ocr_boxes(
+    boxes: Sequence["OcrBox"],
+    *,
+    same_line_y_ratio: float = 0.55,
+    max_h_gap_ratio: float = 1.25,
+    max_v_gap_ratio: float = 0.85,
+    min_x_overlap_ratio: float = 0.25,
+    row_tol: Optional[int] = None,
+) -> List["OcrBox"]:
+    """Merge nearby EasyOCR boxes into full sentences / bubbles.
+
+    1. Sort top-to-bottom, left-to-right (:func:`sort_ocr_boxes_reading_order`).
+    2. Greedily merge consecutive boxes that share a line (small horizontal gap)
+       or continue a bubble (small vertical gap + horizontal overlap).
+
+    Returns a new list of :class:`OcrBox` with union boxes and joined English
+    text (space-separated; hyphenated line-breaks glued). Empty input → [].
+    """
+    ordered = sort_ocr_boxes_reading_order(boxes, row_tol=row_tol)
+    if not ordered:
+        return []
+
+    merged: List[OcrBox] = [ordered[0]]
+    for b in ordered[1:]:
+        prev = merged[-1]
+        if _ocr_boxes_nearby(
+            prev,
+            b,
+            same_line_y_ratio=same_line_y_ratio,
+            max_h_gap_ratio=max_h_gap_ratio,
+            max_v_gap_ratio=max_v_gap_ratio,
+            min_x_overlap_ratio=min_x_overlap_ratio,
+        ):
+            merged[-1] = _combine_ocr_boxes(prev, b)
+        else:
+            merged.append(b)
+    return merged
+
+
 def collect_english_in_reading_order(boxes: Sequence[OcrBox]) -> List[str]:
-    """Return non-empty OCR English strings in reading order."""
+    """Return non-empty OCR English strings in reading order (merged boxes)."""
     out: List[str] = []
-    for ob in sort_ocr_boxes_reading_order(boxes):
+    for ob in merge_nearby_ocr_boxes(boxes):
         t = (ob.text or "").strip()
         if t:
             out.append(t)
@@ -1061,7 +1184,7 @@ def translate_image_file(
     min_confidence: float = 0.3,
     render_mode: str = "caption",
 ) -> Path:
-    """OCR → translate → caption band → save under ``translated_zh/``.
+    """OCR → merge nearby boxes → translate → caption band → save under ``translated_zh/``.
 
     Default ``render_mode="caption"`` keeps the original image intact and
     appends a translation band below it. ``render_mode="overlay"`` is kept
@@ -1115,7 +1238,7 @@ def translate_image_file(
                 mt_status(),
             )
         else:
-            # Default: reading-order OCR → MT each fragment → caption under image.
+            # Default: merge nearby OCR boxes → MT each sentence/bubble → caption under image.
             english_parts = collect_english_in_reading_order(boxes)
             zh_parts: List[str] = []
             for en in english_parts:
@@ -1127,8 +1250,9 @@ def translate_image_file(
                 original, caption, font_path=font_path
             )
             logger.info(
-                "Caption mode: %d OCR line(s) → %d zh line(s); "
+                "Caption mode: %d raw OCR → %d merged line(s) → %d zh line(s); "
                 "out size %sx%s (src %sx%s); %s",
+                len(boxes),
                 len(english_parts),
                 len(zh_parts),
                 canvas.size[0],
