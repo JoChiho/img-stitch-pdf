@@ -1,8 +1,9 @@
-pillow>=10.0.0
+﻿pillow>=10.0.0
 img2pdf>=0.5.0
 pypdf>=4.0.0
-# Optional local EN→ZH pipeline (first run downloads models; see README)
+# Optional local EN→ZH pipeline (first run downloads OCR models; see README)
 easyocr>=1.7.0
+# Fallback MT when Ollama is unavailable (preferred MT is Ollama — install separately)
 argostranslate>=1.9.0
-# Last-resort online MT only if Argos install fails:
+# Last-resort online MT only if Ollama and Argos both fail:
 # deep-translator>=1.11.0

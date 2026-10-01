@@ -63,12 +63,13 @@ def test_wrap_text_to_width_splits_long_cjk():
 
 
 def test_fit_font_size_for_box_returns_usable_font():
-    font, lines, size = tl.fit_font_size_for_box(
-        "你好世界", 80, 40, max_size=48, min_size=8
+    font, lines, size, pad = tl.fit_font_size_for_box(
+        "测试中文", 80, 40, max_size=48, min_size=8
     )
     assert size >= 8
     assert lines
     assert font is not None
+    assert pad >= 0
 
 
 def test_draw_text_in_box_paints_without_mutating_size():
@@ -176,11 +177,11 @@ def test_get_translator_caches_callable_not_translation_object():
     tl._translate_fn = None
     tl._argos_translator = None
     tl._mt_backend = None
+    tl._mt_status_detail = ""
 
-    with patch.object(tl, "_ensure_argos_en_zh", return_value=fake_translation), patch.dict(
-        "sys.modules", {"argostranslate": MagicMock()}
-    ):
-        # Force import path: make `import argostranslate` succeed
+    with patch.object(tl, "ensure_ollama", return_value=(False, "ollama down")), patch.object(
+        tl, "_ensure_argos_en_zh", return_value=fake_translation
+    ), patch.dict("sys.modules", {"argostranslate": MagicMock()}):
         import sys
 
         sys.modules["argostranslate"] = MagicMock()
@@ -192,9 +193,9 @@ def test_get_translator_caches_callable_not_translation_object():
     assert fn1 is fn2
     assert fn1("Hello") == "ZH:Hello"
     assert fn2("World") == "ZH:World"
-    # Module cache must hold the callable, not the Translation object
     assert tl._translate_fn is fn1
     assert callable(tl._translate_fn)
+
 
 
 def test_translate_en_to_zh_multiple_calls_with_mock():
@@ -221,6 +222,8 @@ def test_check_deps_returns_keys():
     info = tl.check_deps()
     assert "easyocr" in info
     assert "argostranslate" in info
+    assert "ollama" in info
+    assert "ollama_model" in info
     assert "cjk_font" in info
 
 
@@ -260,7 +263,8 @@ def test_real_translate_text_hello_returns_cjk():
     # Second call must still work (callable cache regression)
     out2 = tl.translate_text("World")
     assert tl.contains_cjk(out2), f"expected Chinese on 2nd call, got {out2!r}"
-    assert tl.mt_status().startswith("MT backend=argos")
+    status = tl.mt_status()
+    assert status.startswith("MT backend=ollama") or status.startswith("MT backend=argos"), status
     assert "callable_ready=True" in tl.mt_status()
 
 
@@ -313,3 +317,125 @@ def test_ensure_deps_runs_pip_for_missing():
     assert "-m" in args and "pip" in args and "install" in args
     assert "easyocr>=1.7.0" in args
     assert info["easyocr"] is True
+
+
+def test_draw_text_in_box_glyphs_fit_inside_white_rect():
+    """CJK ink must stay inside the (possibly grown) white bar — no vertical clip."""
+    font_path = tl.find_cjk_font()
+    # Gray background; white fill; red text for easy scanning
+    img = Image.new("RGB", (240, 120), (80, 80, 80))
+    # Deliberately short bar (height 16) that used to clip taller CJK glyphs
+    box = (20, 50, 220, 66)
+    out = tl.draw_text_in_box(
+        img,
+        box,
+        "中文测试字形高度",
+        font_path=font_path,
+        padding=2,
+        fill_rgba=(255, 255, 255, 255),
+        text_fill=(220, 0, 0),
+    )
+    # Collect white and red pixels
+    white_pixels = []
+    red_pixels = []
+    w, h = out.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b = out.getpixel((x, y))
+            if r > 240 and g > 240 and b > 240:
+                white_pixels.append((x, y))
+            elif r > 150 and g < 80 and b < 80:
+                red_pixels.append((x, y))
+    assert white_pixels, "expected a white overlay rect"
+    assert red_pixels, "expected red text pixels"
+    wx = [p[0] for p in white_pixels]
+    wy = [p[1] for p in white_pixels]
+    left, right = min(wx), max(wx)
+    top, bottom = min(wy), max(wy)
+    # Every red (text) pixel must lie inside the white rect bbox
+    for x, y in red_pixels:
+        assert left <= x <= right and top <= y <= bottom, (
+            f"glyph pixel ({x},{y}) outside white rect "
+            f"[{left},{top},{right},{bottom}]"
+        )
+
+
+def test_fit_font_size_getbbox_respects_short_box():
+    """When the bar is short, font shrinks (or pad grows) so ink height fits."""
+    font_path = tl.find_cjk_font()
+    # Very short box height
+    font, lines, size, pad = tl.fit_font_size_for_box(
+        "高度测试",
+        box_w=100,
+        box_h=14,
+        font_path=font_path,
+        max_size=48,
+        min_size=8,
+        padding=1,
+    )
+    assert size >= 8
+    _lines, block_w, block_h = tl.measure_text_block("高度测试", font, max(1, 100 - 2 * pad))
+    # Either ink fits in box_h with pad, or pad grew enough that need_h is covered by growth
+    need_h = block_h + 2 * pad
+    assert need_h <= 14 or pad > 1, (
+        f"expected shrink or grow-pad; size={size} pad={pad} block_h={block_h} need_h={need_h}"
+    )
+
+
+def test_translate_via_ollama_mock_http():
+    """Optional: mock urllib so Ollama path returns Chinese without a server."""
+    payload = {"response": "你好"}
+    fake_resp = MagicMock()
+    fake_resp.read.return_value = __import__("json").dumps(payload).encode("utf-8")
+    fake_resp.__enter__ = lambda s: s
+    fake_resp.__exit__ = MagicMock(return_value=False)
+    fake_resp.status = 200
+
+    with patch("urllib.request.urlopen", return_value=fake_resp):
+        out = tl.translate_via_ollama("Hello")
+    assert out == "你好"
+    assert tl.contains_cjk(out)
+
+
+def test_get_translator_prefers_ollama_when_available():
+    tl._translate_fn = None
+    tl._argos_translator = None
+    tl._mt_backend = None
+    tl._mt_status_detail = ""
+
+    with patch.object(
+        tl, "ensure_ollama", return_value=(True, "Ollama ready")
+    ), patch.object(tl, "translate_via_ollama", side_effect=lambda s: f"译:{s}"):
+        fn, backend = tl._get_translator()
+        assert backend == "ollama"
+        assert callable(fn)
+        assert fn("Hi") == "译:Hi"
+        assert tl._mt_backend == "ollama"
+
+
+def test_get_translator_falls_back_to_argos_with_status():
+    tl._translate_fn = None
+    tl._argos_translator = None
+    tl._mt_backend = None
+    tl._mt_status_detail = ""
+
+    fake_translation = MagicMock()
+    fake_translation.translate.side_effect = lambda s: f"阿:{s}"
+
+    with patch.object(
+        tl, "ensure_ollama", return_value=(False, "Ollama 不可用")
+    ), patch.object(tl, "_ensure_argos_en_zh", return_value=fake_translation), patch.dict(
+        "sys.modules", {"argostranslate": MagicMock()}
+    ):
+        import sys
+
+        sys.modules["argostranslate"] = MagicMock()
+        fn, backend = tl._get_translator()
+
+    assert backend == "argos"
+    assert "Argos" in tl._mt_status_detail or "Ollama" in tl._mt_status_detail
+    assert fn("Hello") == "阿:Hello"
+    status = tl.mt_status()
+    assert "argos" in status
+
+

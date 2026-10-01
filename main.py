@@ -6,7 +6,7 @@
 不拼接成巨图，避免 OOM。JPEG 尽量经 img2pdf 原样嵌入；PDF 页经 pypdf
 合并，不重新栅格化。
 
-可选：本地 EN→ZH 图片翻译（EasyOCR + Argos Translate），将中文绘制到
+可选：本地 EN→ZH 图片翻译（EasyOCR + Ollama / Argos），将中文绘制到
 原图目录下新建子文件夹 ``translated_zh/``（不与原图同级混放，便于清理），再走同一套多页 PDF 导出。
 """
 
