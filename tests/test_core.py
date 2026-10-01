@@ -32,6 +32,10 @@ def test_list_images_in_folder_recursive_natural_sort(tmp_path: Path):
     rels = [p.relative_to(tmp_path).as_posix() for p in found]
     assert rels == ["a2.png", "a10.png", "b.jpg", "sub/deep/z.webp", "sub/nested.jpg"]
 
+    top_only = main.list_images_in_folder(tmp_path, recurse=False)
+    top_rels = [p.relative_to(tmp_path).as_posix() for p in top_only]
+    assert top_rels == ["a2.png", "a10.png", "b.jpg"]
+
 
 def test_list_images_skips_gif_by_default(tmp_path: Path):
     (tmp_path / "keep.png").write_bytes(b"x")
@@ -332,4 +336,15 @@ def test_resolve_ollama_model_first_available_without_14b(tmp_path, monkeypatch)
     monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
     monkeypatch.setattr(main, "list_ollama_models_for_ui", lambda: ["phi3:mini", "llama3:8b"])
     assert main.resolve_ollama_model_choice() == "phi3:mini"
+
+
+def test_include_subfolders_config_roundtrip(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(main, "config_path", lambda: cfg)
+    monkeypatch.setattr(main, "config_dir", lambda: tmp_path)
+    assert main.get_include_subfolders_config() is True
+    main.set_include_subfolders_config(False)
+    assert main.get_include_subfolders_config() is False
+    main.set_include_subfolders_config(True)
+    assert main.get_include_subfolders_config() is True
 

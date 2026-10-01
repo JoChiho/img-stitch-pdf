@@ -95,9 +95,11 @@ def list_images_in_folder(
     *,
     skip_gif: bool = True,
     include_pdf: bool = True,
+    recurse: bool = True,
 ) -> List[Path]:
-    """递归收集文件夹（含子目录）内常见扩展名图片与 PDF，按相对路径自然排序。
+    """收集文件夹内常见扩展名图片与 PDF，按相对路径自然排序。
 
+    recurse=True（默认）时递归子目录；False 时仅扫描顶层文件。
     默认跳过 .gif；保留 jpg/jpeg/png/webp/bmp/tif/tiff，以及 .pdf。
     """
     folder = Path(folder)
@@ -114,7 +116,8 @@ def list_images_in_folder(
         skip_dir_names.add(getattr(_tl, "TRANSLATED_SUBDIR", "translated_zh"))
     except ImportError:
         pass
-    for p in folder.rglob("*"):
+    iterator = folder.rglob("*") if recurse else folder.iterdir()
+    for p in iterator:
         if not p.is_file():
             continue
         # Skip outputs living under translated_zh/ (and any *_zh names)
@@ -659,6 +662,25 @@ def apply_ocr_engine_to_runtime(engine=None) -> str:
     return set_ocr_engine_config(chosen)
 
 
+def get_include_subfolders_config() -> bool:
+    """Return persisted ``include_subfolders`` (default True = recurse)."""
+    raw = load_config().get("include_subfolders")
+    if raw is None:
+        return True
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(raw)
+
+
+def set_include_subfolders_config(value: bool) -> bool:
+    """Persist ``include_subfolders`` in config.json."""
+    flag = bool(value)
+    data = load_config()
+    data["include_subfolders"] = flag
+    save_config(data)
+    return flag
+
+
 class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     """桌面 GUI：分区操作、列表/缩略图视图、多页 PDF 导出与本地翻译。"""
 
@@ -682,6 +704,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.output_dir: Path = ensure_default_output_dir()
         self.direct_export_var: Optional[tk.BooleanVar] = None
         self.translate_then_export_var: Optional[tk.BooleanVar] = None
+        self.include_subfolders_var: Optional[tk.BooleanVar] = None
         self.output_dir_label_var: Optional[tk.StringVar] = None
         self.ollama_model_var: Optional[tk.StringVar] = None
         self._ollama_model_combo: Optional[ttk.Combobox] = None
@@ -722,53 +745,196 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         )
 
     # ------------------------------------------------------------------ UI
+    # Soft accent palette (not garish): soft blue / teal / slate
+    UI_BG = "#f4f7fb"
+    UI_CARD = "#ffffff"
+    UI_HEADER_BG = "#e8f0fe"
+    UI_ACCENT = "#4a7fd4"
+    UI_ACCENT_SOFT = "#5b8fa8"
+    UI_MUTED = "#5f6b7a"
+    UI_BORDER = "#d5dde8"
+    UI_EXPORT_BG = "#e8f5ef"
+    UI_EXPORT_ACCENT = "#3d8b6e"
+    UI_HINT_BG = "#f0f4f8"
+
+    def _apply_ttk_theme(self) -> None:
+        """clam theme + light accent styles for clearer section scanning."""
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        bg = self.UI_BG
+        card = self.UI_CARD
+        accent = self.UI_ACCENT
+        muted = self.UI_MUTED
+        border = self.UI_BORDER
+        self.configure(background=bg)
+        style.configure(".", background=bg, foreground="#1f2933")
+        style.configure("TFrame", background=bg)
+        style.configure("Card.TFrame", background=card)
+        style.configure(
+            "Header.TLabel",
+            background=self.UI_HEADER_BG,
+            foreground=accent,
+            font=("Segoe UI", 10, "bold"),
+            padding=(10, 5),
+        )
+        style.configure(
+            "HeaderExport.TLabel",
+            background=self.UI_EXPORT_BG,
+            foreground=self.UI_EXPORT_ACCENT,
+            font=("Segoe UI", 10, "bold"),
+            padding=(10, 5),
+        )
+        style.configure(
+            "Muted.TLabel",
+            background=card,
+            foreground=muted,
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Card.TLabel",
+            background=card,
+            foreground="#1f2933",
+        )
+        style.configure(
+            "Hint.TLabel",
+            background=self.UI_HINT_BG,
+            foreground=muted,
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "TLabelframe",
+            background=card,
+            bordercolor=border,
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=card,
+            foreground=accent,
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.configure(
+            "Accent.TLabelframe",
+            background=card,
+            bordercolor=accent,
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure(
+            "Accent.TLabelframe.Label",
+            background=card,
+            foreground=accent,
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.configure(
+            "Export.TLabelframe",
+            background=card,
+            bordercolor=self.UI_EXPORT_ACCENT,
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure(
+            "Export.TLabelframe.Label",
+            background=card,
+            foreground=self.UI_EXPORT_ACCENT,
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.configure("TButton", padding=(8, 4))
+        style.configure("TCheckbutton", background=card)
+        style.configure("TRadiobutton", background=card)
+        style.configure("TCombobox", padding=2)
+        style.map(
+            "TButton",
+            background=[("active", self.UI_HEADER_BG)],
+        )
+
+    def _make_section(
+        self,
+        parent,
+        title: str,
+        *,
+        export: bool = False,
+    ):
+        """Card with colored header strip + content frame (easier to scan)."""
+        outer = ttk.Frame(parent, style="Card.TFrame")
+        header_bg = self.UI_EXPORT_BG if export else self.UI_HEADER_BG
+        accent = self.UI_EXPORT_ACCENT if export else self.UI_ACCENT
+        # Colored left bar + header
+        head = tk.Frame(outer, background=header_bg, highlightthickness=0)
+        head.pack(fill=tk.X)
+        bar = tk.Frame(head, background=accent, width=4)
+        bar.pack(side=tk.LEFT, fill=tk.Y)
+        hdr_style = "HeaderExport.TLabel" if export else "Header.TLabel"
+        ttk.Label(head, text=title, style=hdr_style).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        body = ttk.Frame(outer, style="Card.TFrame", padding=(8, 6, 8, 6))
+        body.pack(fill=tk.BOTH, expand=True)
+        # Subtle bottom border via tk frame
+        tk.Frame(outer, background=self.UI_BORDER, height=1).pack(fill=tk.X)
+        return outer, body
+
     def _build_ui(self) -> None:
-        pad = {"padx": 8, "pady": 4}
+        self._apply_ttk_theme()
+        pad = {"padx": 10, "pady": 5}
         root = ttk.Frame(self)
-        root.pack(fill=tk.BOTH, expand=True)
+        root.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         # --- 添加 ---
-        add_fr = ttk.LabelFrame(root, text="添加")
-        add_fr.pack(fill=tk.X, **pad)
+        add_outer, add_fr = self._make_section(root, "添加")
+        add_outer.pack(fill=tk.X, **pad)
         ttk.Button(add_fr, text="添加图片…", command=self.add_images).pack(
-            side=tk.LEFT, padx=(8, 4), pady=6
+            side=tk.LEFT, padx=(0, 4), pady=2
         )
         ttk.Button(add_fr, text="添加 PDF…", command=self.add_pdfs).pack(
-            side=tk.LEFT, padx=4, pady=6
+            side=tk.LEFT, padx=4, pady=2
         )
         ttk.Button(add_fr, text="添加文件夹…", command=self.add_folder).pack(
-            side=tk.LEFT, padx=4, pady=6
+            side=tk.LEFT, padx=4, pady=2
         )
+        self.include_subfolders_var = tk.BooleanVar(
+            value=get_include_subfolders_config()
+        )
+        ttk.Checkbutton(
+            add_fr,
+            text="包含子文件夹",
+            variable=self.include_subfolders_var,
+            command=self._on_include_subfolders_toggle,
+        ).pack(side=tk.LEFT, padx=(8, 4), pady=2)
         self._count_var = tk.StringVar(value="共 0 项")
-        ttk.Label(add_fr, textvariable=self._count_var, foreground="#333333").pack(
-            side=tk.RIGHT, padx=10, pady=6
+        ttk.Label(add_fr, textvariable=self._count_var, style="Card.TLabel").pack(
+            side=tk.RIGHT, padx=(10, 0), pady=2
         )
 
         # --- 排序 ---
-        sort_fr = ttk.LabelFrame(root, text="排序")
-        sort_fr.pack(fill=tk.X, **pad)
+        sort_outer, sort_fr = self._make_section(root, "排序")
+        sort_outer.pack(fill=tk.X, **pad)
         ttk.Button(sort_fr, text="上移", command=lambda: self.move_selected(-1)).pack(
-            side=tk.LEFT, padx=(8, 4), pady=6
+            side=tk.LEFT, padx=(0, 4), pady=2
         )
         ttk.Button(sort_fr, text="下移", command=lambda: self.move_selected(1)).pack(
-            side=tk.LEFT, padx=4, pady=6
+            side=tk.LEFT, padx=4, pady=2
         )
         self.move_pos_var = tk.StringVar(value="1")
         self.move_pos_entry = ttk.Entry(sort_fr, width=5, textvariable=self.move_pos_var)
-        self.move_pos_entry.pack(side=tk.LEFT, padx=(10, 2), pady=6)
+        self.move_pos_entry.pack(side=tk.LEFT, padx=(10, 2), pady=2)
         ttk.Button(
             sort_fr, text="移到第…位", command=self.move_selected_to_position
-        ).pack(side=tk.LEFT, padx=4, pady=6)
+        ).pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Button(sort_fr, text="移除选中", command=self.remove_selected).pack(
-            side=tk.LEFT, padx=4, pady=6
+            side=tk.LEFT, padx=4, pady=2
         )
         ttk.Button(sort_fr, text="清空列表", command=self.clear_list).pack(
-            side=tk.LEFT, padx=4, pady=6
+            side=tk.LEFT, padx=4, pady=2
         )
 
         # --- 视图 ---
-        view_bar = ttk.LabelFrame(root, text="视图")
-        view_bar.pack(fill=tk.X, **pad)
+        view_outer, view_bar = self._make_section(root, "视图")
+        view_outer.pack(fill=tk.X, **pad)
         self.view_mode_var = tk.StringVar(value=self.VIEW_LIST)
         ttk.Radiobutton(
             view_bar,
@@ -776,27 +942,39 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             value=self.VIEW_LIST,
             variable=self.view_mode_var,
             command=self._on_view_mode_change,
-        ).pack(side=tk.LEFT, padx=(8, 4), pady=6)
+        ).pack(side=tk.LEFT, padx=(0, 4), pady=2)
         ttk.Radiobutton(
             view_bar,
             text="缩略图",
             value=self.VIEW_THUMB,
             variable=self.view_mode_var,
             command=self._on_view_mode_change,
-        ).pack(side=tk.LEFT, padx=4, pady=6)
+        ).pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Label(
             view_bar,
-            text="添加文件后可随时切换；缩略图显示序号与文件名，支持多选后移除/移位。",
-            foreground="#666666",
-        ).pack(side=tk.LEFT, padx=10, pady=6)
+            text="添加后可随时切换；缩略图支持多选后移除/移位。",
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, padx=10, pady=2)
 
         # --- 内容区（列表 / 缩略图）---
-        self._view_container = ttk.Frame(root)
-        self._view_container.pack(fill=tk.BOTH, expand=True, **pad)
+        list_outer, list_body = self._make_section(root, "文件列表")
+        list_outer.pack(fill=tk.BOTH, expand=True, **pad)
+        self._view_container = ttk.Frame(list_body, style="Card.TFrame")
+        self._view_container.pack(fill=tk.BOTH, expand=True)
 
-        self._list_frame = ttk.Frame(self._view_container)
+        self._list_frame = ttk.Frame(self._view_container, style="Card.TFrame")
         self.listbox = tk.Listbox(
-            self._list_frame, selectmode=tk.EXTENDED, activestyle="dotbox"
+            self._list_frame,
+            selectmode=tk.EXTENDED,
+            activestyle="dotbox",
+            background="#ffffff",
+            foreground="#1f2933",
+            selectbackground="#4a7fd4",
+            selectforeground="#ffffff",
+            highlightthickness=1,
+            highlightbackground=self.UI_BORDER,
+            relief=tk.FLAT,
+            borderwidth=0,
         )
         list_scroll = ttk.Scrollbar(
             self._list_frame, orient=tk.VERTICAL, command=self.listbox.yview
@@ -807,14 +985,16 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.listbox.bind("<Double-Button-1>", self._on_list_double_click)
         self.listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
 
-        self._thumb_outer = ttk.Frame(self._view_container)
+        self._thumb_outer = ttk.Frame(self._view_container, style="Card.TFrame")
         self._thumb_canvas = tk.Canvas(
-            self._thumb_outer, highlightthickness=0, background="#f5f5f5"
+            self._thumb_outer,
+            highlightthickness=0,
+            background="#eef2f7",
         )
         self._thumb_scroll = ttk.Scrollbar(
             self._thumb_outer, orient=tk.VERTICAL, command=self._thumb_canvas.yview
         )
-        self._thumb_inner = ttk.Frame(self._thumb_canvas)
+        self._thumb_inner = ttk.Frame(self._thumb_canvas, style="Card.TFrame")
         self._thumb_inner.bind(
             "<Configure>",
             lambda e: self._thumb_canvas.configure(
@@ -836,41 +1016,33 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
 
         self._show_list_view()
 
-        # --- 导出说明 ---
-        hint = ttk.LabelFrame(root, text="导出说明")
-        hint.pack(fill=tk.X, **pad)
-        ttk.Label(
-            hint,
-            text="多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
-            "PDF 贡献全部页并直接合并（不重新栅格化）。可混合。"
-            "「本地翻译后导出」：图片 EN→ZH，写入 translated_zh/（不覆盖原图），跳过 PDF/GIF。",
-            wraplength=980,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, padx=8, pady=6)
-
         # --- 设定 ---
-        settings_fr = ttk.LabelFrame(root, text="设定")
-        settings_fr.pack(fill=tk.X, **pad)
-        ttk.Label(settings_fr, text="默认导出目录：").pack(side=tk.LEFT, padx=(8, 0), pady=6)
+        settings_outer, settings_fr = self._make_section(root, "设定")
+        settings_outer.pack(fill=tk.X, **pad)
+        ttk.Label(settings_fr, text="默认导出目录：", style="Card.TLabel").pack(
+            side=tk.LEFT, padx=(0, 0), pady=2
+        )
         self.output_dir_label_var = tk.StringVar(value="")
         ttk.Label(
             settings_fr,
             textvariable=self.output_dir_label_var,
-            foreground="#333333",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, pady=6)
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, pady=2)
         ttk.Button(
             settings_fr,
             text="设定默认导出文件夹…",
             command=self.set_default_output_folder,
-        ).pack(side=tk.LEFT, padx=4, pady=6)
+        ).pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Button(
             settings_fr, text="创建桌面快捷方式", command=self.create_shortcut
-        ).pack(side=tk.LEFT, padx=(4, 8), pady=6)
+        ).pack(side=tk.LEFT, padx=(4, 0), pady=2)
 
         # --- 翻译 ---
-        tr_fr = ttk.LabelFrame(root, text="翻译")
-        tr_fr.pack(fill=tk.X, **pad)
-        ttk.Label(tr_fr, text="Ollama 模型：").pack(side=tk.LEFT, padx=(8, 0), pady=6)
+        tr_outer, tr_fr = self._make_section(root, "翻译")
+        tr_outer.pack(fill=tk.X, **pad)
+        ttk.Label(tr_fr, text="Ollama 模型：", style="Card.TLabel").pack(
+            side=tk.LEFT, padx=(0, 0), pady=2
+        )
         self.ollama_model_var = tk.StringVar(value=resolve_ollama_model_choice())
         self._ollama_model_combo = ttk.Combobox(
             tr_fr,
@@ -878,14 +1050,16 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             width=28,
             state="readonly",
         )
-        self._ollama_model_combo.pack(side=tk.LEFT, padx=(0, 4), pady=6)
+        self._ollama_model_combo.pack(side=tk.LEFT, padx=(0, 4), pady=2)
         self._ollama_model_combo.bind(
             "<<ComboboxSelected>>", self._on_ollama_model_selected
         )
         ttk.Button(
             tr_fr, text="刷新模型列表", command=self._refresh_ollama_model_combo
-        ).pack(side=tk.LEFT, padx=2, pady=6)
-        ttk.Label(tr_fr, text="OCR：").pack(side=tk.LEFT, padx=(12, 0), pady=6)
+        ).pack(side=tk.LEFT, padx=2, pady=2)
+        ttk.Label(tr_fr, text="OCR：", style="Card.TLabel").pack(
+            side=tk.LEFT, padx=(12, 0), pady=2
+        )
         self.ocr_engine_var = tk.StringVar(value=resolve_ocr_engine_choice())
         self._ocr_engine_combo = ttk.Combobox(
             tr_fr,
@@ -894,57 +1068,73 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             width=10,
             state="readonly",
         )
-        self._ocr_engine_combo.pack(side=tk.LEFT, padx=(0, 4), pady=6)
+        self._ocr_engine_combo.pack(side=tk.LEFT, padx=(0, 4), pady=2)
         self._ocr_engine_combo.bind(
             "<<ComboboxSelected>>", self._on_ocr_engine_selected
         )
         ttk.Label(
             tr_fr,
             text="（默认 paddle，失败回退 easyocr）",
-            foreground="#666666",
-        ).pack(side=tk.LEFT, padx=6, pady=6)
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, padx=6, pady=2)
 
         # --- 导出 ---
-        export_fr = ttk.LabelFrame(root, text="导出")
-        export_fr.pack(fill=tk.X, **pad)
+        export_outer, export_fr = self._make_section(root, "导出", export=True)
+        export_outer.pack(fill=tk.X, **pad)
         self._export_btn = ttk.Button(
             export_fr, text="生成 PDF…", command=self.export_pdf
         )
-        self._export_btn.pack(side=tk.LEFT, padx=(8, 4), pady=6)
+        self._export_btn.pack(side=tk.LEFT, padx=(0, 4), pady=2)
         self.direct_export_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             export_fr,
             text="直接导出到默认文件夹",
             variable=self.direct_export_var,
-        ).pack(side=tk.LEFT, padx=6, pady=6)
+        ).pack(side=tk.LEFT, padx=6, pady=2)
         self.translate_then_export_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             export_fr,
             text="本地翻译后导出",
             variable=self.translate_then_export_var,
-        ).pack(side=tk.LEFT, padx=4, pady=6)
+        ).pack(side=tk.LEFT, padx=4, pady=2)
         self._translate_export_btn = ttk.Button(
             export_fr, text="本地翻译后导出…", command=self.export_pdf_translated
         )
-        self._translate_export_btn.pack(side=tk.LEFT, padx=4, pady=6)
+        self._translate_export_btn.pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Button(export_fr, text="退出", command=self.destroy).pack(
-            side=tk.RIGHT, padx=(4, 8), pady=6
+            side=tk.RIGHT, padx=(4, 0), pady=2
         )
 
+        # Compact hint under export (was separate LabelFrame)
+        hint = tk.Frame(root, background=self.UI_HINT_BG)
+        hint.pack(fill=tk.X, padx=10, pady=(0, 4))
+        ttk.Label(
+            hint,
+            text="多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
+            "PDF 直接合并页。翻译后写入 translated_zh/（不覆盖原图），跳过 PDF/GIF。",
+            style="Hint.TLabel",
+            wraplength=980,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=10, pady=6)
+
         self.status = tk.StringVar(value="")
-        status_fr = ttk.Frame(self)
-        status_fr.pack(fill=tk.X, side=tk.BOTTOM, padx=4, pady=4)
+        status_fr = tk.Frame(self, background=self.UI_HEADER_BG)
+        status_fr.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Frame(status_fr, background=self.UI_ACCENT, width=4).pack(
+            side=tk.LEFT, fill=tk.Y
+        )
         ttk.Label(
             status_fr,
             text="状态",
-            foreground="#555555",
+            style="Header.TLabel",
         ).pack(side=tk.LEFT, padx=(4, 6))
         ttk.Label(
             status_fr,
             textvariable=self.status,
-            relief=tk.SUNKEN,
+            relief=tk.FLAT,
             anchor=tk.W,
-            padding=(6, 4),
+            padding=(6, 6),
+            background=self.UI_BG,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _update_count_label(self) -> None:
@@ -1382,6 +1572,11 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._refresh_view()
         self._set_status(f"已添加 {added} 个 PDF，当前共 {len(self.paths)} 项。可切换「列表 / 缩略图」。")
 
+    def _on_include_subfolders_toggle(self) -> None:
+        if self.include_subfolders_var is None:
+            return
+        set_include_subfolders_config(bool(self.include_subfolders_var.get()))
+
     def add_folder(self) -> None:
         if self._exporting:
             return
@@ -1389,11 +1584,16 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         if not folder:
             return
         folder_path = Path(folder)
-        items = list_images_in_folder(folder_path)
+        recurse = True
+        if self.include_subfolders_var is not None:
+            recurse = bool(self.include_subfolders_var.get())
+            set_include_subfolders_config(recurse)
+        items = list_images_in_folder(folder_path, recurse=recurse)
         if not items:
+            scope = "（含所有子目录）" if recurse else "（仅顶层）"
             messagebox.showwarning(
                 "提示",
-                f"该文件夹内没有常见格式的图片或 PDF：\n{folder_path}",
+                f"该文件夹{scope}内没有常见格式的图片或 PDF：\n{folder_path}",
             )
             self._set_status("文件夹内未找到图片或 PDF。")
             return
@@ -1416,8 +1616,9 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         else:
             self._update_source_folder_from_paths()
         self._refresh_view()
+        scope = "含所有子目录" if recurse else "仅顶层"
         self._set_status(
-            f"从文件夹（含所有子目录）添加了 {added} 项（图片+PDF，自然排序），"
+            f"从文件夹（{scope}）添加了 {added} 项（图片+PDF，自然排序），"
             f"当前共 {len(self.paths)} 项。"
             f"默认 PDF 名：{default_pdf_name(self.paths, self.source_folder)}"
             " 可切换「列表 / 缩略图」。"
