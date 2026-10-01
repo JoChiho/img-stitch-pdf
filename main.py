@@ -33,7 +33,7 @@ except ImportError:
     img2pdf = None  # type: ignore
 
 
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")  # skip .gif by default
 PROJECT_DIR = Path(__file__).resolve().parent
 
 ProgressCallback = Callable[[int, int], None]
@@ -52,15 +52,60 @@ def natural_key(name: str):
     return key
 
 
-def list_images_in_folder(folder: Path) -> List[Path]:
-    """收集文件夹内常见扩展名图片，按文件名自然排序。"""
+def list_images_in_folder(
+    folder: Path,
+    *,
+    skip_gif: bool = True,
+) -> List[Path]:
+    """递归收集文件夹（含子目录）内常见扩展名图片，按相对路径自然排序。
+
+    默认跳过 .gif；保留 jpg/jpeg/png/webp/bmp/tif/tiff。
+    """
     folder = Path(folder)
+    allowed = set(IMAGE_EXTS)
+    if not skip_gif:
+        allowed = set(allowed) | {".gif"}
     found: List[Path] = []
-    for p in folder.iterdir():
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
-            found.append(p)
-    found.sort(key=lambda p: natural_key(p.name))
+    for p in folder.rglob("*"):
+        if not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        if suf not in allowed:
+            continue
+        found.append(p)
+    found.sort(key=lambda p: natural_key(p.relative_to(folder).as_posix()))
     return found
+
+
+
+def move_items_to_index(
+    items: Sequence,
+    selected_indices: Sequence[int],
+    target_1based: int,
+) -> List:
+    """将选中项移到 1-based 目标位置，返回新列表。
+
+    - selected_indices：0-based，可乱序；按原相对顺序组成一块
+    - target_1based：第一块选中项在结果中的目标序号（夹到 1..len）
+    - 未选中项保持相对顺序
+    """
+    items_list = list(items)
+    n = len(items_list)
+    if n == 0 or not selected_indices:
+        return items_list
+    try:
+        target = int(target_1based)
+    except (TypeError, ValueError):
+        raise ValueError("目标位置必须是整数") from None
+    target = max(1, min(target, n))
+    idx_set = {i for i in selected_indices if isinstance(i, int) and 0 <= i < n}
+    if not idx_set:
+        return items_list
+    ordered = sorted(idx_set)
+    moving = [items_list[i] for i in ordered]
+    remaining = [items_list[i] for i in range(n) if i not in idx_set]
+    insert_at = max(0, min(target - 1, len(remaining)))
+    return remaining[:insert_at] + moving + remaining[insert_at:]
 
 
 def default_pdf_name(paths: List[Path], source_folder: Optional[Path]) -> str:
@@ -250,7 +295,7 @@ class App(tk.Tk):
         self._export_btn: Optional[ttk.Button] = None
 
         self._build_ui()
-        self._set_status("请添加图片，或「添加文件夹」。默认：多页 PDF，一图一页。")
+        self._set_status("请添加图片或添加文件夹（含子目录）。可用「移到第…位」或双击调整顺序。默认：多页 PDF（一图一页）。")
 
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 4}
@@ -270,6 +315,12 @@ class App(tk.Tk):
         ttk.Button(top, text="下移", command=lambda: self.move_selected(1)).pack(
             side=tk.LEFT, padx=2
         )
+        self.move_pos_var = tk.StringVar(value="1")
+        self.move_pos_entry = ttk.Entry(top, width=5, textvariable=self.move_pos_var)
+        self.move_pos_entry.pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Button(top, text="移到第…位", command=self.move_selected_to_position).pack(
+            side=tk.LEFT, padx=2
+        )
         ttk.Button(top, text="移除选中", command=self.remove_selected).pack(
             side=tk.LEFT, padx=2
         )
@@ -285,6 +336,7 @@ class App(tk.Tk):
         self.listbox.configure(yscrollcommand=scroll.set)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.bind("<Double-Button-1>", self._on_list_double_click)
 
         hint = ttk.LabelFrame(self, text="导出说明")
         hint.pack(fill=tk.X, **pad)
@@ -342,7 +394,7 @@ class App(tk.Tk):
         files = filedialog.askopenfilenames(
             title="选择图片",
             filetypes=[
-                ("图片文件", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.gif"),
+                ("图片文件", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
                 ("所有文件", "*.*"),
             ],
         )
@@ -379,21 +431,32 @@ class App(tk.Tk):
             if path not in self.paths:
                 self.paths.append(path)
                 added += 1
-        self._update_source_folder_from_paths()
-        if all(p.resolve().parent == folder_path.resolve() for p in self.paths):
-            self.source_folder = folder_path.resolve()
+        root = folder_path.resolve()
+
+        def _under_root(p: Path) -> bool:
+            try:
+                p.resolve().relative_to(root)
+                return True
+            except ValueError:
+                return False
+
+        if self.paths and all(_under_root(p) for p in self.paths):
+            self.source_folder = root
+        else:
+            self._update_source_folder_from_paths()
         self._refresh_list()
         self._set_status(
-            f"从文件夹添加 {added} 张（自然排序），当前共 {len(self.paths)} 张。"
+            f"从文件夹（含所有子目录）添加了 {added} 张（自然排序），当前共 {len(self.paths)} 张。"
             f"默认 PDF 名：{default_pdf_name(self.paths, self.source_folder)}"
         )
+
 
     def move_selected(self, delta: int) -> None:
         if self._exporting:
             return
         sel = list(self.listbox.curselection())
         if len(sel) != 1:
-            self._set_status("请只选中一张图片再调整顺序。")
+            self._set_status("请只选择一张图片再上下移动；多选请用「移到第…位」。")
             return
         i = sel[0]
         j = i + delta
@@ -403,6 +466,83 @@ class App(tk.Tk):
         self._refresh_list()
         self.listbox.selection_set(j)
         self._set_status("已调整顺序。")
+
+    def move_selected_to_position(self, target_1based: Optional[int] = None) -> None:
+        """将当前选中项移到指定 1-based 位置（支持多选，保持相对顺序）。"""
+        if self._exporting:
+            return
+        sel = list(self.listbox.curselection())
+        if not sel:
+            self._set_status("请先选择要移动的图片。")
+            return
+        if target_1based is None:
+            raw = (self.move_pos_var.get() or "").strip()
+            try:
+                target_1based = int(raw)
+            except ValueError:
+                messagebox.showwarning("提示", "请输入有效的目标位置（正整数）。")
+                self._set_status("目标位置无效。")
+                return
+        try:
+            self.paths = move_items_to_index(self.paths, sel, target_1based)
+        except ValueError as e:
+            messagebox.showwarning("提示", str(e))
+            self._set_status(str(e))
+            return
+        self._refresh_list()
+        n = len(self.paths)
+        start = max(0, min(int(target_1based) - 1, n - len(sel)))
+        for k in range(len(sel)):
+            idx = start + k
+            if 0 <= idx < n:
+                self.listbox.selection_set(idx)
+        if sel:
+            self.listbox.see(start)
+        self._set_status(f"已移到第 {start + 1} 位起（共 {len(sel)} 项）。")
+
+    def _on_list_double_click(self, _event=None) -> None:
+        """双击：弹出对话框输入新的序号。"""
+        if self._exporting:
+            return
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        current = sel[0] + 1
+        dialog = tk.Toplevel(self)
+        dialog.title("调整顺序")
+        dialog.transient(self)
+        dialog.grab_set()
+        ttk.Label(dialog, text=f"当前第 {current} 位，移到第几位？（1–{len(self.paths)}）").pack(
+            padx=12, pady=(12, 4)
+        )
+        var = tk.StringVar(value=str(current))
+        entry = ttk.Entry(dialog, width=8, textvariable=var)
+        entry.pack(padx=12, pady=4)
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+
+        def apply() -> None:
+            raw = (var.get() or "").strip()
+            try:
+                target = int(raw)
+            except ValueError:
+                messagebox.showwarning("提示", "请输入有效的正整数。", parent=dialog)
+                return
+            dialog.destroy()
+            self.move_pos_var.set(str(target))
+            self.move_selected_to_position(target)
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        btns = ttk.Frame(dialog)
+        btns.pack(pady=8)
+        ttk.Button(btns, text="确定", command=apply).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="取消", command=cancel).pack(side=tk.LEFT, padx=4)
+        dialog.bind("<Return>", lambda e: apply())
+        dialog.bind("<Escape>", lambda e: cancel())
+        dialog.update_idletasks()
+        dialog.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 120}")
 
     def remove_selected(self) -> None:
         if self._exporting:

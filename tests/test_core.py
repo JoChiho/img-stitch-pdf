@@ -19,18 +19,49 @@ def test_natural_key_orders_numeric_parts():
     assert sorted_names == ["img1.png", "img2.png", "img10.png", "img20.png"]
 
 
-def test_list_images_in_folder(tmp_path: Path):
+def test_list_images_in_folder_recursive_natural_sort(tmp_path: Path):
     (tmp_path / "b.jpg").write_bytes(b"x")
     (tmp_path / "a10.png").write_bytes(b"x")
     (tmp_path / "a2.png").write_bytes(b"x")
     (tmp_path / "notes.txt").write_bytes(b"x")
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "nested.jpg").write_bytes(b"x")
+    (tmp_path / "sub" / "deep").mkdir()
+    (tmp_path / "sub" / "deep" / "z.webp").write_bytes(b"x")
+
+    found = main.list_images_in_folder(tmp_path)
+    rels = [p.relative_to(tmp_path).as_posix() for p in found]
+    assert rels == ["a2.png", "a10.png", "b.jpg", "sub/deep/z.webp", "sub/nested.jpg"]
+
+
+def test_list_images_skips_gif_by_default(tmp_path: Path):
+    (tmp_path / "keep.png").write_bytes(b"x")
+    (tmp_path / "skip.gif").write_bytes(b"x")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "also.gif").write_bytes(b"x")
+    (tmp_path / "sub" / "ok.jpg").write_bytes(b"x")
 
     found = main.list_images_in_folder(tmp_path)
     names = [p.name for p in found]
-    assert names == ["a2.png", "a10.png", "b.jpg"]
-    assert all(p.parent == tmp_path for p in found)
+    assert names == ["keep.png", "ok.jpg"]
+    assert all(p.suffix.lower() != ".gif" for p in found)
+
+    found_with_gif = main.list_images_in_folder(tmp_path, skip_gif=False)
+    names_gif = sorted(p.name for p in found_with_gif)
+    assert names_gif == ["also.gif", "keep.png", "ok.jpg", "skip.gif"]
+
+
+def test_move_items_to_index_single_and_multi():
+    items = ["a", "b", "c", "d", "e"]
+    assert main.move_items_to_index(items, [2], 1) == ["c", "a", "b", "d", "e"]
+    assert main.move_items_to_index(items, [0], 3) == ["b", "c", "a", "d", "e"]
+    assert main.move_items_to_index(items, [0], 5) == ["b", "c", "d", "e", "a"]
+    assert main.move_items_to_index(items, [2, 3], 1) == ["c", "d", "a", "b", "e"]
+    assert main.move_items_to_index(items, [0, 1], 4) == ["c", "d", "e", "a", "b"]
+    # clamp / empty / invalid indices
+    assert main.move_items_to_index(items, [2], 99) == ["a", "b", "d", "e", "c"]
+    assert main.move_items_to_index(items, [], 1) == items
+    assert main.move_items_to_index(items, [9], 1) == items
 
 
 def test_default_pdf_name_from_folder():
