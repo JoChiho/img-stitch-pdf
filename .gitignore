@@ -23,3 +23,6 @@ Thumbs.db
 uploads/
 tmp/
 *.log
+
+# Tests
+.pytest_cache/
