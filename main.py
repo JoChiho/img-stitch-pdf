@@ -22,7 +22,7 @@ import tempfile
 import threading
 import traceback
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import tkinter as tk
@@ -36,6 +36,13 @@ try:
 except ImportError:
     print("请先安装依赖: pip install -r requirements.txt", file=sys.stderr)
     raise
+
+try:
+    from PIL import ImageTk, ImageDraw, ImageFont
+except ImportError:  # headless / minimal Pillow
+    ImageTk = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    ImageFont = None  # type: ignore
 
 try:
     import img2pdf
@@ -653,11 +660,19 @@ def apply_ocr_engine_to_runtime(engine=None) -> str:
 
 
 class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
+    """桌面 GUI：分区操作、列表/缩略图视图、多页 PDF 导出与本地翻译。"""
+
+    VIEW_LIST = "list"
+    VIEW_THUMB = "thumb"
+    THUMB_PX = 128
+    THUMB_PAD = 8
+    THUMB_COLS_MIN = 2
+
     def __init__(self) -> None:
         super().__init__()
         self.title("图片 / PDF 导出 PDF")
-        self.geometry("820x560")
-        self.minsize(700, 420)
+        self.geometry("1040x720")
+        self.minsize(900, 580)
 
         self.paths: List[Path] = []
         self.source_folder: Optional[Path] = None
@@ -673,174 +688,640 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.ocr_engine_var: Optional[tk.StringVar] = None
         self._ocr_engine_combo: Optional[ttk.Combobox] = None
 
+        self.view_mode_var: Optional[tk.StringVar] = None
+        self._selected: Set[int] = set()
+        self._sel_anchor: Optional[int] = None
+        self._thumb_cache: Dict[str, "ImageTk.PhotoImage"] = {}
+        self._thumb_widgets: List[dict] = []
+        self._thumb_load_job: Optional[str] = None
+        self._thumb_pending: List[int] = []
+        self._placeholder_photo: Optional["ImageTk.PhotoImage"] = None
+        self._pdf_placeholder_photo: Optional["ImageTk.PhotoImage"] = None
+
+        self.listbox: Optional[tk.Listbox] = None
+        self._list_frame: Optional[ttk.Frame] = None
+        self._thumb_outer: Optional[ttk.Frame] = None
+        self._thumb_canvas: Optional[tk.Canvas] = None
+        self._thumb_inner: Optional[ttk.Frame] = None
+        self._thumb_scroll: Optional[ttk.Scrollbar] = None
+        self._view_container: Optional[ttk.Frame] = None
+        self._count_var: Optional[tk.StringVar] = None
+        self.move_pos_var: Optional[tk.StringVar] = None
+        self.move_pos_entry: Optional[ttk.Entry] = None
+        self.status: Optional[tk.StringVar] = None
+
         self._build_ui()
         self._refresh_output_dir_label()
         self._refresh_ollama_model_combo()
         apply_ocr_engine_to_runtime(resolve_ocr_engine_choice())
+        self._update_count_label()
         self._set_status(
-            "请添加图片、PDF 或文件夹（含子目录）。可用「移到第…位」或双击调整顺序。"
-            f"默认导出目录：{self.output_dir}"
+            "请添加图片、PDF 或文件夹。添加后可切换「列表 / 缩略图」视图；"
+            "用「移到第…位」或双击调整顺序。"
+            f" 默认导出目录：{self.output_dir}"
         )
 
+    # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 4}
+        root = ttk.Frame(self)
+        root.pack(fill=tk.BOTH, expand=True)
 
-        top = ttk.Frame(self)
-        top.pack(fill=tk.X, **pad)
+        # --- 添加 ---
+        add_fr = ttk.LabelFrame(root, text="添加")
+        add_fr.pack(fill=tk.X, **pad)
+        ttk.Button(add_fr, text="添加图片…", command=self.add_images).pack(
+            side=tk.LEFT, padx=(8, 4), pady=6
+        )
+        ttk.Button(add_fr, text="添加 PDF…", command=self.add_pdfs).pack(
+            side=tk.LEFT, padx=4, pady=6
+        )
+        ttk.Button(add_fr, text="添加文件夹…", command=self.add_folder).pack(
+            side=tk.LEFT, padx=4, pady=6
+        )
+        self._count_var = tk.StringVar(value="共 0 项")
+        ttk.Label(add_fr, textvariable=self._count_var, foreground="#333333").pack(
+            side=tk.RIGHT, padx=10, pady=6
+        )
 
-        ttk.Button(top, text="添加图片…", command=self.add_images).pack(
-            side=tk.LEFT, padx=(0, 4)
+        # --- 排序 ---
+        sort_fr = ttk.LabelFrame(root, text="排序")
+        sort_fr.pack(fill=tk.X, **pad)
+        ttk.Button(sort_fr, text="上移", command=lambda: self.move_selected(-1)).pack(
+            side=tk.LEFT, padx=(8, 4), pady=6
         )
-        ttk.Button(top, text="添加 PDF…", command=self.add_pdfs).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(top, text="添加文件夹…", command=self.add_folder).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(top, text="上移", command=lambda: self.move_selected(-1)).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(top, text="下移", command=lambda: self.move_selected(1)).pack(
-            side=tk.LEFT, padx=2
+        ttk.Button(sort_fr, text="下移", command=lambda: self.move_selected(1)).pack(
+            side=tk.LEFT, padx=4, pady=6
         )
         self.move_pos_var = tk.StringVar(value="1")
-        self.move_pos_entry = ttk.Entry(top, width=5, textvariable=self.move_pos_var)
-        self.move_pos_entry.pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Button(top, text="移到第…位", command=self.move_selected_to_position).pack(
-            side=tk.LEFT, padx=2
+        self.move_pos_entry = ttk.Entry(sort_fr, width=5, textvariable=self.move_pos_var)
+        self.move_pos_entry.pack(side=tk.LEFT, padx=(10, 2), pady=6)
+        ttk.Button(
+            sort_fr, text="移到第…位", command=self.move_selected_to_position
+        ).pack(side=tk.LEFT, padx=4, pady=6)
+        ttk.Button(sort_fr, text="移除选中", command=self.remove_selected).pack(
+            side=tk.LEFT, padx=4, pady=6
         )
-        ttk.Button(top, text="移除选中", command=self.remove_selected).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(top, text="清空列表", command=self.clear_list).pack(
-            side=tk.LEFT, padx=2
+        ttk.Button(sort_fr, text="清空列表", command=self.clear_list).pack(
+            side=tk.LEFT, padx=4, pady=6
         )
 
-        mid = ttk.Frame(self)
-        mid.pack(fill=tk.BOTH, expand=True, **pad)
+        # --- 视图 ---
+        view_bar = ttk.LabelFrame(root, text="视图")
+        view_bar.pack(fill=tk.X, **pad)
+        self.view_mode_var = tk.StringVar(value=self.VIEW_LIST)
+        ttk.Radiobutton(
+            view_bar,
+            text="列表",
+            value=self.VIEW_LIST,
+            variable=self.view_mode_var,
+            command=self._on_view_mode_change,
+        ).pack(side=tk.LEFT, padx=(8, 4), pady=6)
+        ttk.Radiobutton(
+            view_bar,
+            text="缩略图",
+            value=self.VIEW_THUMB,
+            variable=self.view_mode_var,
+            command=self._on_view_mode_change,
+        ).pack(side=tk.LEFT, padx=4, pady=6)
+        ttk.Label(
+            view_bar,
+            text="添加文件后可随时切换；缩略图显示序号与文件名，支持多选后移除/移位。",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=10, pady=6)
 
-        self.listbox = tk.Listbox(mid, selectmode=tk.EXTENDED, activestyle="dotbox")
-        scroll = ttk.Scrollbar(mid, orient=tk.VERTICAL, command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=scroll.set)
+        # --- 内容区（列表 / 缩略图）---
+        self._view_container = ttk.Frame(root)
+        self._view_container.pack(fill=tk.BOTH, expand=True, **pad)
+
+        self._list_frame = ttk.Frame(self._view_container)
+        self.listbox = tk.Listbox(
+            self._list_frame, selectmode=tk.EXTENDED, activestyle="dotbox"
+        )
+        list_scroll = ttk.Scrollbar(
+            self._list_frame, orient=tk.VERTICAL, command=self.listbox.yview
+        )
+        self.listbox.configure(yscrollcommand=list_scroll.set)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.bind("<Double-Button-1>", self._on_list_double_click)
+        self.listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
 
-        hint = ttk.LabelFrame(self, text="导出说明")
+        self._thumb_outer = ttk.Frame(self._view_container)
+        self._thumb_canvas = tk.Canvas(
+            self._thumb_outer, highlightthickness=0, background="#f5f5f5"
+        )
+        self._thumb_scroll = ttk.Scrollbar(
+            self._thumb_outer, orient=tk.VERTICAL, command=self._thumb_canvas.yview
+        )
+        self._thumb_inner = ttk.Frame(self._thumb_canvas)
+        self._thumb_inner.bind(
+            "<Configure>",
+            lambda e: self._thumb_canvas.configure(
+                scrollregion=self._thumb_canvas.bbox("all")
+            ),
+        )
+        self._thumb_window = self._thumb_canvas.create_window(
+            (0, 0), window=self._thumb_inner, anchor="nw"
+        )
+        self._thumb_canvas.configure(yscrollcommand=self._thumb_scroll.set)
+        self._thumb_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._thumb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._thumb_canvas.bind("<Configure>", self._on_thumb_canvas_configure)
+        # Mouse wheel (Windows / macOS / Linux)
+        self._thumb_canvas.bind("<Enter>", self._bind_thumb_wheel)
+        self._thumb_canvas.bind("<Leave>", self._unbind_thumb_wheel)
+        self._thumb_inner.bind("<Enter>", self._bind_thumb_wheel)
+        self._thumb_inner.bind("<Leave>", self._unbind_thumb_wheel)
+
+        self._show_list_view()
+
+        # --- 导出说明 ---
+        hint = ttk.LabelFrame(root, text="导出说明")
         hint.pack(fill=tk.X, **pad)
         ttk.Label(
             hint,
-            text="生成多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
-            "PDF 文件贡献其全部页并直接合并（不重新栅格化）。可混合图片与 PDF。"
-            "勾选或点「本地翻译后导出」：对图片做本地 EN→ZH（原图保留，下方追加中文译文条带），写入 translated_zh/ 子文件夹（不覆盖原图）。"
-            "跳过 PDF/GIF，再导出多页 PDF。首次需下载 OCR/翻译模型。",
-            wraplength=760,
+            text="多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
+            "PDF 贡献全部页并直接合并（不重新栅格化）。可混合。"
+            "「本地翻译后导出」：图片 EN→ZH，写入 translated_zh/（不覆盖原图），跳过 PDF/GIF。",
+            wraplength=980,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=8, pady=6)
 
-        out_row = ttk.Frame(self)
-        out_row.pack(fill=tk.X, **pad)
-        ttk.Label(out_row, text="默认导出目录：").pack(side=tk.LEFT)
+        # --- 设定 ---
+        settings_fr = ttk.LabelFrame(root, text="设定")
+        settings_fr.pack(fill=tk.X, **pad)
+        ttk.Label(settings_fr, text="默认导出目录：").pack(side=tk.LEFT, padx=(8, 0), pady=6)
         self.output_dir_label_var = tk.StringVar(value="")
         ttk.Label(
-            out_row,
+            settings_fr,
             textvariable=self.output_dir_label_var,
             foreground="#333333",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, pady=6)
         ttk.Button(
-            out_row, text="设定默认导出文件夹…", command=self.set_default_output_folder
-        ).pack(side=tk.RIGHT)
+            settings_fr,
+            text="设定默认导出文件夹…",
+            command=self.set_default_output_folder,
+        ).pack(side=tk.LEFT, padx=4, pady=6)
+        ttk.Button(
+            settings_fr, text="创建桌面快捷方式", command=self.create_shortcut
+        ).pack(side=tk.LEFT, padx=(4, 8), pady=6)
 
-        model_row = ttk.Frame(self)
-        model_row.pack(fill=tk.X, **pad)
-        ttk.Label(model_row, text="Ollama 模型：").pack(side=tk.LEFT)
+        # --- 翻译 ---
+        tr_fr = ttk.LabelFrame(root, text="翻译")
+        tr_fr.pack(fill=tk.X, **pad)
+        ttk.Label(tr_fr, text="Ollama 模型：").pack(side=tk.LEFT, padx=(8, 0), pady=6)
         self.ollama_model_var = tk.StringVar(value=resolve_ollama_model_choice())
         self._ollama_model_combo = ttk.Combobox(
-            model_row,
+            tr_fr,
             textvariable=self.ollama_model_var,
-            width=36,
+            width=28,
             state="readonly",
         )
-        self._ollama_model_combo.pack(side=tk.LEFT, padx=(0, 4))
+        self._ollama_model_combo.pack(side=tk.LEFT, padx=(0, 4), pady=6)
         self._ollama_model_combo.bind(
             "<<ComboboxSelected>>", self._on_ollama_model_selected
         )
         ttk.Button(
-            model_row, text="刷新模型列表", command=self._refresh_ollama_model_combo
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Label(
-            model_row,
-            text="（来自 ollama list，写入 config.json 的 ollama_model）",
-            foreground="#666666",
-        ).pack(side=tk.LEFT, padx=6)
-
-
-        ocr_row = ttk.Frame(self)
-        ocr_row.pack(fill=tk.X, **pad)
-        ttk.Label(ocr_row, text="OCR 引擎：").pack(side=tk.LEFT)
+            tr_fr, text="刷新模型列表", command=self._refresh_ollama_model_combo
+        ).pack(side=tk.LEFT, padx=2, pady=6)
+        ttk.Label(tr_fr, text="OCR：").pack(side=tk.LEFT, padx=(12, 0), pady=6)
         self.ocr_engine_var = tk.StringVar(value=resolve_ocr_engine_choice())
         self._ocr_engine_combo = ttk.Combobox(
-            ocr_row,
+            tr_fr,
             textvariable=self.ocr_engine_var,
             values=["paddle", "easyocr"],
-            width=12,
+            width=10,
             state="readonly",
         )
-        self._ocr_engine_combo.pack(side=tk.LEFT, padx=(0, 4))
+        self._ocr_engine_combo.pack(side=tk.LEFT, padx=(0, 4), pady=6)
         self._ocr_engine_combo.bind(
             "<<ComboboxSelected>>", self._on_ocr_engine_selected
         )
         ttk.Label(
-            ocr_row,
-            text="（默认 paddle；失败时自动回退 easyocr；写入 config.json 的 ocr_engine）",
+            tr_fr,
+            text="（默认 paddle，失败回退 easyocr）",
             foreground="#666666",
-        ).pack(side=tk.LEFT, padx=6)
+        ).pack(side=tk.LEFT, padx=6, pady=6)
 
-        bottom = ttk.Frame(self)
-        bottom.pack(fill=tk.X, **pad)
+        # --- 导出 ---
+        export_fr = ttk.LabelFrame(root, text="导出")
+        export_fr.pack(fill=tk.X, **pad)
         self._export_btn = ttk.Button(
-            bottom, text="生成 PDF…", command=self.export_pdf
+            export_fr, text="生成 PDF…", command=self.export_pdf
         )
-        self._export_btn.pack(side=tk.LEFT)
+        self._export_btn.pack(side=tk.LEFT, padx=(8, 4), pady=6)
         self.direct_export_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            bottom,
+            export_fr,
             text="直接导出到默认文件夹",
             variable=self.direct_export_var,
-        ).pack(side=tk.LEFT, padx=8)
+        ).pack(side=tk.LEFT, padx=6, pady=6)
         self.translate_then_export_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            bottom,
+            export_fr,
             text="本地翻译后导出",
             variable=self.translate_then_export_var,
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=4, pady=6)
         self._translate_export_btn = ttk.Button(
-            bottom, text="本地翻译后导出…", command=self.export_pdf_translated
+            export_fr, text="本地翻译后导出…", command=self.export_pdf_translated
         )
-        self._translate_export_btn.pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text="创建桌面快捷方式", command=self.create_shortcut).pack(
-            side=tk.LEFT, padx=8
+        self._translate_export_btn.pack(side=tk.LEFT, padx=4, pady=6)
+        ttk.Button(export_fr, text="退出", command=self.destroy).pack(
+            side=tk.RIGHT, padx=(4, 8), pady=6
         )
-        ttk.Button(bottom, text="退出", command=self.destroy).pack(side=tk.RIGHT)
 
         self.status = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status, relief=tk.SUNKEN, anchor=tk.W).pack(
-            fill=tk.X, side=tk.BOTTOM, padx=4, pady=4
-        )
+        status_fr = ttk.Frame(self)
+        status_fr.pack(fill=tk.X, side=tk.BOTTOM, padx=4, pady=4)
+        ttk.Label(
+            status_fr,
+            text="状态",
+            foreground="#555555",
+        ).pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(
+            status_fr,
+            textvariable=self.status,
+            relief=tk.SUNKEN,
+            anchor=tk.W,
+            padding=(6, 4),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-    def _set_status(self, msg: str) -> None:
-        self.status.set(msg)
-        self.update_idletasks()
+    def _update_count_label(self) -> None:
+        if self._count_var is None:
+            return
+        n = len(self.paths)
+        n_img = sum(1 for p in self.paths if is_image(p))
+        n_pdf = sum(1 for p in self.paths if is_pdf(p))
+        self._count_var.set(f"共 {n} 项（图 {n_img} / PDF {n_pdf}）")
+
+    # ---------------------------------------------------------- view modes
+    def _current_view(self) -> str:
+        if self.view_mode_var is None:
+            return self.VIEW_LIST
+        return self.view_mode_var.get() or self.VIEW_LIST
+
+    def _on_view_mode_change(self) -> None:
+        # Radio already updated view_mode_var; sync selection from the panel still mapped.
+        if self._list_frame is not None and self._list_frame.winfo_ismapped():
+            if self.listbox is not None:
+                try:
+                    self._selected = set(self.listbox.curselection())
+                except tk.TclError:
+                    pass
+        if self._current_view() == self.VIEW_THUMB:
+            self._show_thumb_view()
+        else:
+            self._show_list_view()
+        self._refresh_view(keep_selection=True)
+        mode_zh = "缩略图" if self._current_view() == self.VIEW_THUMB else "列表"
+        self._set_status(f"已切换到「{mode_zh}」视图，共 {len(self.paths)} 项。")
+
+    def _show_list_view(self) -> None:
+        if self._thumb_outer is not None:
+            self._thumb_outer.pack_forget()
+        if self._list_frame is not None:
+            self._list_frame.pack(fill=tk.BOTH, expand=True)
+
+    def _show_thumb_view(self) -> None:
+        if self._list_frame is not None:
+            self._list_frame.pack_forget()
+        if self._thumb_outer is not None:
+            self._thumb_outer.pack(fill=tk.BOTH, expand=True)
+
+    def _get_selection(self) -> List[int]:
+        if self._current_view() == self.VIEW_LIST and self.listbox is not None:
+            try:
+                return list(self.listbox.curselection())
+            except tk.TclError:
+                return sorted(self._selected)
+        return sorted(i for i in self._selected if 0 <= i < len(self.paths))
+
+    def _set_selection(
+        self, indices: Sequence[int], *, see: Optional[int] = None
+    ) -> None:
+        valid = {i for i in indices if isinstance(i, int) and 0 <= i < len(self.paths)}
+        self._selected = valid
+        if self.listbox is not None:
+            self.listbox.selection_clear(0, tk.END)
+            for idx in valid:
+                self.listbox.selection_set(idx)
+            if see is not None and 0 <= see < len(self.paths):
+                self.listbox.see(see)
+        self._paint_thumb_selection()
+        if see is not None and self._current_view() == self.VIEW_THUMB:
+            self._thumb_see(see)
+
+    def _on_listbox_select(self, _event=None) -> None:
+        if self.listbox is None:
+            return
+        try:
+            self._selected = set(self.listbox.curselection())
+        except tk.TclError:
+            pass
 
     def _refresh_list(self, keep_selection: bool = False) -> None:
-        sel = list(self.listbox.curselection()) if keep_selection else []
-        self.listbox.delete(0, tk.END)
-        for i, path in enumerate(self.paths, start=1):
+        """兼容旧名：刷新当前视图。"""
+        self._refresh_view(keep_selection=keep_selection)
+
+    def _refresh_view(self, keep_selection: bool = False) -> None:
+        if keep_selection:
+            sel = self._get_selection()
+            if not sel:
+                sel = sorted(self._selected)
+        else:
+            sel = sorted(i for i in self._selected if 0 <= i < len(self.paths))
+        if self.listbox is not None:
+            self.listbox.delete(0, tk.END)
+            for i, path in enumerate(self.paths, start=1):
+                kind = "PDF" if is_pdf(path) else "图"
+                self.listbox.insert(tk.END, f"{i}. [{kind}] {path.name}  —  {path}")
+        if self._current_view() == self.VIEW_THUMB:
+            self._rebuild_thumb_grid()
+        self._set_selection(sel)
+        self._update_count_label()
+
+    # ------------------------------------------------------- thumbnails
+    def _ensure_placeholders(self) -> None:
+        if self._placeholder_photo is not None:
+            return
+        if ImageTk is None or ImageDraw is None:
+            raise RuntimeError("缩略图需要 Pillow 的 ImageTk / ImageDraw 支持。")
+        size = self.THUMB_PX
+        # Generic image placeholder
+        img = Image.new("RGB", (size, size), (230, 230, 230))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([4, 4, size - 5, size - 5], outline=(160, 160, 160), width=2)
+        draw.line([(20, size - 30), (size // 2, 40), (size - 20, size - 30)], fill=(160, 160, 160), width=2)
+        self._placeholder_photo = ImageTk.PhotoImage(img)
+        # PDF placeholder
+        pdf = Image.new("RGB", (size, size), (245, 235, 230))
+        d2 = ImageDraw.Draw(pdf)
+        d2.rectangle([12, 8, size - 12, size - 8], fill=(255, 255, 255), outline=(180, 60, 60), width=2)
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+        text = "PDF"
+        if font is not None:
+            bbox = d2.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            d2.text(((size - tw) / 2, (size - th) / 2), text, fill=(180, 60, 60), font=font)
+        else:
+            d2.text((size // 2 - 10, size // 2 - 5), text, fill=(180, 60, 60))
+        self._pdf_placeholder_photo = ImageTk.PhotoImage(pdf)
+
+    def _thumb_cache_key(self, path: Path) -> str:
+        try:
+            st = path.stat()
+            return f"{path.resolve()}|{st.st_mtime_ns}|{st.st_size}|{self.THUMB_PX}"
+        except OSError:
+            return f"{path}|missing|{self.THUMB_PX}"
+
+    def _make_thumb_image(self, path: Path) -> "ImageTk.PhotoImage":
+        self._ensure_placeholders()
+        key = self._thumb_cache_key(path)
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            return cached
+        if is_pdf(path):
+            assert self._pdf_placeholder_photo is not None
+            self._thumb_cache[key] = self._pdf_placeholder_photo
+            return self._pdf_placeholder_photo
+        if not is_image(path):
+            assert self._placeholder_photo is not None
+            self._thumb_cache[key] = self._placeholder_photo
+            return self._placeholder_photo
+        try:
+            with Image.open(path) as im:
+                im.load()
+                im = im.convert("RGB") if im.mode not in ("RGB", "L") else im.convert("RGB")
+                im.thumbnail((self.THUMB_PX, self.THUMB_PX), getattr(Image, "Resampling", Image).LANCZOS)
+                canvas = Image.new("RGB", (self.THUMB_PX, self.THUMB_PX), (245, 245, 245))
+                ox = (self.THUMB_PX - im.width) // 2
+                oy = (self.THUMB_PX - im.height) // 2
+                canvas.paste(im, (ox, oy))
+                photo = ImageTk.PhotoImage(canvas)
+        except Exception:
+            assert self._placeholder_photo is not None
+            photo = self._placeholder_photo
+        self._thumb_cache[key] = photo
+        # Bound cache size
+        if len(self._thumb_cache) > 400:
+            # drop arbitrary older keys (keep placeholders)
+            drop = [k for k in self._thumb_cache if k not in (key,)]
+            for k in drop[:100]:
+                self._thumb_cache.pop(k, None)
+        return photo
+
+    def _on_thumb_canvas_configure(self, event) -> None:
+        if self._thumb_canvas is None:
+            return
+        self._thumb_canvas.itemconfigure(self._thumb_window, width=event.width)
+        # Re-flow columns when width changes
+        if self._current_view() == self.VIEW_THUMB and self._thumb_widgets:
+            self._reflow_thumb_grid()
+
+    def _thumb_cols(self) -> int:
+        if self._thumb_canvas is None:
+            return self.THUMB_COLS_MIN
+        w = max(self._thumb_canvas.winfo_width(), 200)
+        cell = self.THUMB_PX + 24 + self.THUMB_PAD * 2
+        return max(self.THUMB_COLS_MIN, w // cell)
+
+    def _rebuild_thumb_grid(self) -> None:
+        if self._thumb_inner is None:
+            return
+        self._cancel_thumb_loads()
+        for child in self._thumb_inner.winfo_children():
+            child.destroy()
+        self._thumb_widgets = []
+        self._ensure_placeholders()
+        assert self._placeholder_photo is not None
+        for i, path in enumerate(self.paths):
+            cell = ttk.Frame(self._thumb_inner, padding=4)
+            border = tk.Frame(cell, bd=2, relief=tk.GROOVE, background="#e8e8e8")
+            border.pack(fill=tk.BOTH, expand=True)
+            img_lbl = tk.Label(
+                border,
+                image=self._placeholder_photo
+                if not is_pdf(path)
+                else self._pdf_placeholder_photo,
+                background="#f0f0f0",
+                width=self.THUMB_PX,
+                height=self.THUMB_PX,
+            )
+            img_lbl.pack(padx=2, pady=2)
             kind = "PDF" if is_pdf(path) else "图"
-            self.listbox.insert(tk.END, f"{i}. [{kind}] {path.name}  —  {path}")
-        for idx in sel:
-            if 0 <= idx < len(self.paths):
-                self.listbox.selection_set(idx)
+            name = path.name
+            if len(name) > 22:
+                name = name[:10] + "…" + name[-9:]
+            caption = f"{i + 1}. [{kind}] {name}"
+            cap_lbl = tk.Label(
+                border,
+                text=caption,
+                wraplength=self.THUMB_PX + 8,
+                justify=tk.CENTER,
+                background="#e8e8e8",
+                font=("TkDefaultFont", 8),
+            )
+            cap_lbl.pack(fill=tk.X, padx=2, pady=(0, 2))
+            for w in (cell, border, img_lbl, cap_lbl):
+                w.bind("<Button-1>", lambda e, idx=i: self._on_thumb_click(e, idx))
+                w.bind("<Double-Button-1>", lambda e, idx=i: self._on_thumb_double_click(idx))
+                w.bind("<Control-Button-1>", lambda e, idx=i: self._on_thumb_click(e, idx))
+                w.bind("<Shift-Button-1>", lambda e, idx=i: self._on_thumb_click(e, idx))
+            self._thumb_widgets.append(
+                {
+                    "index": i,
+                    "path": path,
+                    "cell": cell,
+                    "border": border,
+                    "img_lbl": img_lbl,
+                    "cap_lbl": cap_lbl,
+                    "loaded": False,
+                }
+            )
+        self._reflow_thumb_grid()
+        self._paint_thumb_selection()
+        self._thumb_pending = list(range(len(self.paths)))
+        self._schedule_thumb_loads()
+
+    def _reflow_thumb_grid(self) -> None:
+        if not self._thumb_widgets:
+            return
+        cols = self._thumb_cols()
+        for i, info in enumerate(self._thumb_widgets):
+            r, c = divmod(i, cols)
+            info["cell"].grid(row=r, column=c, padx=self.THUMB_PAD, pady=self.THUMB_PAD, sticky="n")
+        if self._thumb_canvas is not None:
+            self._thumb_canvas.update_idletasks()
+            self._thumb_canvas.configure(scrollregion=self._thumb_canvas.bbox("all"))
+
+    def _paint_thumb_selection(self) -> None:
+        for info in self._thumb_widgets:
+            idx = info["index"]
+            border: tk.Frame = info["border"]
+            cap: tk.Label = info["cap_lbl"]
+            if idx in self._selected:
+                border.configure(background="#3a7cff", bd=3, relief=tk.SOLID)
+                cap.configure(background="#3a7cff", foreground="white")
+            else:
+                border.configure(background="#e8e8e8", bd=2, relief=tk.GROOVE)
+                cap.configure(background="#e8e8e8", foreground="black")
+
+    def _on_thumb_click(self, event, idx: int) -> None:
+        if self._exporting:
+            return
+        ctrl = bool(event.state & 0x0004) or bool(event.state & 0x0008)  # Control / Command
+        shift = bool(event.state & 0x0001)
+        if shift and self._sel_anchor is not None:
+            a, b = sorted((self._sel_anchor, idx))
+            self._selected = set(range(a, b + 1))
+        elif ctrl:
+            if idx in self._selected:
+                self._selected.discard(idx)
+            else:
+                self._selected.add(idx)
+            self._sel_anchor = idx
+        else:
+            self._selected = {idx}
+            self._sel_anchor = idx
+        self._set_selection(self._selected, see=idx)
+
+    def _on_thumb_double_click(self, idx: int) -> None:
+        if self._exporting:
+            return
+        self._selected = {idx}
+        self._sel_anchor = idx
+        self._set_selection(self._selected)
+        # Temporarily ensure listbox also has selection for dialog flow
+        self._on_list_double_click()
+
+    def _thumb_see(self, idx: int) -> None:
+        if not (0 <= idx < len(self._thumb_widgets)) or self._thumb_canvas is None:
+            return
+        cell = self._thumb_widgets[idx]["cell"]
+        self._thumb_canvas.update_idletasks()
+        y = cell.winfo_y()
+        h = max(self._thumb_inner.winfo_height(), 1) if self._thumb_inner else 1
+        ch = max(self._thumb_canvas.winfo_height(), 1)
+        # fraction so cell is in view
+        top = max(0.0, (y - 10) / max(h - ch, 1))
+        self._thumb_canvas.yview_moveto(top)
+
+    def _cancel_thumb_loads(self) -> None:
+        if self._thumb_load_job is not None:
+            try:
+                self.after_cancel(self._thumb_load_job)
+            except Exception:
+                pass
+            self._thumb_load_job = None
+        self._thumb_pending = []
+
+    def _schedule_thumb_loads(self) -> None:
+        if self._thumb_load_job is not None:
+            return
+        self._thumb_load_job = self.after(10, self._load_next_thumbs)
+
+    def _load_next_thumbs(self) -> None:
+        self._thumb_load_job = None
+        if self._current_view() != self.VIEW_THUMB:
+            return
+        batch = 6
+        loaded_any = False
+        while batch > 0 and self._thumb_pending:
+            idx = self._thumb_pending.pop(0)
+            batch -= 1
+            if idx >= len(self._thumb_widgets):
+                continue
+            info = self._thumb_widgets[idx]
+            if info.get("loaded"):
+                continue
+            path = info["path"]
+            photo = self._make_thumb_image(path)
+            try:
+                info["img_lbl"].configure(image=photo)
+                info["img_lbl"].image = photo  # keep ref
+                info["loaded"] = True
+                loaded_any = True
+            except tk.TclError:
+                pass
+        if self._thumb_pending:
+            self._thumb_load_job = self.after(15, self._load_next_thumbs)
+        elif loaded_any:
+            pass
+
+    def _on_thumb_mousewheel(self, event) -> None:
+        if self._thumb_canvas is None:
+            return
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            self._thumb_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            self._thumb_canvas.yview_scroll(1, "units")
+
+    def _bind_thumb_wheel(self, _event=None) -> None:
+        if self._thumb_canvas is None:
+            return
+        # Windows / macOS
+        self.bind_all("<MouseWheel>", self._on_thumb_mousewheel)
+        # Linux
+        self.bind_all("<Button-4>", self._on_thumb_mousewheel)
+        self.bind_all("<Button-5>", self._on_thumb_mousewheel)
+
+    def _unbind_thumb_wheel(self, _event=None) -> None:
+        try:
+            self.unbind_all("<MouseWheel>")
+            self.unbind_all("<Button-4>")
+            self.unbind_all("<Button-5>")
+        except tk.TclError:
+            pass
+
+    # ----------------------------------------------------------- status
+    def _set_status(self, msg: str) -> None:
+        if self.status is not None:
+            self.status.set(msg)
+        self.update_idletasks()
 
     def _update_source_folder_from_paths(self) -> None:
         """根据当前列表推断 source_folder（同一目录则视为该文件夹）。"""
@@ -874,8 +1355,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                 self.paths.append(path)
                 added += 1
         self._update_source_folder_from_paths()
-        self._refresh_list()
-        self._set_status(f"已添加 {added} 张图片，当前共 {len(self.paths)} 项。")
+        self._refresh_view()
+        self._set_status(f"已添加 {added} 张图片，当前共 {len(self.paths)} 项。可切换「列表 / 缩略图」。")
 
     def add_pdfs(self) -> None:
         if self._exporting:
@@ -898,8 +1379,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                 self.paths.append(path)
                 added += 1
         self._update_source_folder_from_paths()
-        self._refresh_list()
-        self._set_status(f"已添加 {added} 个 PDF，当前共 {len(self.paths)} 项。")
+        self._refresh_view()
+        self._set_status(f"已添加 {added} 个 PDF，当前共 {len(self.paths)} 项。可切换「列表 / 缩略图」。")
 
     def add_folder(self) -> None:
         if self._exporting:
@@ -934,17 +1415,18 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             self.source_folder = root
         else:
             self._update_source_folder_from_paths()
-        self._refresh_list()
+        self._refresh_view()
         self._set_status(
             f"从文件夹（含所有子目录）添加了 {added} 项（图片+PDF，自然排序），"
             f"当前共 {len(self.paths)} 项。"
             f"默认 PDF 名：{default_pdf_name(self.paths, self.source_folder)}"
+            " 可切换「列表 / 缩略图」。"
         )
 
     def move_selected(self, delta: int) -> None:
         if self._exporting:
             return
-        sel = list(self.listbox.curselection())
+        sel = self._get_selection()
         if len(sel) != 1:
             self._set_status("请只选择一项再上下移动；多选请用「移到第…位」。")
             return
@@ -953,20 +1435,23 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         if j < 0 or j >= len(self.paths):
             return
         self.paths[i], self.paths[j] = self.paths[j], self.paths[i]
-        self._refresh_list()
-        self.listbox.selection_set(j)
+        self._selected = {j}
+        self._sel_anchor = j
+        self._refresh_view(keep_selection=True)
+        self._set_selection([j], see=j)
         self._set_status("已调整顺序。")
 
     def move_selected_to_position(self, target_1based: Optional[int] = None) -> None:
         """将当前选中项移到指定 1-based 位置（支持多选，保持相对顺序）。"""
         if self._exporting:
             return
-        sel = list(self.listbox.curselection())
+        sel = self._get_selection()
         if not sel:
             self._set_status("请先选择要移动的项。")
             return
         if target_1based is None:
-            raw = (self.move_pos_var.get() or "").strip()
+            raw = (self.move_pos_var.get() if self.move_pos_var else "") or ""
+            raw = raw.strip()
             try:
                 target_1based = int(raw)
             except ValueError:
@@ -979,22 +1464,20 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             messagebox.showwarning("提示", str(e))
             self._set_status(str(e))
             return
-        self._refresh_list()
         n = len(self.paths)
         start = max(0, min(int(target_1based) - 1, n - len(sel)))
-        for k in range(len(sel)):
-            idx = start + k
-            if 0 <= idx < n:
-                self.listbox.selection_set(idx)
-        if sel:
-            self.listbox.see(start)
+        new_sel = list(range(start, start + len(sel)))
+        self._selected = set(new_sel)
+        self._sel_anchor = start if new_sel else None
+        self._refresh_view(keep_selection=True)
+        self._set_selection(new_sel, see=start if new_sel else None)
         self._set_status(f"已移到第 {start + 1} 位起（共 {len(sel)} 项）。")
 
     def _on_list_double_click(self, _event=None) -> None:
         """双击：弹出对话框输入新的序号。"""
         if self._exporting:
             return
-        sel = list(self.listbox.curselection())
+        sel = self._get_selection()
         if not sel:
             return
         current = sel[0] + 1
@@ -1002,9 +1485,9 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         dialog.title("调整顺序")
         dialog.transient(self)
         dialog.grab_set()
-        ttk.Label(dialog, text=f"当前第 {current} 位，移到第几位？（1–{len(self.paths)}）").pack(
-            padx=12, pady=(12, 4)
-        )
+        ttk.Label(
+            dialog, text=f"当前第 {current} 位，移到第几位？（1–{len(self.paths)}）"
+        ).pack(padx=12, pady=(12, 4))
         var = tk.StringVar(value=str(current))
         entry = ttk.Entry(dialog, width=8, textvariable=var)
         entry.pack(padx=12, pady=4)
@@ -1019,7 +1502,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                 messagebox.showwarning("提示", "请输入有效的正整数。", parent=dialog)
                 return
             dialog.destroy()
-            self.move_pos_var.set(str(target))
+            if self.move_pos_var is not None:
+                self.move_pos_var.set(str(target))
             self.move_selected_to_position(target)
 
         def cancel() -> None:
@@ -1037,14 +1521,16 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     def remove_selected(self) -> None:
         if self._exporting:
             return
-        sel = sorted(self.listbox.curselection(), reverse=True)
+        sel = sorted(self._get_selection(), reverse=True)
         if not sel:
             self._set_status("请先选中要移除的项。")
             return
         for i in sel:
             del self.paths[i]
+        self._selected.clear()
+        self._sel_anchor = None
         self._update_source_folder_from_paths()
-        self._refresh_list()
+        self._refresh_view()
         self._set_status(f"已移除，当前共 {len(self.paths)} 项。")
 
     def clear_list(self) -> None:
@@ -1052,9 +1538,12 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             return
         self.paths.clear()
         self.source_folder = None
-        self._refresh_list()
+        self._selected.clear()
+        self._sel_anchor = None
+        self._cancel_thumb_loads()
+        self._thumb_cache.clear()
+        self._refresh_view()
         self._set_status("列表已清空。")
-
 
     def _refresh_output_dir_label(self) -> None:
         if self.output_dir_label_var is not None:
@@ -1118,8 +1607,6 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             return
         apply_ollama_model_to_runtime(name)
         self._set_status(f"已选择 Ollama 模型：{name}（已写入配置）")
-
-
 
     def _on_ocr_engine_selected(self, _event=None) -> None:
         if self.ocr_engine_var is None:
@@ -1361,7 +1848,6 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._set_exporting(False)
         self._set_status(f"失败：{err}")
         messagebox.showerror("导出失败", f"{err}")
-
 
 
 def main() -> None:
