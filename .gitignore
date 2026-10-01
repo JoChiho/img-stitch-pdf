@@ -26,3 +26,7 @@ tmp/
 
 # Tests
 .pytest_cache/
+
+# OCR / MT caches (user machine; do not commit)
+.EasyOCR/
+argos-translate/

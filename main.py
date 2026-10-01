@@ -5,6 +5,9 @@
 默认：列表项按顺序组成多页 PDF（图片一图一页；PDF 贡献其全部页），
 不拼接成巨图，避免 OOM。JPEG 尽量经 img2pdf 原样嵌入；PDF 页经 pypdf
 合并，不重新栅格化。
+
+可选：本地 EN→ZH 图片翻译（EasyOCR + Argos Translate），将中文绘制到
+新文件（原图旁 ``*_zh``），再走同一套多页 PDF 导出。
 """
 
 from __future__ import annotations
@@ -44,6 +47,11 @@ try:
 except ImportError:
     PdfReader = None  # type: ignore
     PdfWriter = None  # type: ignore
+
+try:
+    import translate_local
+except ImportError:
+    translate_local = None  # type: ignore
 
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")  # skip .gif by default
@@ -529,8 +537,10 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.source_folder: Optional[Path] = None
         self._exporting = False
         self._export_btn: Optional[ttk.Button] = None
+        self._translate_export_btn: Optional[ttk.Button] = None
         self.output_dir: Path = ensure_default_output_dir()
         self.direct_export_var: Optional[tk.BooleanVar] = None
+        self.translate_then_export_var: Optional[tk.BooleanVar] = None
         self.output_dir_label_var: Optional[tk.StringVar] = None
 
         self._build_ui()
@@ -589,7 +599,9 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         ttk.Label(
             hint,
             text="生成多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
-            "PDF 文件贡献其全部页并直接合并（不重新栅格化）。可混合图片与 PDF。",
+            "PDF 文件贡献其全部页并直接合并（不重新栅格化）。可混合图片与 PDF。"
+            "勾选或点「本地翻译后导出」：对图片做本地 EN→ZH（原图旁生成 *_zh，不覆盖原图），"
+            "跳过 PDF/GIF，再导出多页 PDF。首次需下载 OCR/翻译模型。",
             wraplength=760,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=8, pady=6)
@@ -619,6 +631,16 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             text="直接导出到默认文件夹",
             variable=self.direct_export_var,
         ).pack(side=tk.LEFT, padx=8)
+        self.translate_then_export_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            bottom,
+            text="本地翻译后导出",
+            variable=self.translate_then_export_var,
+        ).pack(side=tk.LEFT, padx=4)
+        self._translate_export_btn = ttk.Button(
+            bottom, text="本地翻译后导出…", command=self.export_pdf_translated
+        )
+        self._translate_export_btn.pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="创建桌面快捷方式", command=self.create_shortcut).pack(
             side=tk.LEFT, padx=8
         )
@@ -908,36 +930,151 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         messagebox.showinfo("完成", f"已创建桌面快捷方式：\n{lnk}")
 
     def export_pdf(self) -> None:
+        """普通导出；若勾选「本地翻译后导出」则走翻译管线。"""
+        if self._exporting:
+            return
+        translate = bool(
+            self.translate_then_export_var is not None
+            and self.translate_then_export_var.get()
+        )
+        if translate:
+            self.export_pdf_translated()
+            return
+        self._start_pdf_export(list(self.paths), translate_note=None)
+
+    def export_pdf_translated(self) -> None:
+        """本地 EN→ZH 翻译图片为 *_zh 新文件，再导出多页 PDF（后台线程）。"""
         if self._exporting:
             return
         if not self.paths:
-            messagebox.showwarning("提示", "请先添加至少一张图片或一个 PDF。")
+            messagebox.showwarning("提示", "请先添加至少一张图片。")
             self._set_status("导出列表为空。")
             return
+        if translate_local is None:
+            messagebox.showerror(
+                "缺少模块",
+                "未找到 translate_local.py。请确认项目文件完整。",
+            )
+            return
 
-        initial = default_pdf_name(self.paths, self.source_folder)
+        image_count = sum(1 for p in self.paths if is_image(p))
+        pdf_count = sum(1 for p in self.paths if is_pdf(p))
+        if image_count == 0:
+            messagebox.showwarning(
+                "提示",
+                "翻译模式只处理图片，当前列表没有可翻译的图片。\n"
+                "PDF 不会被翻译；请添加 jpg/png 等图片后再试。",
+            )
+            self._set_status("翻译模式：无可用图片。")
+            return
+        if pdf_count:
+            ok = messagebox.askokcancel(
+                "翻译模式",
+                f"列表中有 {pdf_count} 个 PDF，翻译模式将跳过它们，"
+                f"仅翻译 {image_count} 张图片后导出 PDF。\n\n是否继续？",
+            )
+            if not ok:
+                self._set_status("已取消翻译导出。")
+                return
+
+        out_path = self._ask_pdf_out_path(
+            default_name=default_pdf_name(self.paths, self.source_folder)
+        )
+        if out_path is None:
+            return
+
+        paths_snapshot = list(self.paths)
+        self._set_exporting(True)
+        self._set_status(
+            f"正在本地翻译（首次可能下载模型）… 0/{image_count}"
+        )
+
+        def worker() -> None:
+            try:
+                def on_tr(i: int, n: int, msg: str) -> None:
+                    self.after(
+                        0,
+                        lambda i=i, n=n, msg=msg: self._set_status(
+                            f"本地翻译 {i}/{n}：{msg}"
+                        ),
+                    )
+
+                translated, skipped_pdfs, warnings = (
+                    translate_local.translate_image_paths(
+                        paths_snapshot, progress_callback=on_tr
+                    )
+                )
+                if not translated:
+                    raise RuntimeError(
+                        "没有成功翻译任何图片。"
+                        + (" ".join(warnings) if warnings else "")
+                    )
+
+                def on_progress(i: int, n: int) -> None:
+                    self.after(
+                        0, lambda i=i, n=n: self._set_status(f"正在导出 {i}/{n}…")
+                    )
+
+                page_count = items_to_multipage_pdf(
+                    translated, out_path, progress_callback=on_progress
+                )
+                note_parts = [
+                    f"已生成 {len(translated)} 张翻译图（原图旁 *_zh，未覆盖原图）"
+                ]
+                if skipped_pdfs:
+                    note_parts.append(f"跳过 PDF {len(skipped_pdfs)} 个")
+                if warnings:
+                    note_parts.append("；".join(warnings[:5]))
+                note = "。".join(note_parts)
+            except Exception as e:
+                traceback.print_exc()
+                err = e
+                self.after(0, lambda: self._on_export_error(err))
+            else:
+                self.after(
+                    0,
+                    lambda: self._on_export_success(
+                        out_path, page_count, extra=note
+                    ),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ask_pdf_out_path(self, default_name: str) -> Optional[Path]:
+        """Resolve output PDF path via direct-export flag or save dialog."""
         initial_dir = self._export_initial_dir()
         direct = bool(
             self.direct_export_var is not None and self.direct_export_var.get()
         )
-
         if direct:
-            out_path = Path(initial_dir) / initial
+            out_path = Path(initial_dir) / default_name
             if out_path.suffix.lower() != ".pdf":
                 out_path = out_path.with_suffix(".pdf")
-        else:
-            out = filedialog.asksaveasfilename(
-                title="保存 PDF",
-                defaultextension=".pdf",
-                filetypes=[("PDF 文件", "*.pdf")],
-                initialfile=initial,
-                initialdir=initial_dir,
-            )
-            if not out:
-                self._set_status("已取消导出。")
-                return
-            out_path = Path(out)
-        paths_snapshot = list(self.paths)
+            return out_path
+        out = filedialog.asksaveasfilename(
+            title="保存 PDF",
+            defaultextension=".pdf",
+            filetypes=[("PDF 文件", "*.pdf")],
+            initialfile=default_name,
+            initialdir=initial_dir,
+        )
+        if not out:
+            self._set_status("已取消导出。")
+            return None
+        return Path(out)
+
+    def _start_pdf_export(
+        self, paths_snapshot: List[Path], translate_note: Optional[str]
+    ) -> None:
+        if not paths_snapshot:
+            messagebox.showwarning("提示", "请先添加至少一张图片或一个 PDF。")
+            self._set_status("导出列表为空。")
+            return
+        out_path = self._ask_pdf_out_path(
+            default_name=default_pdf_name(paths_snapshot, self.source_folder)
+        )
+        if out_path is None:
+            return
         self._set_exporting(True)
         self._set_status(f"正在导出多页 PDF：0/{len(paths_snapshot)}…")
 
@@ -958,25 +1095,40 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                 self.after(0, lambda: self._on_export_error(err))
             else:
                 self.after(
-                    0, lambda: self._on_export_success(out_path, page_count)
+                    0,
+                    lambda: self._on_export_success(
+                        out_path, page_count, extra=translate_note
+                    ),
                 )
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _set_exporting(self, running: bool) -> None:
         self._exporting = running
+        state = tk.DISABLED if running else tk.NORMAL
         if self._export_btn is not None:
-            self._export_btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self._export_btn.configure(state=state)
+        if self._translate_export_btn is not None:
+            self._translate_export_btn.configure(state=state)
 
-    def _on_export_success(self, out_path: Path, page_count: int) -> None:
+    def _on_export_success(
+        self, out_path: Path, page_count: int, extra: Optional[str] = None
+    ) -> None:
         self._set_exporting(False)
-        self._set_status(f"导出成功：{out_path}（{page_count} 页）")
-        messagebox.showinfo("完成", f"已导出多页 PDF（{page_count} 页）：\n{out_path}")
+        msg = f"导出成功：{out_path}（{page_count} 页）"
+        if extra:
+            msg = f"{msg} — {extra}"
+        self._set_status(msg)
+        detail = f"已导出多页 PDF（{page_count} 页）：\n{out_path}"
+        if extra:
+            detail = f"{detail}\n\n{extra}"
+        messagebox.showinfo("完成", detail)
 
     def _on_export_error(self, err: BaseException) -> None:
         self._set_exporting(False)
         self._set_status(f"失败：{err}")
         messagebox.showerror("导出失败", f"{err}")
+
 
 
 def main() -> None:

@@ -15,6 +15,7 @@
 - 默认 PDF 文件名：来自文件夹时用**文件夹名**；否则同源目录名 / **首文件 stem** / `merge.pdf`
 - **创建桌面快捷方式**（Windows `.lnk`：`pythonw.exe` + `main.py`，工作目录=项目目录）
 - 导出在**后台线程**进行，界面可继续操作；状态栏显示进度（如 `3/98`）；导出中禁用「生成 PDF」按钮
+- **本地翻译后导出**（可选）：勾选「本地翻译后导出」或点同名按钮 → 对列表中的图片做 **EN→ZH**（EasyOCR + Argos Translate），在**原图同目录**生成 `*_zh` 新图（**绝不覆盖原图**），再按默认导出目录写出多页 PDF；**跳过 PDF / GIF**；全程后台线程，避免界面冻结
 - 底部状态栏提示进度与结果
 
 ## 环境要求
@@ -32,9 +33,15 @@ pip install -r requirements.txt
 
 依赖：
 
-- `pillow` — 非 JPEG / 特殊 PNG 的转换
+- `pillow` — 非 JPEG / 特殊 PNG 的转换；翻译叠字
 - `img2pdf` — 多页 PDF 写入（JPEG 原样嵌入等）
 - `pypdf` — PDF 页合并（不重新栅格化）
+- `easyocr` — 本地 OCR（英文检测；**首次运行下载模型**，体积较大，需网络）
+- `argostranslate` — 本地机器翻译 en→zh（**首次运行下载语言包**）
+
+> Windows 上优先 EasyOCR（相对 PaddleOCR 更易装）。若 Argos 安装失败，可另行 `pip install deep-translator` 作为**联网**后备（非默认）。
+>
+> 中文字体：自动查找 `msyh.ttc` / `simhei.ttf` 等；也可设环境变量 `IMG_STITCH_CJK_FONT` 指向字体文件。
 
 可选：使用虚拟环境
 
@@ -88,6 +95,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\create_desktop_shortcut.ps
 5. 等待状态栏进度（如 `正在导出 3/98…`）；完成后弹出提示（页数为实际 PDF 页数）
 6. 打开 PDF 即可按页阅读：图片各占一页，原 PDF 的页按列表顺序插入
 
+### 本地翻译后导出
+
+1. 列表中加入英文截图 / 图片（可混有 PDF，翻译时会跳过 PDF 并提示）
+2. 勾选「本地翻译后导出」，再点「生成 PDF…」；或直接点「本地翻译后导出…」
+3. 状态栏会显示翻译进度；**首次**会下载 EasyOCR 与 Argos 模型，请保持网络畅通，界面不阻塞
+4. 每张原图旁生成 `原名_zh.扩展名`（例如 `page1.jpg` → `page1_zh.jpg`），再导出多页 PDF 到默认导出目录 / 保存对话框所选路径
+
+命令行单独试一张图：
+
+```bash
+python translate_local.py path\to\image.jpg
+```
+
+## 质量与限制
+
+- OCR 对小字、艺术字、低对比、倾斜文本效果有限；可能漏检或框不准
+- Argos 为轻量离线翻译，专有名词 / 长难句质量一般，不如云端大模型
+- 叠字：半透明白底 + 自适应字号居中；复杂排版（多栏、竖排）效果一般
+- 翻译模式**不处理 PDF 内嵌文字**（跳过 PDF）；也不处理 GIF
+- 首次模型下载可能数百 MB；之后离线可用（Argos 路径）；EasyOCR 依赖 PyTorch，安装较慢
 
 ## 配置
 
@@ -113,8 +140,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\create_desktop_shortcut.ps
 ```
 img-stitch-pdf/
 ├── main.py                      # GUI 与导出逻辑
+├── translate_local.py           # 本地 EN→ZH（OCR / MT / 叠字）
 ├── create_desktop_shortcut.ps1  # 创建桌面快捷方式
-├── requirements.txt             # 运行依赖
+├── requirements.txt             # 运行依赖（含可选翻译栈）
 ├── requirements-dev.txt         # 开发 / 测试依赖
 ├── tests/                       # pytest 单元测试
 ├── README.md
