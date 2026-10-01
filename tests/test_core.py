@@ -50,6 +50,26 @@ def test_list_images_skips_gif_by_default(tmp_path: Path):
     assert names_gif == ["also.gif", "keep.png", "ok.jpg", "skip.gif"]
 
 
+
+def test_list_images_skips_translated_zh_subdir(tmp_path: Path):
+    (tmp_path / "keep.png").write_bytes(b"x")
+    sub = tmp_path / "translated_zh"
+    sub.mkdir()
+    (sub / "keep_zh.png").write_bytes(b"x")
+    (tmp_path / "old_zh.jpg").write_bytes(b"x")
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "ok.webp").write_bytes(b"x")
+    nest_tr = tmp_path / "nested" / "translated_zh"
+    nest_tr.mkdir()
+    (nest_tr / "ok_zh.webp").write_bytes(b"x")
+
+    found = main.list_images_in_folder(tmp_path)
+    names = [p.relative_to(tmp_path).as_posix() for p in found]
+    assert names == ["keep.png", "nested/ok.webp"]
+    assert all("translated_zh" not in n for n in names)
+    assert all(not Path(n).stem.endswith("_zh") for n in names)
+
+
 def test_list_folder_picks_up_pdf(tmp_path: Path):
     (tmp_path / "a.png").write_bytes(b"x")
     (tmp_path / "b.pdf").write_bytes(b"%PDF-1.4")

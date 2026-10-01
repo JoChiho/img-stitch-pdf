@@ -7,7 +7,7 @@
 合并，不重新栅格化。
 
 可选：本地 EN→ZH 图片翻译（EasyOCR + Argos Translate），将中文绘制到
-新文件（原图旁 ``*_zh``），再走同一套多页 PDF 导出。
+原图目录下新建子文件夹 ``translated_zh/``（不与原图同级混放，便于清理），再走同一套多页 PDF 导出。
 """
 
 from __future__ import annotations
@@ -100,8 +100,20 @@ def list_images_in_folder(
     if not skip_gif:
         allowed = set(allowed) | {".gif"}
     found: List[Path] = []
+    skip_dir_names = {"translated_zh"}
+    try:
+        import translate_local as _tl
+
+        skip_dir_names.add(getattr(_tl, "TRANSLATED_SUBDIR", "translated_zh"))
+    except ImportError:
+        pass
     for p in folder.rglob("*"):
         if not p.is_file():
+            continue
+        # Skip outputs living under translated_zh/ (and any *_zh names)
+        if any(part in skip_dir_names for part in p.parts):
+            continue
+        if p.stem.endswith("_zh"):
             continue
         suf = p.suffix.lower()
         if suf not in allowed:
@@ -600,7 +612,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             hint,
             text="生成多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
             "PDF 文件贡献其全部页并直接合并（不重新栅格化）。可混合图片与 PDF。"
-            "勾选或点「本地翻译后导出」：对图片做本地 EN→ZH（原图旁生成 *_zh，不覆盖原图），"
+            "勾选或点「本地翻译后导出」：对图片做本地 EN→ZH（写入 translated_zh/ 子文件夹，不覆盖原图），"
             "跳过 PDF/GIF，再导出多页 PDF。首次需下载 OCR/翻译模型。",
             wraplength=760,
             justify=tk.LEFT,
@@ -943,7 +955,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._start_pdf_export(list(self.paths), translate_note=None)
 
     def export_pdf_translated(self) -> None:
-        """本地 EN→ZH 翻译图片为 *_zh 新文件，再导出多页 PDF（后台线程）。"""
+        """本地 EN→ZH 翻译图片到 translated_zh/ 子文件夹，再导出多页 PDF（后台线程）。"""
         if self._exporting:
             return
         if not self.paths:
@@ -1031,7 +1043,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                     translated, out_path, progress_callback=on_progress
                 )
                 note_parts = [
-                    f"已生成 {len(translated)} 张翻译图（原图旁 *_zh，未覆盖原图）"
+                    f"已生成 {len(translated)} 张翻译图（写入 translated_zh/ 子文件夹，未覆盖原图）"
                 ]
                 if skipped_pdfs:
                     note_parts.append(f"跳过 PDF {len(skipped_pdfs)} 个")

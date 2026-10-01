@@ -32,26 +32,50 @@ ProgressCallback = Callable[[int, int, str], None]  # (current, total, message)
 # ---------------------------------------------------------------------------
 
 TRANSLATED_SUFFIX = "_zh"
+# Subfolder under the source image's directory (not siblings in the same folder).
+TRANSLATED_SUBDIR = "translated_zh"
 
 
-def translated_sibling_path(src: Path) -> Path:
-    """Return sibling path with ``_zh`` before the extension.
+def translated_output_path(src: Path) -> Path:
+    """Return path under a NEW ``translated_zh/`` subfolder (not a sibling).
 
     Examples::
-        foo.jpg      -> foo_zh.jpg
-        foo_zh.png   -> foo_zh.png   (idempotent; do not double-suffix)
-        a/b/c.JPEG   -> a/b/c_zh.jpeg  (normalizes suffix case to lower)
+        foo.jpg                  -> translated_zh/foo_zh.jpg
+        a/b/c.JPEG               -> a/b/translated_zh/c_zh.jpeg
+        a/translated_zh/x_zh.png -> a/translated_zh/x_zh.png  (idempotent)
     """
     src = Path(src)
     stem = src.stem
     suffix = src.suffix.lower() or src.suffix
     if stem.endswith(TRANSLATED_SUFFIX):
-        return src.with_name(f"{stem}{suffix}")
-    return src.with_name(f"{stem}{TRANSLATED_SUFFIX}{suffix}")
+        out_name = f"{stem}{suffix}"
+    else:
+        out_name = f"{stem}{TRANSLATED_SUFFIX}{suffix}"
+
+    parent = src.parent
+    if parent.name == TRANSLATED_SUBDIR:
+        return parent / out_name
+    return parent / TRANSLATED_SUBDIR / out_name
+
+
+def translated_sibling_path(src: Path) -> Path:
+    """Deprecated alias for :func:`translated_output_path` (now uses a subfolder)."""
+    return translated_output_path(src)
 
 
 def is_already_translated_name(path: Path) -> bool:
-    return Path(path).stem.endswith(TRANSLATED_SUFFIX)
+    """True if path looks like a prior translation output (suffix or subfolder)."""
+    path = Path(path)
+    if path.stem.endswith(TRANSLATED_SUFFIX):
+        return True
+    if path.parent.name == TRANSLATED_SUBDIR:
+        return True
+    return False
+
+
+def contains_cjk(text: str) -> bool:
+    """Return True if ``text`` contains any CJK Unified Ideograph."""
+    return any("一" <= ch <= "鿿" for ch in (text or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +291,8 @@ class OcrBox:
 
 
 _easyocr_reader = None
-_argos_translator = None
+_argos_translator = None  # Argos Translation object (debug / status only)
+_translate_fn = None  # cached callable: str -> str
 _mt_backend: Optional[str] = None  # "argos" | "deep_translator" | None
 
 
@@ -472,21 +497,31 @@ def _ensure_argos_en_zh():
 
 
 def _get_translator():
-    """Prefer Argos (local); fall back to deep_translator Google only if Argos unavailable."""
-    global _argos_translator, _mt_backend
-    if _argos_translator is not None:
-        return _argos_translator, _mt_backend
+    """Prefer Argos (local); fall back to deep_translator Google only if Argos unavailable.
+
+    Always caches and returns a *callable* ``(text) -> str``.  Previously the
+    Argos ``CachedTranslation`` object was stored in ``_argos_translator`` and
+    returned on subsequent calls; that object is not callable, so every translate
+    after the first (or after ``preload_models``) raised TypeError, was swallowed,
+    and painted the original English back onto the image.
+    """
+    global _argos_translator, _translate_fn, _mt_backend
+    if _translate_fn is not None:
+        return _translate_fn, _mt_backend
 
     try:
         import argostranslate  # noqa: F401
 
-        _argos_translator = _ensure_argos_en_zh()
+        translator = _ensure_argos_en_zh()
+        _argos_translator = translator
         _mt_backend = "argos"
 
         def _argos_fn(text: str) -> str:
-            return _argos_translator.translate(text)
+            return translator.translate(text)
 
-        return _argos_fn, _mt_backend
+        _translate_fn = _argos_fn
+        logger.info("MT backend ready: argos en->zh (callable cached)")
+        return _translate_fn, _mt_backend
     except ImportError:
         pass
     except Exception as e:
@@ -501,8 +536,9 @@ def _get_translator():
         def _google_fn(text: str) -> str:
             return gt.translate(text)
 
-        _argos_translator = _google_fn  # cache callable
-        return _google_fn, _mt_backend
+        _translate_fn = _google_fn
+        logger.info("MT backend ready: deep_translator Google en->zh-CN")
+        return _translate_fn, _mt_backend
     except ImportError as e:
         raise ImportError(
             "本地翻译需要 argostranslate（应用应已自动安装）。\n"
@@ -512,17 +548,51 @@ def _get_translator():
 
 
 def translate_en_to_zh(text: str) -> str:
-    """Translate a single English string to Chinese."""
+    """Translate a single English string to Chinese (Argos / fallback)."""
     text = (text or "").strip()
     if not text:
         return text
-    fn, _backend = _get_translator()
+    fn, backend = _get_translator()
+    if not callable(fn):
+        logger.error(
+            "Translator is not callable (backend=%s, type=%s); returning original",
+            backend,
+            type(fn).__name__,
+        )
+        return text
     try:
         out = fn(text)
-        return (out or text).strip()
+        out = (out or "").strip() or text
+        if out == text:
+            logger.warning(
+                "Translate returned unchanged text %r (backend=%s)",
+                text[:60],
+                backend,
+            )
+        else:
+            logger.info(
+                "Translated (%s): %r -> %r",
+                backend,
+                text[:60],
+                out[:60],
+            )
+        return out
     except Exception as e:
-        logger.warning("Translate failed for %r: %s", text[:40], e)
+        logger.exception(
+            "Translate failed for %r (backend=%s): %s", text[:60], backend, e
+        )
         return text
+
+
+def translate_text(text: str) -> str:
+    """Public alias: translate English text to Chinese."""
+    return translate_en_to_zh(text)
+
+
+def mt_status() -> str:
+    """Short status string for logging / UI (backend + whether callable is ready)."""
+    ready = _translate_fn is not None and callable(_translate_fn)
+    return f"MT backend={_mt_backend or 'none'}; callable_ready={ready}"
 
 
 # ---------------------------------------------------------------------------
@@ -536,16 +606,26 @@ def translate_image_file(
     font_path: Optional[Path] = None,
     min_confidence: float = 0.3,
 ) -> Path:
-    """OCR → translate → overlay → save NEW sibling image. Never overwrites ``src``."""
+    """OCR -> translate -> overlay -> save under ``translated_zh/``. Never overwrites ``src``."""
     src = Path(src)
     if not src.is_file():
         raise FileNotFoundError(src)
-    out = Path(dst) if dst is not None else translated_sibling_path(src)
+    out = Path(dst) if dst is not None else translated_output_path(src)
     if out.resolve() == src.resolve():
-        # Safety: if somehow same path, force a distinct name
-        out = src.with_name(f"{src.stem}_zh_out{src.suffix.lower()}")
+        # Safety: if somehow same path, force a distinct name under subfolder
+        out = src.parent / TRANSLATED_SUBDIR / f"{src.stem}_zh_out{src.suffix.lower()}"
 
     boxes = ocr_image(src, min_confidence=min_confidence)
+    # Ensure translator is ready before the loop so status/logging is accurate
+    _get_translator()
+    logger.info(
+        "Translating %s: %d OCR box(es); %s; out=%s",
+        src.name,
+        len(boxes),
+        mt_status(),
+        out,
+    )
+    translated_boxes = 0
     with Image.open(src) as im:
         im.load()
         canvas = im.convert("RGB")
@@ -553,9 +633,18 @@ def translate_image_file(
             zh = translate_en_to_zh(ob.text)
             if not zh:
                 continue
+            if contains_cjk(zh) or zh != ob.text:
+                translated_boxes += 1
             canvas = draw_text_in_box(canvas, ob.box, zh, font_path=font_path)
 
         out.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Saved %s (%d/%d boxes changed from source text); %s",
+            out,
+            translated_boxes,
+            len(boxes),
+            mt_status(),
+        )
         suf = out.suffix.lower()
         save_kw = {}
         fmt = None
@@ -584,10 +673,11 @@ def translate_image_paths(
     progress_callback: Optional[ProgressCallback] = None,
     skip_non_images: bool = True,
 ) -> Tuple[List[Path], List[Path], List[str]]:
-    """Translate each image to a sibling ``*_zh`` file.
+    """Translate each image into ``<parent>/translated_zh/*_zh.*``.
 
     Returns ``(translated_paths, skipped_pdfs, warnings)``.
-    GIFs and non-images are skipped; PDFs are listed in ``skipped_pdfs``.
+    GIFs, non-images, and already-translated outputs are skipped; PDFs go in
+    ``skipped_pdfs``.
     """
     paths = [Path(p) for p in paths]
     translated: List[Path] = []
@@ -602,6 +692,9 @@ def translate_image_paths(
             continue
         if suf == ".gif":
             warnings.append(f"已跳过 GIF: {p.name}")
+            continue
+        if is_already_translated_name(p):
+            warnings.append(f"已跳过译图/已有后缀: {p.name}")
             continue
         if suf not in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}:
             if skip_non_images:
@@ -644,6 +737,19 @@ def preload_models(progress_callback: Optional[Callable[[str], None]] = None) ->
     _msg("正在准备 Argos Translate en→zh（首次会下载语言包）…")
     _get_translator()
     backend = _mt_backend or "unknown"
+    if _translate_fn is None or not callable(_translate_fn):
+        raise RuntimeError(
+            f"翻译器未就绪（backend={backend}, fn={type(_translate_fn).__name__}）。"
+            "请检查 Argos en→zh 语言包是否已安装。"
+        )
+    # Smoke-check: one word must become Chinese, proving the callable path works
+    sample = translate_text("Hello")
+    if not contains_cjk(sample):
+        raise RuntimeError(
+            f"翻译冒烟失败：translate_text('Hello') -> {sample!r}（期望含中文）。"
+            f"{mt_status()}"
+        )
+    _msg(f"翻译冒烟通过：Hello → {sample}（{mt_status()}）")
     font = find_cjk_font()
     font_note = str(font) if font else "未找到 CJK 字体（中文可能显示为方框）"
     return f"就绪（OCR=easyocr, MT={backend}, font={font_note}）"

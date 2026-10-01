@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Unit tests for local EN→ZH helpers (no OCR/MT models required)."""
 
 from __future__ import annotations
@@ -12,21 +12,45 @@ from PIL import Image, ImageDraw, ImageFont
 import translate_local as tl
 
 
-def test_translated_sibling_path_basic():
-    assert tl.translated_sibling_path(Path("a/orig.jpg")) == Path("a/orig_zh.jpg")
-    assert tl.translated_sibling_path(Path("shot.PNG")) == Path("shot_zh.png")
-    assert tl.translated_sibling_path(Path("/tmp/x.jpeg")) == Path("/tmp/x_zh.jpeg")
+def test_translated_output_path_uses_subdir():
+    assert tl.translated_output_path(Path("a/orig.jpg")) == Path(
+        "a/translated_zh/orig_zh.jpg"
+    )
+    assert tl.translated_output_path(Path("shot.PNG")) == Path(
+        "translated_zh/shot_zh.png"
+    )
+    assert tl.translated_output_path(Path("/tmp/x.jpeg")) == Path(
+        "/tmp/translated_zh/x_zh.jpeg"
+    )
+    assert tl.TRANSLATED_SUBDIR == "translated_zh"
 
 
-def test_translated_sibling_path_idempotent_and_webp():
-    p = Path("folder/name_zh.png")
-    assert tl.translated_sibling_path(p) == p
-    assert tl.translated_sibling_path(Path("a.webp")).name == "a_zh.webp"
+def test_translated_sibling_path_alias_uses_subdir():
+    # Deprecated alias must still point into the subfolder (not same-folder sibling).
+    assert tl.translated_sibling_path(Path("a/orig.jpg")) == Path(
+        "a/translated_zh/orig_zh.jpg"
+    )
+
+
+def test_translated_output_path_idempotent_inside_subdir():
+    p = Path("folder/translated_zh/name_zh.png")
+    assert tl.translated_output_path(p) == p
+    assert tl.translated_output_path(Path("a.webp")).name == "a_zh.webp"
+    assert tl.translated_output_path(Path("a.webp")).parent.name == "translated_zh"
 
 
 def test_is_already_translated_name():
     assert tl.is_already_translated_name(Path("x_zh.jpg"))
+    assert tl.is_already_translated_name(Path("folder/translated_zh/x.png"))
     assert not tl.is_already_translated_name(Path("x.jpg"))
+    assert not tl.is_already_translated_name(Path("folder/x.png"))
+
+
+def test_contains_cjk():
+    assert tl.contains_cjk("你好")
+    assert tl.contains_cjk("Hello 世界")
+    assert not tl.contains_cjk("Hello")
+    assert not tl.contains_cjk("")
 
 
 def test_wrap_text_to_width_splits_long_cjk():
@@ -66,7 +90,8 @@ def test_translate_image_paths_skips_pdf_and_gif(tmp_path: Path):
     gif = tmp_path / "c.gif"
     gif.write_bytes(b"GIF89a")
 
-    fake_out = tmp_path / "a_zh.png"
+    fake_out = tmp_path / "translated_zh" / "a_zh.png"
+    fake_out.parent.mkdir(parents=True, exist_ok=True)
 
     def fake_translate(src, **_kw):
         Image.new("RGB", (20, 20), (0, 0, 0)).save(fake_out)
@@ -83,7 +108,35 @@ def test_translate_image_paths_skips_pdf_and_gif(tmp_path: Path):
     assert any("GIF" in w for w in warnings)
 
 
-def test_translate_image_file_uses_sibling_and_mocks(tmp_path: Path):
+def test_translate_image_paths_skips_already_translated(tmp_path: Path):
+    img = tmp_path / "a.png"
+    Image.new("RGB", (20, 20), (255, 255, 255)).save(img)
+    already = tmp_path / "translated_zh" / "a_zh.png"
+    already.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (20, 20), (0, 0, 0)).save(already)
+    sibling_zh = tmp_path / "old_zh.png"
+    Image.new("RGB", (20, 20), (1, 1, 1)).save(sibling_zh)
+
+    calls = []
+
+    def fake_translate(src, **_kw):
+        calls.append(src)
+        out = tl.translated_output_path(src)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (20, 20), (0, 0, 0)).save(out)
+        return out
+
+    with patch.object(tl, "translate_image_file", side_effect=fake_translate):
+        translated, _skipped, warnings = tl.translate_image_paths(
+            [img, already, sibling_zh]
+        )
+
+    assert calls == [img]
+    assert translated == [tl.translated_output_path(img)]
+    assert any("译图" in w or "后缀" in w for w in warnings)
+
+
+def test_translate_image_file_writes_under_subdir(tmp_path: Path):
     src = tmp_path / "hello.jpg"
     Image.new("RGB", (100, 40), (200, 200, 200)).save(src, format="JPEG")
 
@@ -91,13 +144,77 @@ def test_translate_image_file_uses_sibling_and_mocks(tmp_path: Path):
 
     with patch.object(tl, "ocr_image", return_value=boxes), patch.object(
         tl, "translate_en_to_zh", return_value="你好"
-    ):
+    ), patch.object(tl, "_get_translator", return_value=(lambda t: "你好", "mock")):
         out = tl.translate_image_file(src)
 
-    assert out == tmp_path / "hello_zh.jpg"
+    expected = tmp_path / "translated_zh" / "hello_zh.jpg"
+    assert out == expected
     assert out.is_file()
+    assert out.parent.name == tl.TRANSLATED_SUBDIR
     assert src.is_file()  # original preserved
     assert src.read_bytes() != out.read_bytes()
+    # Must NOT create sibling in the same folder
+    assert not (tmp_path / "hello_zh.jpg").exists()
+
+
+def test_translate_text_mock_returns_chinese():
+    """Unit test: mock translate_text('Hello') returns Chinese chars."""
+    with patch.object(tl, "_get_translator", return_value=(lambda t: "你好", "mock")):
+        # Clear any prior cache so _get_translator mock is used via translate_en_to_zh
+        # translate_en_to_zh calls _get_translator each time when we also clear _translate_fn
+        tl._translate_fn = None
+        out = tl.translate_text("Hello")
+    assert tl.contains_cjk(out)
+    assert out == "你好"
+
+
+def test_get_translator_caches_callable_not_translation_object():
+    """Regression: must not return CachedTranslation on 2nd call (not callable)."""
+    fake_translation = MagicMock(name="CachedTranslation")
+    fake_translation.translate.side_effect = lambda s: f"ZH:{s}"
+
+    tl._translate_fn = None
+    tl._argos_translator = None
+    tl._mt_backend = None
+
+    with patch.object(tl, "_ensure_argos_en_zh", return_value=fake_translation), patch.dict(
+        "sys.modules", {"argostranslate": MagicMock()}
+    ):
+        # Force import path: make `import argostranslate` succeed
+        import sys
+
+        sys.modules["argostranslate"] = MagicMock()
+        fn1, backend1 = tl._get_translator()
+        fn2, backend2 = tl._get_translator()
+
+    assert backend1 == "argos" and backend2 == "argos"
+    assert callable(fn1) and callable(fn2)
+    assert fn1 is fn2
+    assert fn1("Hello") == "ZH:Hello"
+    assert fn2("World") == "ZH:World"
+    # Module cache must hold the callable, not the Translation object
+    assert tl._translate_fn is fn1
+    assert callable(tl._translate_fn)
+
+
+def test_translate_en_to_zh_multiple_calls_with_mock():
+    tl._translate_fn = None
+    tl._argos_translator = None
+    tl._mt_backend = None
+
+    calls = []
+
+    def fake_fn(text: str) -> str:
+        calls.append(text)
+        return f"译:{text}"
+
+    with patch.object(tl, "_get_translator", return_value=(fake_fn, "mock")):
+        a = tl.translate_en_to_zh("Hello")
+        b = tl.translate_en_to_zh("World")
+    assert a == "译:Hello"
+    assert b == "译:World"
+    assert calls == ["Hello", "World"]
+    assert tl.contains_cjk(a) and tl.contains_cjk(b)
 
 
 def test_check_deps_returns_keys():
@@ -117,9 +234,34 @@ def test_smoke_translate_real_if_models_present(tmp_path: Path):
     draw = ImageDraw.Draw(img)
     draw.text((10, 20), "Hello", fill=(0, 0, 0))
     img.save(src)
+    # Reset translator cache so real path is exercised after other tests
+    tl._translate_fn = None
+    tl._argos_translator = None
+    tl._mt_backend = None
     out = tl.translate_image_file(src)
     assert out.is_file()
     assert out != src
+    assert out.parent.name == tl.TRANSLATED_SUBDIR
+    # Real MT: Hello should become Chinese
+    sample = tl.translate_text("Hello")
+    assert tl.contains_cjk(sample)
+
+
+@pytest.mark.skipif(
+    not tl.check_deps().get("argostranslate"),
+    reason="argos not installed",
+)
+def test_real_translate_text_hello_returns_cjk():
+    tl._translate_fn = None
+    tl._argos_translator = None
+    tl._mt_backend = None
+    out = tl.translate_text("Hello")
+    assert tl.contains_cjk(out), f"expected Chinese, got {out!r}"
+    # Second call must still work (callable cache regression)
+    out2 = tl.translate_text("World")
+    assert tl.contains_cjk(out2), f"expected Chinese on 2nd call, got {out2!r}"
+    assert tl.mt_status().startswith("MT backend=argos")
+    assert "callable_ready=True" in tl.mt_status()
 
 
 def test_missing_pip_packages_reports_when_unavailable():
