@@ -305,3 +305,31 @@ def test_get_output_dir_empty_string_is_none(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
     main.save_config({"output_dir": ""})
     assert main.get_output_dir() is None
+
+
+def test_ollama_model_config_roundtrip(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
+    assert main.get_ollama_model_config() is None
+    saved = main.set_ollama_model_config("qwen2.5:7b")
+    assert saved == "qwen2.5:7b"
+    assert main.get_ollama_model_config() == "qwen2.5:7b"
+    assert main.load_config()["ollama_model"] == "qwen2.5:7b"
+
+
+def test_resolve_ollama_model_prefers_config_then_14b(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
+    monkeypatch.setattr(main, "list_ollama_models_for_ui", lambda: ["llama3:8b", "qwen2.5:14b"])
+    # No config → prefer 14b when present
+    assert main.resolve_ollama_model_choice() == "qwen2.5:14b"
+    main.set_ollama_model_config("llama3:8b")
+    assert main.resolve_ollama_model_choice() == "llama3:8b"
+
+
+def test_resolve_ollama_model_first_available_without_14b(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
+    monkeypatch.setattr(main, "list_ollama_models_for_ui", lambda: ["phi3:mini", "llama3:8b"])
+    assert main.resolve_ollama_model_choice() == "phi3:mini"
+

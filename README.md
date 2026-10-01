@@ -15,7 +15,7 @@
 - 默认 PDF 文件名：来自文件夹时用**文件夹名**；否则同源目录名 / **首文件 stem** / `merge.pdf`
 - **创建桌面快捷方式**（Windows `.lnk`：`pythonw.exe` + `main.py`，工作目录=项目目录）
 - 导出在**后台线程**进行，界面可继续操作；状态栏显示进度（如 `3/98`）；导出中禁用「生成 PDF」按钮
-- **本地翻译后导出**：勾选或点「本地翻译后导出」→ 对列表中的图片做 **EN→ZH**（EasyOCR + Ollama / Argos），**保留原图像素不变**，在图片**下方追加**浅色中文译文条带（自动换行、CJK 字体与边距），写入原图同目录下 `translated_zh/*_zh`；**不覆盖原图**，再按默认导出目录写出多页 PDF（跳过 PDF / GIF）。全程后台线程，界面不冻结。
+- **本地翻译后导出**：勾选或点「本地翻译后导出」→ 对列表中的图片做 **EN→ZH**（EasyOCR + Ollama / Argos）。每张图：OCR 阅读顺序后把**全部英文拼成一段**，**只翻译一次**，在原图**下方追加**那一条中文译文条带（自动换行、CJK 字体）；写入 `translated_zh/*_zh`（**不覆盖原图**），再导出多页 PDF（跳过 PDF / GIF）。界面提供 **Ollama 模型下拉框**（`ollama list`），选择写入 `config.json` 的 `ollama_model`。
 - 底部状态栏提示进度与结果
 
 ## 环境要求
@@ -38,7 +38,7 @@ pip install -r requirements.txt
 - `pypdf` — PDF 页合并（不重新栅格化）
 - `easyocr` — 本地 OCR（英文检测；**首次运行下载模型**，体积较大，需网络）
 - `argostranslate` — 本地机器翻译 en→zh（**首次运行下载语言包**）
-- **Ollama**（推荐本地 MT）— 安装 https://ollama.com ，执行 `ollama serve`，并 `ollama pull qwen2.5:14b`（内存 ≥16GB；内存较低时用 `qwen2.5:7b` / `qwen2.5:3b`）。可用环境变量 `IMG_STITCH_OLLAMA_MODEL` / `IMG_STITCH_OLLAMA_HOST` 覆盖。
+- **Ollama**（推荐本地 MT）：安装 https://ollama.com ，执行 `ollama serve`，并 `ollama pull qwen2.5:14b`（内存 ≥ 约 16GB；内存较低时用 `qwen2.5:7b` / `qwen2.5:3b`）。GUI **模型下拉框**列出 `ollama list` 结果，默认优先 `qwen2.5:14b`（若已安装），选择持久化到 `config.json` 的 `ollama_model`；也可用环境变量 `IMG_STITCH_OLLAMA_MODEL` / `IMG_STITCH_OLLAMA_HOST` 覆盖。
 
 > Windows 上优先 EasyOCR（相对 PaddleOCR 更易装）。若 Ollama 未运行则自动回退 Argos；若 Argos 也失败，可再 `pip install deep-translator` 作为**联网**后备（非默认）。
 >
@@ -99,9 +99,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\create_desktop_shortcut.ps
 ### 本地翻译后导出
 
 1. 列表中加入英文截图 / 图片（可混有 PDF，翻译时会跳过 PDF 并提示）
-2. 勾选「本地翻译后导出」，再点「生成 PDF…」；或直接点「本地翻译后导出…」
-3. 状态栏会显示翻译进度；**首次会准备 EasyOCR 与 Ollama/Argos 模型（Ollama 需事先 `ollama pull`；Argos 会下载语言包）
-4. 每张原图旁生成 `原名_zh.扩展名`（例如 `page1.jpg` → `page1_zh.jpg`），再导出多页 PDF 到默认导出目录 / 保存对话框所选路径
+2. （可选）在 **Ollama 模型** 下拉框中选择本地模型（列表来自 `ollama list` / API tags）；默认若已安装则选 `qwen2.5:14b`，选择会写入 `%APPDATA%/img-stitch-pdf/config.json` 的 `ollama_model`
+3. 勾选「本地翻译后导出」，再点「生成 PDF…」；或直接点「本地翻译后导出…」
+4. 状态栏会显示翻译进度；**首次会准备 EasyOCR 与 Ollama/Argos**（Ollama 需事先 `ollama pull`；Argos 会下载语言包）
+5. 每张图：OCR 阅读顺序 → 全部英文空格拼成**一段** → **一次**机器翻译 → 原图下方一条中文译文；输出为 `translated_zh/原名_zh.扩展名`，再导出多页 PDF
+
 
 命令行单独试一张图：
 
@@ -117,18 +119,21 @@ python translate_local.py path\to\image.jpg
 1. 安装 Ollama（Windows 可用 winget：`winget install Ollama.Ollama`）。
 2. 保持服务运行：`ollama serve`（安装后通常已在后台）。
 3. 按内存拉取模型：
-   - **≥16GB RAM**：`ollama pull qwen2.5:14b`（或 `qwen2.5:7b`）
+   - **≥ 约 16GB RAM**：`ollama pull qwen2.5:14b`（或 `qwen2.5:7b`）
    - **内存较低**：`ollama pull qwen2.5:3b`
-4. 可选环境变量：
+4. 在 GUI 的 **Ollama 模型** 下拉框选择模型（等同 `ollama list`）；或设环境变量：
    - `IMG_STITCH_OLLAMA_MODEL`（默认 `qwen2.5:14b`）
    - `IMG_STITCH_OLLAMA_HOST`（默认 `http://127.0.0.1:11434`）
 5. 若 Ollama 不可用，应用会**回退 Argos** 并在状态里提示。
+
+每张图默认把 OCR 得到的全部英文按阅读顺序拼成**一个段落**再翻译一次（整页一条译文）。附近框合并（`merge_nearby`）仅作可选回退，不是默认路径。
+
 
 ## 质量与限制
 
 - OCR 对小字、艺术字、低对比、倾斜文本效果有限；可能漏检或框不准
 - 默认优先 **Ollama**（如 qwen2.5）做 EN→ZH；不可用时回退 Argos。
-- 默认**不再叠字覆盖原图**：OCR 附近框合并为整句/气泡后按阅读顺序 → Ollama/Argos 翻译 → 在原图下方追加浅色译文条带（`font.getbbox` 换行与量高，CJK 字体、充足边距）。旧的框内叠字路径仅保留为 `render_mode="overlay"`（非默认）。
+- 默认**不再叠字覆盖原图**：OCR 阅读顺序后将**全部英文拼成一段** → 一次 Ollama/Argos 翻译 → 在原图下方追加浅色译文条带（`font.getbbox` 换行与量高，CJK 字体、充足边距）。附近框合并仅为可选回退（`merge_nearby=True`）。旧的框内叠字路径仅保留为 `render_mode="overlay"`（非默认）。
 - 译文条带：浅色底 + 自动换行左对齐；原图文字框保持不变；复杂排版依赖 OCR 阅读顺序
 - 翻译模式**不处理 PDF 内嵌文字**（跳过 PDF）；也不处理 GIF
 - 首次模型下载可能数百 MB；之后离线可用（Argos 路径）；EasyOCR 依赖 PyTorch，安装较慢
@@ -146,11 +151,14 @@ python translate_local.py path\to\image.jpg
 
 ```json
 {
-  "output_dir": "C:\\Users\\你\\Documents\\PDF导出"
+  "output_dir": "C:\Users\你\Documents\PDF导出",
+  "ollama_model": "qwen2.5:14b"
 }
 ```
 
-首次启动若尚未配置，会自动创建 `文档/PDF导出`（或 `~/Documents/PDF导出`）并写入该文件。
+其中 `ollama_model` 由 GUI 模型下拉框写入；未配置时若本机已安装则默认优先 `qwen2.5:14b`。
+
+首次启动若尚未配置导出目录，会自动创建 `文档/PDF导出`（或 `~/Documents/PDF导出`）并写入该文件。
 
 ## 项目结构
 

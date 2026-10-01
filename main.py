@@ -442,6 +442,79 @@ def set_output_dir(path: Union[str, Path]) -> Path:
     return out
 
 
+DEFAULT_OLLAMA_MODEL = "qwen2.5:14b"
+
+
+def get_ollama_model_config() -> Optional[str]:
+    """Return persisted ``ollama_model`` from config.json, or None if unset."""
+    raw = load_config().get("ollama_model")
+    if raw is None or raw == "":
+        return None
+    return str(raw).strip() or None
+
+
+def set_ollama_model_config(model: str) -> str:
+    """Persist ``ollama_model`` in config.json and apply to translate_local if loaded."""
+    name = (model or "").strip() or DEFAULT_OLLAMA_MODEL
+    data = load_config()
+    data["ollama_model"] = name
+    save_config(data)
+    if translate_local is not None and hasattr(translate_local, "set_ollama_model"):
+        translate_local.set_ollama_model(name)
+    return name
+
+
+def list_ollama_models_for_ui() -> List[str]:
+    """Model names from Ollama (``/api/tags``, same as ``ollama list``). Empty if down."""
+    if translate_local is None:
+        return []
+    try:
+        names = list(translate_local.ollama_list_models())
+    except Exception:
+        return []
+    seen = set()
+    out: List[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def resolve_ollama_model_choice(available: Optional[Sequence[str]] = None) -> str:
+    """Pick model: config → qwen2.5:14b if present → first available → default."""
+    names = list(available) if available is not None else list_ollama_models_for_ui()
+    cfg = get_ollama_model_config()
+    if cfg:
+        if not names or cfg in names:
+            return cfg
+        for n in names:
+            if n.startswith(cfg) or cfg in n:
+                return n
+        return cfg
+    prefer = DEFAULT_OLLAMA_MODEL
+    if prefer in names:
+        return prefer
+    for n in names:
+        if n.startswith(prefer) or prefer in n:
+            return n
+    if names:
+        return names[0]
+    if translate_local is not None and hasattr(translate_local, "get_ollama_model"):
+        return translate_local.get_ollama_model()
+    return prefer
+
+
+def apply_ollama_model_to_runtime(model: Optional[str] = None) -> str:
+    """Resolve choice and push selection into config + translate_local."""
+    names = list_ollama_models_for_ui()
+    chosen = (model or "").strip() or resolve_ollama_model_choice(names)
+    set_ollama_model_config(chosen)
+    return chosen
+
+
+
+
 def ensure_default_output_dir() -> Path:
     """若尚未配置 output_dir，则创建建议目录并写入配置；返回当前默认目录。"""
     existing = get_output_dir()
@@ -542,7 +615,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__()
         self.title("图片 / PDF 导出 PDF")
-        self.geometry("820x520")
+        self.geometry("820x560")
         self.minsize(700, 420)
 
         self.paths: List[Path] = []
@@ -554,9 +627,12 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.direct_export_var: Optional[tk.BooleanVar] = None
         self.translate_then_export_var: Optional[tk.BooleanVar] = None
         self.output_dir_label_var: Optional[tk.StringVar] = None
+        self.ollama_model_var: Optional[tk.StringVar] = None
+        self._ollama_model_combo: Optional[ttk.Combobox] = None
 
         self._build_ui()
         self._refresh_output_dir_label()
+        self._refresh_ollama_model_combo()
         self._set_status(
             "请添加图片、PDF 或文件夹（含子目录）。可用「移到第…位」或双击调整顺序。"
             f"默认导出目录：{self.output_dir}"
@@ -630,6 +706,30 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         ttk.Button(
             out_row, text="设定默认导出文件夹…", command=self.set_default_output_folder
         ).pack(side=tk.RIGHT)
+
+        model_row = ttk.Frame(self)
+        model_row.pack(fill=tk.X, **pad)
+        ttk.Label(model_row, text="Ollama 模型：").pack(side=tk.LEFT)
+        self.ollama_model_var = tk.StringVar(value=resolve_ollama_model_choice())
+        self._ollama_model_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.ollama_model_var,
+            width=36,
+            state="readonly",
+        )
+        self._ollama_model_combo.pack(side=tk.LEFT, padx=(0, 4))
+        self._ollama_model_combo.bind(
+            "<<ComboboxSelected>>", self._on_ollama_model_selected
+        )
+        ttk.Button(
+            model_row, text="刷新模型列表", command=self._refresh_ollama_model_combo
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Label(
+            model_row,
+            text="（来自 ollama list，写入 config.json 的 ollama_model）",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=6)
+
 
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, **pad)
@@ -930,6 +1030,31 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             return str(self.paths[0].parent)
         return str(Path.home())
 
+    def _refresh_ollama_model_combo(self) -> None:
+        """Reload Ollama model names into the dropdown and apply persisted choice."""
+        names = list_ollama_models_for_ui()
+        chosen = resolve_ollama_model_choice(names)
+        values = list(names)
+        if chosen and chosen not in values:
+            values = [chosen] + values
+        if not values:
+            values = [chosen or DEFAULT_OLLAMA_MODEL]
+        if self._ollama_model_combo is not None:
+            self._ollama_model_combo["values"] = values
+        if self.ollama_model_var is not None:
+            self.ollama_model_var.set(chosen)
+        apply_ollama_model_to_runtime(chosen)
+
+    def _on_ollama_model_selected(self, _event=None) -> None:
+        if self.ollama_model_var is None:
+            return
+        name = (self.ollama_model_var.get() or "").strip()
+        if not name:
+            return
+        apply_ollama_model_to_runtime(name)
+        self._set_status(f"已选择 Ollama 模型：{name}（已写入配置）")
+
+
     def create_shortcut(self) -> None:
         try:
             lnk = create_desktop_shortcut(PROJECT_DIR)
@@ -1007,6 +1132,11 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                     self.after(0, lambda m=msg: self._set_status(m))
 
                 # Auto-install missing packages into this interpreter (no manual pip)
+                # Honor UI / config model before loading MT
+                if self.ollama_model_var is not None:
+                    apply_ollama_model_to_runtime(self.ollama_model_var.get())
+                else:
+                    apply_ollama_model_to_runtime()
                 translate_local.ensure_deps(progress_callback=on_dep)
                 on_dep("正在准备 OCR / 翻译模型（首次可能下载）…")
                 try:

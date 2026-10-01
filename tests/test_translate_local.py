@@ -470,13 +470,37 @@ def test_sort_ocr_boxes_reading_order_rows():
 
 
 def test_collect_english_and_join_caption():
-    # Far apart vertically -> stay separate after merge pass
+    # Default: reading order only (no merge) — far boxes stay separate fragments
     boxes = [
         tl.OcrBox("world", (10, 120, 80, 140), 0.9),
         tl.OcrBox("Hello", (10, 5, 80, 25), 0.9),
     ]
     assert tl.collect_english_in_reading_order(boxes) == ["Hello", "world"]
+    assert tl.join_english_paragraph(boxes) == "Hello world"
     assert tl.join_chinese_caption_lines(["你好", "世界"]) == "你好\n世界"
+    assert tl.join_chinese_caption_lines(["整页一句"]) == "整页一句"
+
+
+def test_join_english_parts_hyphen_and_spaces():
+    assert tl.join_english_parts(["Hello", "world"]) == "Hello world"
+    assert tl.join_english_parts(["some-", "thing", "else"]) == "something else"
+    assert tl.join_english_parts(["", "  ", "Only"]) == "Only"
+
+
+def test_join_english_paragraph_optional_merge_fallback():
+    boxes = [
+        tl.OcrBox("world", (70, 10, 130, 30), 0.8),
+        tl.OcrBox("Hello", (10, 12, 60, 28), 0.9),
+        tl.OcrBox("Below", (10, 120, 80, 140), 0.9),
+    ]
+    # Default whole-page: all fragments joined regardless of distance
+    assert tl.join_english_paragraph(boxes) == "Hello world Below"
+    # Optional merge still available; then join remaining
+    assert tl.collect_english_in_reading_order(boxes, merge_nearby=True) == [
+        "Hello world",
+        "Below",
+    ]
+    assert tl.join_english_paragraph(boxes, merge_nearby=True) == "Hello world Below"
 
 
 def test_merge_nearby_ocr_boxes_same_line():
@@ -559,10 +583,10 @@ def test_append_caption_band_empty_returns_same_size():
 def test_translate_image_file_default_is_caption_not_overlay(tmp_path: Path):
     src = tmp_path / "panel.png"
     Image.new("RGB", (120, 50), (90, 90, 90)).save(src)
-    # Nearby vertical boxes -> merged into one sentence before MT
+    # Distant boxes still joined into ONE paragraph → ONE MT call (whole-page)
     boxes = [
         tl.OcrBox("One", (5, 5, 50, 20), 0.95),
-        tl.OcrBox("Two", (5, 25, 50, 40), 0.95),
+        tl.OcrBox("Two", (5, 80, 50, 95), 0.95),  # far below — merge would keep separate
     ]
     calls = []
 
@@ -582,6 +606,46 @@ def test_translate_image_file_default_is_caption_not_overlay(tmp_path: Path):
         assert im.size[1] > 50
         # Top-left of original region still gray (not whitened by overlay)
         assert im.getpixel((2, 2)) == (90, 90, 90)
+
+
+def test_translate_image_file_merge_nearby_optional(tmp_path: Path):
+    src = tmp_path / "panel2.png"
+    Image.new("RGB", (120, 50), (90, 90, 90)).save(src)
+    boxes = [
+        tl.OcrBox("One", (5, 5, 50, 20), 0.95),
+        tl.OcrBox("Two", (5, 25, 50, 40), 0.95),
+    ]
+    calls = []
+
+    def fake_tr(t):
+        calls.append(t)
+        return "合并译文"
+
+    with patch.object(tl, "ocr_image", return_value=boxes), patch.object(
+        tl, "translate_en_to_zh", side_effect=fake_tr
+    ), patch.object(tl, "_get_translator", return_value=(fake_tr, "mock")):
+        tl.translate_image_file(src, merge_nearby=True)
+
+    assert calls == ["One Two"]
+
+
+def test_set_ollama_model_updates_and_resets_cache():
+    prev = tl.get_ollama_model()
+    tl._translate_fn = lambda t: t  # type: ignore
+    tl._mt_backend = "ollama"
+    try:
+        assert tl.set_ollama_model("qwen2.5:7b") == "qwen2.5:7b"
+        assert tl.get_ollama_model() == "qwen2.5:7b"
+        assert tl._translate_fn is None
+        assert tl._mt_backend is None
+    finally:
+        tl.set_ollama_model(prev)
+
+
+def test_pick_default_ollama_model_prefers_14b():
+    assert tl.pick_default_ollama_model(["llama3:8b", "qwen2.5:14b"]) == "qwen2.5:14b"
+    assert tl.pick_default_ollama_model(["qwen2.5:7b", "llama3:8b"]) == "qwen2.5:7b"
+    assert tl.pick_default_ollama_model([]) == "qwen2.5:14b"
 
 
 

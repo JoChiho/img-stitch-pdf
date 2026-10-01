@@ -5,8 +5,10 @@
 Offline-first translation for screenshot / comic panels:
   - OCR: EasyOCR (lazy import; first run downloads models)
   - MT: Ollama HTTP API (preferred, e.g. qwen2.5) with Argos en→zh fallback
-  - Caption: keep the original image intact; append a white/light translation
-    band BELOW the image (taller output = original + wrapped Chinese lines).
+  - Caption (default): after OCR reading-order, join ALL English into ONE
+    paragraph (spaces), translate once via Ollama/Argos, then append that
+    single Chinese translation as a light band BELOW the original image.
+    Nearby-box merge remains an optional fallback (``merge_nearby=True``).
     Does NOT paint over original text boxes (overlay helpers remain for tests
     only and are not used by the default pipeline).
 
@@ -568,18 +570,73 @@ def merge_nearby_ocr_boxes(
     return merged
 
 
-def collect_english_in_reading_order(boxes: Sequence[OcrBox]) -> List[str]:
-    """Return non-empty OCR English strings in reading order (merged boxes)."""
+def collect_english_in_reading_order(
+    boxes: Sequence[OcrBox],
+    *,
+    merge_nearby: bool = False,
+    row_tol: Optional[int] = None,
+) -> List[str]:
+    """Return non-empty OCR English strings in reading order.
+
+    Default is **whole-page** fragments (sort only; no nearby merge). Pass
+    ``merge_nearby=True`` to run :func:`merge_nearby_ocr_boxes` first as an
+    optional fallback before collecting strings.
+    """
+    ordered = (
+        merge_nearby_ocr_boxes(boxes, row_tol=row_tol)
+        if merge_nearby
+        else sort_ocr_boxes_reading_order(boxes, row_tol=row_tol)
+    )
     out: List[str] = []
-    for ob in merge_nearby_ocr_boxes(boxes):
+    for ob in ordered:
         t = (ob.text or "").strip()
         if t:
             out.append(t)
     return out
 
 
+def join_english_parts(parts: Sequence[str]) -> str:
+    """Join English fragments into one paragraph (spaces; glue hyphen breaks)."""
+    result = ""
+    for raw in parts:
+        t = (raw or "").strip()
+        if not t:
+            continue
+        if not result:
+            result = t
+        elif result.endswith("-"):
+            # Hyphenated line-break: "some-" + "thing" -> "something"
+            result = result[:-1] + t
+        else:
+            result = f"{result} {t}"
+    return result
+
+
+def join_english_paragraph(
+    boxes: Sequence[OcrBox],
+    *,
+    merge_nearby: bool = False,
+    row_tol: Optional[int] = None,
+) -> str:
+    """Sort OCR boxes in reading order and join ALL English into one paragraph.
+
+    Default (``merge_nearby=False``): whole-page — every non-empty box text is
+    joined with spaces after reading-order sort. If ``merge_nearby=True``, first
+    run :func:`merge_nearby_ocr_boxes` as an optional fallback, then join.
+    """
+    return join_english_parts(
+        collect_english_in_reading_order(
+            boxes, merge_nearby=merge_nearby, row_tol=row_tol
+        )
+    )
+
+
 def join_chinese_caption_lines(zh_lines: Sequence[str]) -> str:
-    """Join translated fragments into readable Chinese caption text."""
+    """Join translated fragments into readable Chinese caption text.
+
+    Prefer a single whole-page translation (one string). Multiple fragments are
+    still joined with newlines for backward compatibility / merge fallback.
+    """
     parts = [(s or "").strip() for s in zh_lines]
     parts = [p for p in parts if p]
     return "\n".join(parts)
@@ -686,10 +743,54 @@ _translate_fn = None  # cached callable: str -> str
 _mt_backend: Optional[str] = None  # "ollama" | "argos" | "deep_translator" | None
 _mt_status_detail: str = ""  # human-readable note (fallback reason, model name, …)
 
-# Ollama defaults (override with env). Prefer 14b when RAM allows; see README.
+# Ollama defaults (override with env / set_ollama_model). Prefer 14b when present.
+DEFAULT_OLLAMA_MODEL = "qwen2.5:14b"
 OLLAMA_HOST = os.environ.get("IMG_STITCH_OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("IMG_STITCH_OLLAMA_MODEL", "qwen2.5:14b")
+OLLAMA_MODEL = os.environ.get("IMG_STITCH_OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
 OLLAMA_TIMEOUT_SEC = float(os.environ.get("IMG_STITCH_OLLAMA_TIMEOUT", "120"))
+
+
+def get_ollama_model() -> str:
+    """Return the currently selected Ollama model name."""
+    return OLLAMA_MODEL
+
+
+def reset_mt_cache() -> None:
+    """Clear cached MT callable so the next translate re-resolves the backend."""
+    global _translate_fn, _mt_backend, _mt_status_detail, _argos_translator
+    _translate_fn = None
+    _mt_backend = None
+    _mt_status_detail = ""
+    _argos_translator = None
+
+
+def set_ollama_model(model: str) -> str:
+    """Set preferred Ollama model and clear MT cache so it takes effect next call."""
+    global OLLAMA_MODEL
+    name = (model or "").strip() or DEFAULT_OLLAMA_MODEL
+    OLLAMA_MODEL = name
+    reset_mt_cache()
+    logger.info("Ollama model set to %s", OLLAMA_MODEL)
+    return OLLAMA_MODEL
+
+
+def pick_default_ollama_model(available: Optional[Sequence[str]] = None) -> str:
+    """Prefer ``qwen2.5:14b`` when present in *available* (or live ``ollama list``).
+
+    Does not change the current model unless a better default match is found and
+    the current selection is empty. Returns the chosen name without writing config.
+    """
+    names = list(available) if available is not None else ollama_list_models()
+    prefer = DEFAULT_OLLAMA_MODEL
+    if not names:
+        return prefer
+    if prefer in names:
+        return prefer
+    # Accept close tags (e.g. qwen2.5:14b-instruct)
+    for n in names:
+        if n.startswith(prefer) or prefer in n:
+            return n
+    return names[0]
 
 
 def check_deps() -> dict:
@@ -1183,12 +1284,15 @@ def translate_image_file(
     font_path: Optional[Path] = None,
     min_confidence: float = 0.3,
     render_mode: str = "caption",
+    merge_nearby: bool = False,
 ) -> Path:
-    """OCR → merge nearby boxes → translate → caption band → save under ``translated_zh/``.
+    """OCR → whole-page English paragraph → one MT call → caption band.
 
     Default ``render_mode="caption"`` keeps the original image intact and
-    appends a translation band below it. ``render_mode="overlay"`` is kept
-    only for backward compatibility / debugging and is not the default.
+    appends a single Chinese translation band below it (all OCR English joined
+    in reading order, then translated once). Pass ``merge_nearby=True`` to
+    optionally merge nearby boxes before joining (fallback only).
+    ``render_mode="overlay"`` is kept for backward compatibility / debugging.
 
     Never overwrites ``src``.
     """
@@ -1238,23 +1342,20 @@ def translate_image_file(
                 mt_status(),
             )
         else:
-            # Default: merge nearby OCR boxes → MT each sentence/bubble → caption under image.
-            english_parts = collect_english_in_reading_order(boxes)
-            zh_parts: List[str] = []
-            for en in english_parts:
-                zh = translate_en_to_zh(en)
-                if zh:
-                    zh_parts.append(zh)
-            caption = join_chinese_caption_lines(zh_parts)
+            # Default: reading-order → one English paragraph → one MT call → caption.
+            english = join_english_paragraph(boxes, merge_nearby=merge_nearby)
+            caption = ""
+            if english:
+                caption = translate_en_to_zh(english)
             canvas = append_caption_band(
                 original, caption, font_path=font_path
             )
             logger.info(
-                "Caption mode: %d raw OCR → %d merged line(s) → %d zh line(s); "
-                "out size %sx%s (src %sx%s); %s",
+                "Caption mode: %d raw OCR → whole-page paragraph (%d chars EN) "
+                "→ 1 MT call (merge_nearby=%s); out size %sx%s (src %sx%s); %s",
                 len(boxes),
-                len(english_parts),
-                len(zh_parts),
+                len(english),
+                merge_nearby,
                 canvas.size[0],
                 canvas.size[1],
                 original.size[0],
