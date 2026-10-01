@@ -217,3 +217,71 @@ def test_items_to_multipage_pdf_images_only_delegates(tmp_path: Path):
     pages = main.items_to_multipage_pdf(paths, out)
     assert pages == 4
     assert len(PdfReader(str(out)).pages) == 4
+
+
+
+def test_suggested_default_output_dir_ends_with_chinese_folder():
+    suggested = main.suggested_default_output_dir()
+    assert suggested.name == "PDF导出"
+    assert suggested.parent.name in ("Documents", "文档", "My Documents") or (
+        "Documents" in suggested.parent.as_posix()
+        or "文档" in suggested.parent.as_posix()
+    )
+
+
+def test_config_load_save_roundtrip(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
+    assert main.load_config() == {}
+    assert main.get_output_dir() is None
+
+    out = tmp_path / "exports"
+    saved = main.set_output_dir(out)
+    assert saved == out.resolve()
+    assert main.config_path() == cfg_dir / "config.json"
+    assert main.config_path().is_file()
+
+    loaded = main.load_config()
+    assert loaded["output_dir"] == str(out.resolve())
+    assert main.get_output_dir() == out.resolve()
+
+
+def test_config_load_handles_missing_and_corrupt(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
+    assert main.load_config() == {}
+
+    path = main.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not-json", encoding="utf-8")
+    assert main.load_config() == {}
+
+    path.write_text('"just a string"', encoding="utf-8")
+    assert main.load_config() == {}
+
+
+def test_ensure_default_output_dir_creates_and_persists(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "cfg"
+    suggested = tmp_path / "Documents" / "PDF导出"
+    monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
+    monkeypatch.setattr(main, "suggested_default_output_dir", lambda: suggested)
+
+    assert main.get_output_dir() is None
+    got = main.ensure_default_output_dir()
+    assert got == suggested.resolve()
+    assert suggested.is_dir()
+    assert main.get_output_dir() == suggested.resolve()
+
+    # second call keeps existing setting even if suggested would differ
+    other = tmp_path / "other_out"
+    other.mkdir()
+    main.set_output_dir(other)
+    got2 = main.ensure_default_output_dir()
+    assert got2 == other.resolve()
+
+
+def test_get_output_dir_empty_string_is_none(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setattr(main, "config_dir", lambda: cfg_dir)
+    main.save_config({"output_dir": ""})
+    assert main.get_output_dir() is None

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import subprocess
@@ -333,6 +334,109 @@ def items_to_multipage_pdf(
     return total_pages
 
 
+
+APP_NAME = "img-stitch-pdf"
+CONFIG_FILENAME = "config.json"
+
+
+def config_dir() -> Path:
+    """用户级配置目录：Windows 用 %APPDATA%/img-stitch-pdf，其它用 ~/.config/img-stitch-pdf。"""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA")
+        if base:
+            return Path(base) / APP_NAME
+        return Path.home() / "AppData" / "Roaming" / APP_NAME
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / APP_NAME
+    return Path.home() / ".config" / APP_NAME
+
+
+def config_path() -> Path:
+    return config_dir() / CONFIG_FILENAME
+
+
+def suggested_default_output_dir() -> Path:
+    """首次建议的默认导出目录：~/Documents/PDF导出（跨平台友好）。"""
+    docs = Path.home() / "Documents"
+    # Windows 上 Documents 可能在 OneDrive 下；仍优先 ~/Documents
+    if sys.platform == "win32":
+        try:
+            import ctypes.wintypes
+
+            CSIDL_PERSONAL = 5  # My Documents
+            SHGFP_TYPE_CURRENT = 0
+            buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+            ctypes.windll.shell32.SHGetFolderPathW(
+                None, CSIDL_PERSONAL, None, SHGFP_TYPE_CURRENT, buf
+            )
+            if buf.value:
+                docs = Path(buf.value)
+        except Exception:
+            pass
+    return docs / "PDF导出"
+
+
+def load_config() -> dict:
+    """读取 JSON 配置；文件不存在或损坏时返回空 dict。"""
+    path = config_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(data: dict) -> Path:
+    """写入配置文件，自动创建配置目录。返回配置文件路径。"""
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(data) if isinstance(data, dict) else {}
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def get_output_dir() -> Optional[Path]:
+    """返回已配置的 output_dir（Path）；未设置或无效则 None。"""
+    raw = load_config().get("output_dir")
+    if raw is None or raw == "":
+        return None
+    try:
+        p = Path(str(raw)).expanduser()
+    except (TypeError, ValueError):
+        return None
+    return p
+
+
+def set_output_dir(path: Union[str, Path]) -> Path:
+    """设置并持久化 output_dir，返回规范化 Path。"""
+    out = Path(path).expanduser().resolve()
+    data = load_config()
+    data["output_dir"] = str(out)
+    save_config(data)
+    return out
+
+
+def ensure_default_output_dir() -> Path:
+    """若尚未配置 output_dir，则创建建议目录并写入配置；返回当前默认目录。"""
+    existing = get_output_dir()
+    if existing is not None:
+        try:
+            existing.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return existing
+    suggested = suggested_default_output_dir()
+    suggested.mkdir(parents=True, exist_ok=True)
+    return set_output_dir(suggested)
+
+
+
 def find_pythonw() -> Path:
     """查找 pythonw.exe（尽量与当前解释器同目录）。"""
     exe = Path(sys.executable)
@@ -425,11 +529,15 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.source_folder: Optional[Path] = None
         self._exporting = False
         self._export_btn: Optional[ttk.Button] = None
+        self.output_dir: Path = ensure_default_output_dir()
+        self.direct_export_var: Optional[tk.BooleanVar] = None
+        self.output_dir_label_var: Optional[tk.StringVar] = None
 
         self._build_ui()
+        self._refresh_output_dir_label()
         self._set_status(
             "请添加图片、PDF 或文件夹（含子目录）。可用「移到第…位」或双击调整顺序。"
-            "导出：图片一图一页，PDF 按页追加，不重新栅格化。"
+            f"默认导出目录：{self.output_dir}"
         )
 
     def _build_ui(self) -> None:
@@ -486,12 +594,31 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=8, pady=6)
 
+        out_row = ttk.Frame(self)
+        out_row.pack(fill=tk.X, **pad)
+        ttk.Label(out_row, text="默认导出目录：").pack(side=tk.LEFT)
+        self.output_dir_label_var = tk.StringVar(value="")
+        ttk.Label(
+            out_row,
+            textvariable=self.output_dir_label_var,
+            foreground="#333333",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            out_row, text="设定默认导出文件夹…", command=self.set_default_output_folder
+        ).pack(side=tk.RIGHT)
+
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, **pad)
         self._export_btn = ttk.Button(
             bottom, text="生成 PDF…", command=self.export_pdf
         )
         self._export_btn.pack(side=tk.LEFT)
+        self.direct_export_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            bottom,
+            text="直接导出到默认文件夹",
+            variable=self.direct_export_var,
+        ).pack(side=tk.LEFT, padx=8)
         ttk.Button(bottom, text="创建桌面快捷方式", command=self.create_shortcut).pack(
             side=tk.LEFT, padx=8
         )
@@ -729,6 +856,46 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._refresh_list()
         self._set_status("列表已清空。")
 
+
+    def _refresh_output_dir_label(self) -> None:
+        if self.output_dir_label_var is not None:
+            self.output_dir_label_var.set(str(self.output_dir))
+
+    def set_default_output_folder(self) -> None:
+        """弹出目录选择，持久化默认导出文件夹。"""
+        if self._exporting:
+            return
+        initial = str(self.output_dir) if self.output_dir.is_dir() else str(Path.home())
+        chosen = filedialog.askdirectory(
+            title="设定默认导出文件夹",
+            initialdir=initial,
+        )
+        if not chosen:
+            self._set_status("未更改默认导出目录。")
+            return
+        self.output_dir = set_output_dir(chosen)
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showwarning("提示", f"目录已保存，但创建失败：{e}")
+        self._refresh_output_dir_label()
+        self._set_status(f"默认导出目录已设为：{self.output_dir}")
+
+    def _export_initial_dir(self) -> str:
+        """保存对话框的初始目录：优先已配置的默认导出文件夹。"""
+        if self.output_dir is not None:
+            try:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            if self.output_dir.is_dir():
+                return str(self.output_dir)
+        if self.source_folder and self.source_folder.is_dir():
+            return str(self.source_folder)
+        if self.paths:
+            return str(self.paths[0].parent)
+        return str(Path.home())
+
     def create_shortcut(self) -> None:
         try:
             lnk = create_desktop_shortcut(PROJECT_DIR)
@@ -749,24 +916,27 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             return
 
         initial = default_pdf_name(self.paths, self.source_folder)
-        initial_dir = None
-        if self.source_folder and self.source_folder.is_dir():
-            initial_dir = str(self.source_folder)
-        elif self.paths:
-            initial_dir = str(self.paths[0].parent)
-
-        out = filedialog.asksaveasfilename(
-            title="保存 PDF",
-            defaultextension=".pdf",
-            filetypes=[("PDF 文件", "*.pdf")],
-            initialfile=initial,
-            initialdir=initial_dir,
+        initial_dir = self._export_initial_dir()
+        direct = bool(
+            self.direct_export_var is not None and self.direct_export_var.get()
         )
-        if not out:
-            self._set_status("已取消导出。")
-            return
 
-        out_path = Path(out)
+        if direct:
+            out_path = Path(initial_dir) / initial
+            if out_path.suffix.lower() != ".pdf":
+                out_path = out_path.with_suffix(".pdf")
+        else:
+            out = filedialog.asksaveasfilename(
+                title="保存 PDF",
+                defaultextension=".pdf",
+                filetypes=[("PDF 文件", "*.pdf")],
+                initialfile=initial,
+                initialdir=initial_dir,
+            )
+            if not out:
+                self._set_status("已取消导出。")
+                return
+            out_path = Path(out)
         paths_snapshot = list(self.paths)
         self._set_exporting(True)
         self._set_status(f"正在导出多页 PDF：0/{len(paths_snapshot)}…")
