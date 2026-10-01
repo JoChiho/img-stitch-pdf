@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""多图导出为多页 PDF — 桌面 Tkinter GUI。
+"""多图 / PDF 导出为多页 PDF — 桌面 Tkinter GUI。
 
-默认：每张图一页，不拼接成巨图，避免 OOM。
-JPEG 尽量经 img2pdf 原样嵌入；其余走无损 PNG 路径。
+默认：列表项按顺序组成多页 PDF（图片一图一页；PDF 贡献其全部页），
+不拼接成巨图，避免 OOM。JPEG 尽量经 img2pdf 原样嵌入；PDF 页经 pypdf
+合并，不重新栅格化。
 """
 
 from __future__ import annotations
@@ -13,13 +14,18 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Union
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:  # 无 GUI 环境仍可导入核心导出逻辑（如 pytest）
+    tk = None  # type: ignore
+    filedialog = messagebox = ttk = None  # type: ignore
 
 try:
     from PIL import Image
@@ -32,8 +38,16 @@ try:
 except ImportError:
     img2pdf = None  # type: ignore
 
+try:
+    from pypdf import PdfReader, PdfWriter
+except ImportError:
+    PdfReader = None  # type: ignore
+    PdfWriter = None  # type: ignore
+
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")  # skip .gif by default
+PDF_EXT = ".pdf"
+MEDIA_EXTS = IMAGE_EXTS + (PDF_EXT,)
 PROJECT_DIR = Path(__file__).resolve().parent
 
 ProgressCallback = Callable[[int, int], None]
@@ -52,17 +66,28 @@ def natural_key(name: str):
     return key
 
 
+def is_pdf(path: Path) -> bool:
+    return Path(path).suffix.lower() == PDF_EXT
+
+
+def is_image(path: Path) -> bool:
+    return Path(path).suffix.lower() in IMAGE_EXTS
+
+
 def list_images_in_folder(
     folder: Path,
     *,
     skip_gif: bool = True,
+    include_pdf: bool = True,
 ) -> List[Path]:
-    """递归收集文件夹（含子目录）内常见扩展名图片，按相对路径自然排序。
+    """递归收集文件夹（含子目录）内常见扩展名图片与 PDF，按相对路径自然排序。
 
-    默认跳过 .gif；保留 jpg/jpeg/png/webp/bmp/tif/tiff。
+    默认跳过 .gif；保留 jpg/jpeg/png/webp/bmp/tif/tiff，以及 .pdf。
     """
     folder = Path(folder)
     allowed = set(IMAGE_EXTS)
+    if include_pdf:
+        allowed.add(PDF_EXT)
     if not skip_gif:
         allowed = set(allowed) | {".gif"}
     found: List[Path] = []
@@ -75,7 +100,6 @@ def list_images_in_folder(
         found.append(p)
     found.sort(key=lambda p: natural_key(p.relative_to(folder).as_posix()))
     return found
-
 
 
 def move_items_to_index(
@@ -109,7 +133,7 @@ def move_items_to_index(
 
 
 def default_pdf_name(paths: List[Path], source_folder: Optional[Path]) -> str:
-    """默认 PDF 文件名：文件夹名 / 首图 stem / images.pdf。"""
+    """默认 PDF 文件名：文件夹名 / 首文件 stem / merge.pdf。"""
     if source_folder is not None:
         name = source_folder.name.strip()
         if name:
@@ -121,7 +145,7 @@ def default_pdf_name(paths: List[Path], source_folder: Optional[Path]) -> str:
             if folder_name:
                 return f"{folder_name}.pdf"
         return f"{paths[0].stem}.pdf"
-    return "images.pdf"
+    return "merge.pdf"
 
 
 def _rgba_to_rgb(img: Image.Image) -> Image.Image:
@@ -153,12 +177,13 @@ def _prepare_img2pdf_input(path: Path) -> Img2pdfInput:
         rgb.save(buf, format="PNG", optimize=False)
         return buf.getvalue()
 
+
 def images_to_multipage_pdf(
     paths: Sequence[Path],
     out_path: Path,
     progress_callback: Optional[ProgressCallback] = None,
-) -> None:
-    """将多张图片导出为多页 PDF（一图一页，列表顺序）。
+) -> int:
+    """将多张图片导出为多页 PDF（一图一页，列表顺序）。返回页数。
 
     不拼接成单张巨图。优先 img2pdf；不可用时退回 Pillow 多页 PDF。
     """
@@ -181,7 +206,7 @@ def images_to_multipage_pdf(
             prepared.append(_prepare_img2pdf_input(p))
         with open(out_path, "wb") as f:
             f.write(img2pdf.convert(prepared))
-        return
+        return n
 
     # 无 img2pdf：Pillow 逐页写入，仍不拼接
     pil_images: List[Image.Image] = []
@@ -199,6 +224,113 @@ def images_to_multipage_pdf(
                 im.close()
             except Exception:
                 pass
+    return n
+
+
+def _require_pypdf() -> None:
+    if PdfWriter is None or PdfReader is None:
+        raise ImportError(
+            "合并 PDF 需要 pypdf。请执行: pip install pypdf"
+        )
+
+
+def merge_pdf_files(
+    pdf_paths: Sequence[Path],
+    out_path: Path,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> int:
+    """按列表顺序合并多个 PDF 的全部页（不重新栅格化）。返回总页数。"""
+    _require_pypdf()
+    paths = [Path(p) for p in pdf_paths]
+    if not paths:
+        raise ValueError("没有可合并的 PDF")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(paths)
+    writer = PdfWriter()
+    total_pages = 0
+
+    for i, p in enumerate(paths, start=1):
+        if progress_callback is not None:
+            progress_callback(i, n)
+        reader = PdfReader(str(p))
+        for page in reader.pages:
+            writer.add_page(page)
+            total_pages += 1
+
+    with open(out_path, "wb") as f:
+        writer.write(f)
+    return total_pages
+
+
+def _image_to_temp_pdf(path: Path, tmp_dir: Path) -> Path:
+    """把单张图片写成临时单页 PDF，供后续与其它 PDF 合并。"""
+    tmp_pdf = tmp_dir / f"img_{path.stem}_{id(path)}.pdf"
+    images_to_multipage_pdf([path], tmp_pdf)
+    return tmp_pdf
+
+
+def items_to_multipage_pdf(
+    paths: Sequence[Path],
+    out_path: Path,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> int:
+    """将图片与/或 PDF 按列表顺序导出为一个多页 PDF。返回总页数。
+
+    - 仅图片：走 images_to_multipage_pdf（img2pdf）
+    - 仅 PDF：pypdf 合并页，不栅格化
+    - 混合：图片先转临时 PDF，再与 PDF 页按顺序合并
+    """
+    paths = [Path(p) for p in paths]
+    if not paths:
+        raise ValueError("没有可导出的文件")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pdfs = [p for p in paths if is_pdf(p)]
+    images = [p for p in paths if is_image(p)]
+    unknown = [p for p in paths if not is_pdf(p) and not is_image(p)]
+    if unknown:
+        raise ValueError(f"不支持的文件类型: {unknown[0].suffix}")
+
+    n = len(paths)
+
+    def report(i: int) -> None:
+        if progress_callback is not None:
+            progress_callback(i, n)
+
+    # 纯图片：原有路径
+    if not pdfs:
+        return images_to_multipage_pdf(paths, out_path, progress_callback=progress_callback)
+
+    # 纯 PDF：直接合并
+    if not images:
+        return merge_pdf_files(paths, out_path, progress_callback=progress_callback)
+
+    # 混合：逐项生成 PDF 片段再合并
+    _require_pypdf()
+    writer = PdfWriter()
+    total_pages = 0
+    with tempfile.TemporaryDirectory(prefix="img_stitch_pdf_") as tmp:
+        tmp_dir = Path(tmp)
+        for i, p in enumerate(paths, start=1):
+            report(i)
+            if is_pdf(p):
+                reader = PdfReader(str(p))
+                for page in reader.pages:
+                    writer.add_page(page)
+                    total_pages += 1
+            else:
+                seg = _image_to_temp_pdf(p, tmp_dir)
+                reader = PdfReader(str(seg))
+                for page in reader.pages:
+                    writer.add_page(page)
+                    total_pages += 1
+        with open(out_path, "wb") as f:
+            writer.write(f)
+    return total_pages
 
 
 def find_pythonw() -> Path:
@@ -261,7 +393,7 @@ $Shortcut.TargetPath = '{str(pythonw).replace("'", "''")}'
 $Shortcut.Arguments = '"{str(main_py).replace("'", "''")}"'
 $Shortcut.WorkingDirectory = '{str(project_dir).replace("'", "''")}'
 $Shortcut.WindowStyle = 1
-$Shortcut.Description = '图片导出为多页 PDF'
+$Shortcut.Description = '图片/PDF 导出为多页 PDF'
 $Shortcut.Save()
 """
         subprocess.run(
@@ -282,12 +414,12 @@ $Shortcut.Save()
     return lnk_path
 
 
-class App(tk.Tk):
+class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__()
-        self.title("图片导出 PDF")
-        self.geometry("760x520")
-        self.minsize(660, 420)
+        self.title("图片 / PDF 导出 PDF")
+        self.geometry("820x520")
+        self.minsize(700, 420)
 
         self.paths: List[Path] = []
         self.source_folder: Optional[Path] = None
@@ -295,7 +427,10 @@ class App(tk.Tk):
         self._export_btn: Optional[ttk.Button] = None
 
         self._build_ui()
-        self._set_status("请添加图片或添加文件夹（含子目录）。可用「移到第…位」或双击调整顺序。默认：多页 PDF（一图一页）。")
+        self._set_status(
+            "请添加图片、PDF 或文件夹（含子目录）。可用「移到第…位」或双击调整顺序。"
+            "导出：图片一图一页，PDF 按页追加，不重新栅格化。"
+        )
 
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 4}
@@ -305,6 +440,9 @@ class App(tk.Tk):
 
         ttk.Button(top, text="添加图片…", command=self.add_images).pack(
             side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(top, text="添加 PDF…", command=self.add_pdfs).pack(
+            side=tk.LEFT, padx=2
         )
         ttk.Button(top, text="添加文件夹…", command=self.add_folder).pack(
             side=tk.LEFT, padx=2
@@ -342,9 +480,9 @@ class App(tk.Tk):
         hint.pack(fill=tk.X, **pad)
         ttk.Label(
             hint,
-            text="生成多页 PDF：列表中每张图片对应一页，保留原始像素。"
-            "JPEG 尽量原样嵌入；PNG 等走无损路径。不会拼接成单张巨图。",
-            wraplength=700,
+            text="生成多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
+            "PDF 文件贡献其全部页并直接合并（不重新栅格化）。可混合图片与 PDF。",
+            wraplength=760,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=8, pady=6)
 
@@ -372,7 +510,8 @@ class App(tk.Tk):
         sel = list(self.listbox.curselection()) if keep_selection else []
         self.listbox.delete(0, tk.END)
         for i, path in enumerate(self.paths, start=1):
-            self.listbox.insert(tk.END, f"{i}. {path.name}  —  {path}")
+            kind = "PDF" if is_pdf(path) else "图"
+            self.listbox.insert(tk.END, f"{i}. [{kind}] {path.name}  —  {path}")
         for idx in sel:
             if 0 <= idx < len(self.paths):
                 self.listbox.selection_set(idx)
@@ -410,24 +549,49 @@ class App(tk.Tk):
                 added += 1
         self._update_source_folder_from_paths()
         self._refresh_list()
-        self._set_status(f"已添加 {added} 张，当前共 {len(self.paths)} 张。")
+        self._set_status(f"已添加 {added} 张图片，当前共 {len(self.paths)} 项。")
+
+    def add_pdfs(self) -> None:
+        if self._exporting:
+            return
+        files = filedialog.askopenfilenames(
+            title="选择 PDF",
+            filetypes=[
+                ("PDF 文件", "*.pdf"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not files:
+            return
+        added = 0
+        for f in files:
+            path = Path(f)
+            if not is_pdf(path):
+                continue
+            if path not in self.paths:
+                self.paths.append(path)
+                added += 1
+        self._update_source_folder_from_paths()
+        self._refresh_list()
+        self._set_status(f"已添加 {added} 个 PDF，当前共 {len(self.paths)} 项。")
 
     def add_folder(self) -> None:
         if self._exporting:
             return
-        folder = filedialog.askdirectory(title="选择图片文件夹")
+        folder = filedialog.askdirectory(title="选择文件夹（图片与 PDF）")
         if not folder:
             return
         folder_path = Path(folder)
-        images = list_images_in_folder(folder_path)
-        if not images:
+        items = list_images_in_folder(folder_path)
+        if not items:
             messagebox.showwarning(
-                "提示", f"该文件夹内没有常见格式的图片：\n{folder_path}"
+                "提示",
+                f"该文件夹内没有常见格式的图片或 PDF：\n{folder_path}",
             )
-            self._set_status("文件夹内未找到图片。")
+            self._set_status("文件夹内未找到图片或 PDF。")
             return
         added = 0
-        for path in images:
+        for path in items:
             if path not in self.paths:
                 self.paths.append(path)
                 added += 1
@@ -446,17 +610,17 @@ class App(tk.Tk):
             self._update_source_folder_from_paths()
         self._refresh_list()
         self._set_status(
-            f"从文件夹（含所有子目录）添加了 {added} 张（自然排序），当前共 {len(self.paths)} 张。"
+            f"从文件夹（含所有子目录）添加了 {added} 项（图片+PDF，自然排序），"
+            f"当前共 {len(self.paths)} 项。"
             f"默认 PDF 名：{default_pdf_name(self.paths, self.source_folder)}"
         )
-
 
     def move_selected(self, delta: int) -> None:
         if self._exporting:
             return
         sel = list(self.listbox.curselection())
         if len(sel) != 1:
-            self._set_status("请只选择一张图片再上下移动；多选请用「移到第…位」。")
+            self._set_status("请只选择一项再上下移动；多选请用「移到第…位」。")
             return
         i = sel[0]
         j = i + delta
@@ -473,7 +637,7 @@ class App(tk.Tk):
             return
         sel = list(self.listbox.curselection())
         if not sel:
-            self._set_status("请先选择要移动的图片。")
+            self._set_status("请先选择要移动的项。")
             return
         if target_1based is None:
             raw = (self.move_pos_var.get() or "").strip()
@@ -549,13 +713,13 @@ class App(tk.Tk):
             return
         sel = sorted(self.listbox.curselection(), reverse=True)
         if not sel:
-            self._set_status("请先选中要移除的图片。")
+            self._set_status("请先选中要移除的项。")
             return
         for i in sel:
             del self.paths[i]
         self._update_source_folder_from_paths()
         self._refresh_list()
-        self._set_status(f"已移除，当前共 {len(self.paths)} 张。")
+        self._set_status(f"已移除，当前共 {len(self.paths)} 项。")
 
     def clear_list(self) -> None:
         if self._exporting:
@@ -580,7 +744,7 @@ class App(tk.Tk):
         if self._exporting:
             return
         if not self.paths:
-            messagebox.showwarning("提示", "请先添加至少一张图片。")
+            messagebox.showwarning("提示", "请先添加至少一张图片或一个 PDF。")
             self._set_status("导出列表为空。")
             return
 
@@ -615,7 +779,7 @@ class App(tk.Tk):
                         0, lambda i=i, n=n: self._set_status(f"正在导出 {i}/{n}…")
                     )
 
-                images_to_multipage_pdf(
+                page_count = items_to_multipage_pdf(
                     paths_snapshot, out_path, progress_callback=on_progress
                 )
             except Exception as e:
@@ -623,7 +787,9 @@ class App(tk.Tk):
                 err = e
                 self.after(0, lambda: self._on_export_error(err))
             else:
-                self.after(0, lambda: self._on_export_success(out_path, len(paths_snapshot)))
+                self.after(
+                    0, lambda: self._on_export_success(out_path, page_count)
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -644,6 +810,8 @@ class App(tk.Tk):
 
 
 def main() -> None:
+    if tk is None:
+        raise SystemExit("需要 tkinter 才能启动界面。请安装 python3-tk 或使用带 Tk 的 Python。")
     app = App()
     app.mainloop()
 
