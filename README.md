@@ -15,7 +15,7 @@
 - 默认 PDF 文件名：来自文件夹时用**文件夹名**；否则同源目录名 / **首文件 stem** / `merge.pdf`
 - **创建桌面快捷方式**（Windows `.lnk`：`pythonw.exe` + `main.py`，工作目录=项目目录）
 - 导出在**后台线程**进行，界面可继续操作；状态栏显示进度（如 `3/98`）；导出中禁用「生成 PDF」按钮
-- **本地翻译后导出**（可选）：勾选「本地翻译后导出」或点同名按钮 → 对列表中的图片做 **EN→ZH**（EasyOCR + Ollama / Argos），在**原图同目录**生成 `translated_zh/*_zh` 新图（**绝不覆盖原图**），再按默认导出目录写出多页 PDF；**跳过 PDF / GIF**；全程后台线程，避免界面冻结
+- **本地翻译后导出**：勾选或点「本地翻译后导出」→ 对列表中的图片做 **EN→ZH**（EasyOCR + Ollama / Argos），**保留原图像素不变**，在图片**下方追加**浅色中文译文条带（自动换行、CJK 字体与边距），写入原图同目录下 `translated_zh/*_zh`；**不覆盖原图**，再按默认导出目录写出多页 PDF（跳过 PDF / GIF）。全程后台线程，界面不冻结。
 - 底部状态栏提示进度与结果
 
 ## 环境要求
@@ -128,8 +128,8 @@ python translate_local.py path\to\image.jpg
 
 - OCR 对小字、艺术字、低对比、倾斜文本效果有限；可能漏检或框不准
 - 默认优先 **Ollama**（如 qwen2.5）做 EN→ZH；不可用时回退 Argos。
-- 中文叠字用 `font.getbbox` 测量并 `anchor=lt` 绘制，矮白条会缩小字号或增高 pad，避免字形被裁切。
-- 叠字：半透明白底 + 自适应字号居中；复杂排版（多栏、竖排）效果一般
+- 默认**不再叠字覆盖原图**：OCR 英文按阅读顺序收集 → Ollama/Argos 翻译 → 在原图下方追加浅色译文条带（`font.getbbox` 换行与量高，CJK 字体、充足边距）。旧的框内叠字路径仅保留为 `render_mode="overlay"`（非默认）。
+- 译文条带：浅色底 + 自动换行左对齐；原图文字框保持不变；复杂排版依赖 OCR 阅读顺序
 - 翻译模式**不处理 PDF 内嵌文字**（跳过 PDF）；也不处理 GIF
 - 首次模型下载可能数百 MB；之后离线可用（Argos 路径）；EasyOCR 依赖 PyTorch，安装较慢
 
@@ -157,7 +157,7 @@ python translate_local.py path\to\image.jpg
 ```
 img-stitch-pdf/
 ├── main.py                      # GUI 与导出逻辑
-├── translate_local.py           # 本地 EN→ZH（OCR / MT / 叠字）
+├── translate_local.py           # 本地 EN→ZH（OCR / MT / 下方译文条带）
 ├── create_desktop_shortcut.ps1  # 创建桌面快捷方式
 ├── requirements.txt             # 运行依赖（含可选翻译栈）
 ├── requirements-dev.txt         # 开发 / 测试依赖

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Local EN→ZH image translation pipeline (OCR → MT → overlay).
+"""Local EN→ZH image translation pipeline (OCR → MT → caption band).
 
 Offline-first translation for screenshot / comic panels:
   - OCR: EasyOCR (lazy import; first run downloads models)
   - MT: Ollama HTTP API (preferred, e.g. qwen2.5) with Argos en→zh fallback
-  - Overlay: Pillow + system CJK font; glyphs measured with font.getbbox
-    so Chinese text is not clipped by the white bar (never overwrites originals)
+  - Caption: keep the original image intact; append a white/light translation
+    band BELOW the image (taller output = original + wrapped Chinese lines).
+    Does NOT paint over original text boxes (overlay helpers remain for tests
+    only and are not used by the default pipeline).
 
 Heavy deps are optional at import time so unit tests for helpers can run
 without torch / argos / a running Ollama server.
@@ -399,6 +401,147 @@ def draw_text_in_box(
         y += lh + spacing
 
     return composed
+
+
+
+# ---------------------------------------------------------------------------
+# Reading order + caption band (default render; does not paint over original)
+# ---------------------------------------------------------------------------
+
+def sort_ocr_boxes_reading_order(
+    boxes: Sequence[OcrBox],
+    *,
+    row_tol: Optional[int] = None,
+) -> List[OcrBox]:
+    """Sort OCR boxes top-to-bottom, then left-to-right (reading order).
+
+    Boxes whose tops fall within ``row_tol`` pixels are treated as one row
+    (sorted left-to-right). If ``row_tol`` is omitted, half the median box
+    height is used (minimum 8px).
+    """
+    items = list(boxes)
+    if not items:
+        return []
+    heights = [max(1, b.box[3] - b.box[1]) for b in items]
+    heights_sorted = sorted(heights)
+    med_h = heights_sorted[len(heights_sorted) // 2]
+    tol = int(row_tol) if row_tol is not None else max(8, med_h // 2)
+
+    # Seed rows by top Y, then sort each row by left X.
+    by_top = sorted(items, key=lambda b: (b.box[1], b.box[0]))
+    rows: List[List[OcrBox]] = []
+    for b in by_top:
+        if not rows:
+            rows.append([b])
+            continue
+        row_top = min(x.box[1] for x in rows[-1])
+        if abs(b.box[1] - row_top) <= tol:
+            rows[-1].append(b)
+        else:
+            rows.append([b])
+    ordered: List[OcrBox] = []
+    for row in rows:
+        ordered.extend(sorted(row, key=lambda b: b.box[0]))
+    return ordered
+
+
+def collect_english_in_reading_order(boxes: Sequence[OcrBox]) -> List[str]:
+    """Return non-empty OCR English strings in reading order."""
+    out: List[str] = []
+    for ob in sort_ocr_boxes_reading_order(boxes):
+        t = (ob.text or "").strip()
+        if t:
+            out.append(t)
+    return out
+
+
+def join_chinese_caption_lines(zh_lines: Sequence[str]) -> str:
+    """Join translated fragments into readable Chinese caption text."""
+    parts = [(s or "").strip() for s in zh_lines]
+    parts = [p for p in parts if p]
+    return "\n".join(parts)
+
+
+def append_caption_band(
+    img: Image.Image,
+    text: str,
+    *,
+    font_path: Optional[Path] = None,
+    bg_rgb: Tuple[int, int, int] = (250, 250, 250),
+    text_fill: Tuple[int, int, int] = (20, 20, 20),
+    margin: int = 24,
+    line_spacing: float = 1.35,
+    font_size: Optional[int] = None,
+    max_band_height_ratio: float = 3.0,
+) -> Image.Image:
+    """Return a taller RGB image: original on top, caption band below.
+
+    The original pixels are pasted unchanged; Chinese (or other) caption
+    text is wrapped with a CJK font onto a light band under the image.
+    If ``text`` is empty, returns an RGB copy of ``img`` (same size).
+    """
+    base = img.convert("RGB")
+    w, h = base.size
+    caption = (text or "").strip()
+    if not caption:
+        return base.copy()
+
+    margin = max(8, int(margin))
+    # Prefer a readable size scaled to image width; shrink if band grows too tall.
+    if font_size is None:
+        size = max(16, min(36, w // 28))
+    else:
+        size = max(10, int(font_size))
+
+    max_band_h = max(h // 4, int(h * float(max_band_height_ratio)))
+    chosen_font = _load_font(size, font_path)
+    lines: List[str] = []
+    line_heights: List[int] = []
+    band_h = 0
+
+    for attempt_size in range(size, 9, -1):
+        chosen_font = _load_font(attempt_size, font_path)
+        inner_w = max(1, w - 2 * margin)
+        lines = wrap_text_to_width(caption, chosen_font, inner_w)
+        if not lines:
+            lines = [" "]
+        line_heights = []
+        for line in lines:
+            _lw, lh = _line_ink_size(chosen_font, line or " ")
+            line_heights.append(lh)
+        spacing = max(
+            0,
+            int((line_heights[0] if line_heights else attempt_size) * (line_spacing - 1.0)),
+        )
+        total_text_h = sum(line_heights) + spacing * max(0, len(lines) - 1)
+        band_h = margin + total_text_h + margin
+        if band_h <= max_band_h or attempt_size <= 10:
+            size = attempt_size
+            break
+
+    spacing = max(
+        0,
+        int((line_heights[0] if line_heights else size) * (line_spacing - 1.0)),
+    )
+
+    out = Image.new("RGB", (w, h + band_h), bg_rgb)
+    out.paste(base, (0, 0))
+    # Subtle separator line between image and caption
+    draw = ImageDraw.Draw(out)
+    sep = tuple(max(0, c - 18) for c in bg_rgb)
+    draw.line([(0, h), (w - 1, h)], fill=sep, width=1)
+
+    y = h + margin
+    for line, lh in zip(lines, line_heights):
+        x = margin
+        try:
+            draw.text((x, y), line, font=chosen_font, fill=text_fill, anchor="lt")
+        except TypeError:
+            bl, bt, _br, _bb = _font_getbbox(chosen_font, line or " ")
+            draw.text((x - bl, y - bt), line, font=chosen_font, fill=text_fill)
+        y += lh + spacing
+    return out
+
 
 
 # ---------------------------------------------------------------------------
@@ -916,8 +1059,16 @@ def translate_image_file(
     dst: Optional[Path] = None,
     font_path: Optional[Path] = None,
     min_confidence: float = 0.3,
+    render_mode: str = "caption",
 ) -> Path:
-    """OCR -> translate -> overlay -> save under ``translated_zh/``. Never overwrites ``src``."""
+    """OCR → translate → caption band → save under ``translated_zh/``.
+
+    Default ``render_mode="caption"`` keeps the original image intact and
+    appends a translation band below it. ``render_mode="overlay"`` is kept
+    only for backward compatibility / debugging and is not the default.
+
+    Never overwrites ``src``.
+    """
     src = Path(src)
     if not src.is_file():
         raise FileNotFoundError(src)
@@ -926,38 +1077,70 @@ def translate_image_file(
         # Safety: if somehow same path, force a distinct name under subfolder
         out = src.parent / TRANSLATED_SUBDIR / f"{src.stem}_zh_out{src.suffix.lower()}"
 
+    mode = (render_mode or "caption").strip().lower()
+    if mode not in ("caption", "overlay"):
+        mode = "caption"
+
     boxes = ocr_image(src, min_confidence=min_confidence)
     # Ensure translator is ready before the loop so status/logging is accurate
     _get_translator()
     logger.info(
-        "Translating %s: %d OCR box(es); %s; out=%s",
+        "Translating %s: %d OCR box(es); mode=%s; %s; out=%s",
         src.name,
         len(boxes),
+        mode,
         mt_status(),
         out,
     )
-    translated_boxes = 0
+
     with Image.open(src) as im:
         im.load()
-        canvas = im.convert("RGB")
-        for ob in boxes:
-            zh = translate_en_to_zh(ob.text)
-            if not zh:
-                continue
-            if contains_cjk(zh) or zh != ob.text:
-                translated_boxes += 1
-            canvas = draw_text_in_box(canvas, ob.box, zh, font_path=font_path)
+        original = im.convert("RGB")
+
+        if mode == "overlay":
+            # Legacy path (disabled as default): paint Chinese over each box.
+            canvas = original
+            translated_boxes = 0
+            for ob in boxes:
+                zh = translate_en_to_zh(ob.text)
+                if not zh:
+                    continue
+                if contains_cjk(zh) or zh != ob.text:
+                    translated_boxes += 1
+                canvas = draw_text_in_box(canvas, ob.box, zh, font_path=font_path)
+            logger.info(
+                "Overlay mode: %d/%d boxes changed; %s",
+                translated_boxes,
+                len(boxes),
+                mt_status(),
+            )
+        else:
+            # Default: reading-order OCR → MT each fragment → caption under image.
+            english_parts = collect_english_in_reading_order(boxes)
+            zh_parts: List[str] = []
+            for en in english_parts:
+                zh = translate_en_to_zh(en)
+                if zh:
+                    zh_parts.append(zh)
+            caption = join_chinese_caption_lines(zh_parts)
+            canvas = append_caption_band(
+                original, caption, font_path=font_path
+            )
+            logger.info(
+                "Caption mode: %d OCR line(s) → %d zh line(s); "
+                "out size %sx%s (src %sx%s); %s",
+                len(english_parts),
+                len(zh_parts),
+                canvas.size[0],
+                canvas.size[1],
+                original.size[0],
+                original.size[1],
+                mt_status(),
+            )
 
         out.parent.mkdir(parents=True, exist_ok=True)
-        logger.info(
-            "Saved %s (%d/%d boxes changed from source text); %s",
-            out,
-            translated_boxes,
-            len(boxes),
-            mt_status(),
-        )
         suf = out.suffix.lower()
-        save_kw = {}
+        save_kw: dict = {}
         fmt = None
         if suf in (".jpg", ".jpeg"):
             fmt = "JPEG"

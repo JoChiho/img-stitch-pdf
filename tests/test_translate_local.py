@@ -139,13 +139,17 @@ def test_translate_image_paths_skips_already_translated(tmp_path: Path):
 
 def test_translate_image_file_writes_under_subdir(tmp_path: Path):
     src = tmp_path / "hello.jpg"
-    Image.new("RGB", (100, 40), (200, 200, 200)).save(src, format="JPEG")
+    # Distinct top-left color so we can prove original pixels stay intact
+    img = Image.new("RGB", (100, 40), (200, 200, 200))
+    img.putpixel((0, 0), (11, 22, 33))
+    img.save(src, format="JPEG")
 
     boxes = [tl.OcrBox(text="Hello", box=(5, 5, 90, 30), confidence=0.9)]
+    zh = "\u4f60\u597d"  # nihao
 
     with patch.object(tl, "ocr_image", return_value=boxes), patch.object(
-        tl, "translate_en_to_zh", return_value="你好"
-    ), patch.object(tl, "_get_translator", return_value=(lambda t: "你好", "mock")):
+        tl, "translate_en_to_zh", return_value=zh
+    ), patch.object(tl, "_get_translator", return_value=(lambda t: zh, "mock")):
         out = tl.translate_image_file(src)
 
     expected = tmp_path / "translated_zh" / "hello_zh.jpg"
@@ -156,6 +160,22 @@ def test_translate_image_file_writes_under_subdir(tmp_path: Path):
     assert src.read_bytes() != out.read_bytes()
     # Must NOT create sibling in the same folder
     assert not (tmp_path / "hello_zh.jpg").exists()
+
+    # Caption band: taller than source; top region keeps original content
+    with Image.open(src) as src_im, Image.open(out) as out_im:
+        src_im = src_im.convert("RGB")
+        out_im = out_im.convert("RGB")
+        assert out_im.size[0] == 100
+        assert out_im.size[1] > src_im.size[1]
+        # Original image region pasted at (0,0) — sample a few pixels vs source
+        for xy in [(1, 1), (50, 20), (90, 35)]:
+            a = src_im.getpixel(xy)
+            b = out_im.getpixel(xy)
+            assert all(abs(a[i] - b[i]) <= 8 for i in range(3)), (xy, a, b)
+        # Band below original should be light (caption background)
+        band_y = src_im.size[1] + 5
+        br, bg, bb = out_im.getpixel((50, band_y))
+        assert br > 200 and bg > 200 and bb > 200
 
 
 def test_translate_text_mock_returns_chinese():
@@ -438,4 +458,84 @@ def test_get_translator_falls_back_to_argos_with_status():
     status = tl.mt_status()
     assert "argos" in status
 
+
+def test_sort_ocr_boxes_reading_order_rows():
+    boxes = [
+        tl.OcrBox("B", (80, 10, 120, 30), 0.9),
+        tl.OcrBox("A", (10, 12, 50, 28), 0.9),
+        tl.OcrBox("C", (10, 50, 90, 70), 0.9),
+    ]
+    ordered = tl.sort_ocr_boxes_reading_order(boxes, row_tol=10)
+    assert [b.text for b in ordered] == ["A", "B", "C"]
+
+
+def test_collect_english_and_join_caption():
+    boxes = [
+        tl.OcrBox("world", (10, 40, 80, 60), 0.9),
+        tl.OcrBox("Hello", (10, 5, 80, 25), 0.9),
+    ]
+    assert tl.collect_english_in_reading_order(boxes) == ["Hello", "world"]
+    assert tl.join_chinese_caption_lines(["\u4f60\u597d", "\u4e16\u754c"]) == "\u4f60\u597d\n\u4e16\u754c"
+
+
+def test_append_caption_band_taller_and_preserves_top():
+    img = Image.new("RGB", (160, 60), (40, 50, 60))
+    img.putpixel((2, 2), (1, 2, 3))
+    out = tl.append_caption_band(img, "\u4e00\u884c\u4e2d\u6587\u6807\u6ce8" * 3)
+    assert out.size[0] == 160
+    assert out.size[1] > 60
+    assert out.getpixel((2, 2)) == (1, 2, 3)
+    # Original bottom row unchanged at y=59
+    assert out.getpixel((80, 59)) == (40, 50, 60)
+    # Caption band is light
+    r, g, b = out.getpixel((80, 70))
+    assert r > 200 and g > 200 and b > 200
+
+
+def test_append_caption_band_empty_returns_same_size():
+    img = Image.new("RGB", (50, 30), (9, 9, 9))
+    out = tl.append_caption_band(img, "   ")
+    assert out.size == img.size
+    assert out.getpixel((0, 0)) == (9, 9, 9)
+
+
+def test_translate_image_file_default_is_caption_not_overlay(tmp_path: Path):
+    src = tmp_path / "panel.png"
+    Image.new("RGB", (120, 50), (90, 90, 90)).save(src)
+    boxes = [
+        tl.OcrBox("One", (5, 5, 50, 20), 0.95),
+        tl.OcrBox("Two", (5, 25, 50, 40), 0.95),
+    ]
+    calls = []
+
+    def fake_tr(t):
+        calls.append(t)
+        return {"One": "\u4e00", "Two": "\u4e8c"}.get(t, t)
+
+    with patch.object(tl, "ocr_image", return_value=boxes), patch.object(
+        tl, "translate_en_to_zh", side_effect=fake_tr
+    ), patch.object(tl, "_get_translator", return_value=(fake_tr, "mock")), patch.object(
+        tl, "draw_text_in_box", side_effect=AssertionError("overlay must not run by default")
+    ):
+        out = tl.translate_image_file(src)
+
+    assert calls == ["One", "Two"]
+    with Image.open(out) as im:
+        assert im.size[1] > 50
+        # Top-left of original region still gray (not whitened by overlay)
+        assert im.getpixel((2, 2)) == (90, 90, 90)
+
+
+def test_translate_image_file_overlay_mode_still_available(tmp_path: Path):
+    src = tmp_path / "old.jpg"
+    Image.new("RGB", (100, 40), (10, 20, 30)).save(src, format="JPEG")
+    boxes = [tl.OcrBox("Hi", (5, 5, 90, 30), 0.9)]
+    zh = "\u4f60\u597d"
+    with patch.object(tl, "ocr_image", return_value=boxes), patch.object(
+        tl, "translate_en_to_zh", return_value=zh
+    ), patch.object(tl, "_get_translator", return_value=(lambda t: zh, "mock")):
+        out = tl.translate_image_file(src, render_mode="overlay")
+    with Image.open(out) as im:
+        # Overlay keeps same dimensions
+        assert im.size == (100, 40)
 

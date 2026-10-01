@@ -612,7 +612,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             hint,
             text="生成多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
             "PDF 文件贡献其全部页并直接合并（不重新栅格化）。可混合图片与 PDF。"
-            "勾选或点「本地翻译后导出」：对图片做本地 EN→ZH（写入 translated_zh/ 子文件夹，不覆盖原图），"
+            "勾选或点「本地翻译后导出」：对图片做本地 EN→ZH（原图保留，下方追加中文译文条带），写入 translated_zh/ 子文件夹（不覆盖原图）。"
             "跳过 PDF/GIF，再导出多页 PDF。首次需下载 OCR/翻译模型。",
             wraplength=760,
             justify=tk.LEFT,
