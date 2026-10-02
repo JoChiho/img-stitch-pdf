@@ -692,6 +692,65 @@ def set_include_subfolders_config(value: bool) -> bool:
     return flag
 
 
+DEFAULT_OCR_DOWNSCALE_ENABLED = False
+DEFAULT_OCR_DOWNSCALE_MAX_LONG_SIDE = 1600
+
+
+def get_ocr_downscale_enabled_config() -> bool:
+    """Return persisted ``ocr_downscale`` (default False = off)."""
+    raw = load_config().get("ocr_downscale")
+    if raw is None:
+        return DEFAULT_OCR_DOWNSCALE_ENABLED
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(raw)
+
+
+def get_ocr_downscale_max_long_side_config() -> int:
+    """Return persisted ``ocr_downscale_max_long_side`` (default 1600)."""
+    raw = load_config().get("ocr_downscale_max_long_side")
+    if raw is None or raw == "":
+        return DEFAULT_OCR_DOWNSCALE_MAX_LONG_SIDE
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_OCR_DOWNSCALE_MAX_LONG_SIDE
+
+
+def set_ocr_downscale_config(enabled: bool, max_long_side=None):
+    """Persist OCR downscale settings and apply to translate_local if loaded."""
+    flag = bool(enabled)
+    if max_long_side is None:
+        side = get_ocr_downscale_max_long_side_config()
+    else:
+        try:
+            side = max(1, int(max_long_side))
+        except (TypeError, ValueError):
+            side = DEFAULT_OCR_DOWNSCALE_MAX_LONG_SIDE
+    data = load_config()
+    data["ocr_downscale"] = flag
+    data["ocr_downscale_max_long_side"] = side
+    save_config(data)
+    if translate_local is not None and hasattr(translate_local, "set_ocr_downscale"):
+        translate_local.set_ocr_downscale(flag, side)
+    return flag, side
+
+
+def apply_ocr_downscale_to_runtime(enabled=None, max_long_side=None):
+    """Resolve choice from args/config and push into config + translate_local."""
+    flag = (
+        get_ocr_downscale_enabled_config()
+        if enabled is None
+        else bool(enabled)
+    )
+    side = (
+        get_ocr_downscale_max_long_side_config()
+        if max_long_side is None
+        else max_long_side
+    )
+    return set_ocr_downscale_config(flag, side)
+
+
 class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     """桌面 GUI：分区操作、列表/缩略图视图、多页 PDF 导出与本地翻译。"""
 
@@ -723,6 +782,9 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._ollama_model_combo: Optional[ttk.Combobox] = None
         self.ocr_engine_var: Optional[tk.StringVar] = None
         self._ocr_engine_combo: Optional[ttk.Combobox] = None
+        self.ocr_downscale_var: Optional[tk.BooleanVar] = None
+        self.ocr_downscale_max_var: Optional[tk.StringVar] = None
+        self._ocr_downscale_entry: Optional[ttk.Entry] = None
 
         self.view_mode_var: Optional[tk.StringVar] = None
         self._selected: Set[int] = set()
@@ -760,6 +822,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.after(150, self._refresh_ollama_model_combo_async)
         self.after(200, self._poll_ui_queue)
         apply_ocr_engine_to_runtime(resolve_ocr_engine_choice())
+        apply_ocr_downscale_to_runtime()
         self._update_count_label()
         self._set_status(
             "请添加图片、PDF 或文件夹。添加后可切换「列表 / 缩略图」视图；"
@@ -1063,12 +1126,14 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         # --- 翻译 ---
         tr_outer, tr_fr = self._make_section(root, "翻译")
         tr_outer.pack(fill=tk.X, **pad)
-        ttk.Label(tr_fr, text="Ollama 模型：", style="Card.TLabel").pack(
+        tr_row1 = ttk.Frame(tr_fr, style="Card.TFrame")
+        tr_row1.pack(fill=tk.X)
+        ttk.Label(tr_row1, text="Ollama 模型：", style="Card.TLabel").pack(
             side=tk.LEFT, padx=(0, 0), pady=2
         )
         self.ollama_model_var = tk.StringVar(value=resolve_ollama_model_choice())
         self._ollama_model_combo = ttk.Combobox(
-            tr_fr,
+            tr_row1,
             textvariable=self.ollama_model_var,
             width=28,
             state="readonly",
@@ -1078,14 +1143,14 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             "<<ComboboxSelected>>", self._on_ollama_model_selected
         )
         ttk.Button(
-            tr_fr, text="刷新模型列表", command=self._refresh_ollama_model_combo_async
+            tr_row1, text="刷新模型列表", command=self._refresh_ollama_model_combo_async
         ).pack(side=tk.LEFT, padx=2, pady=2)
-        ttk.Label(tr_fr, text="OCR：", style="Card.TLabel").pack(
+        ttk.Label(tr_row1, text="OCR：", style="Card.TLabel").pack(
             side=tk.LEFT, padx=(12, 0), pady=2
         )
         self.ocr_engine_var = tk.StringVar(value=resolve_ocr_engine_choice())
         self._ocr_engine_combo = ttk.Combobox(
-            tr_fr,
+            tr_row1,
             textvariable=self.ocr_engine_var,
             values=["paddle", "easyocr"],
             width=10,
@@ -1096,10 +1161,44 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             "<<ComboboxSelected>>", self._on_ocr_engine_selected
         )
         ttk.Label(
-            tr_fr,
+            tr_row1,
             text="（默认 paddle，失败回退 easyocr）",
             style="Muted.TLabel",
         ).pack(side=tk.LEFT, padx=6, pady=2)
+
+        tr_row2 = ttk.Frame(tr_fr, style="Card.TFrame")
+        tr_row2.pack(fill=tk.X, pady=(4, 0))
+        self.ocr_downscale_var = tk.BooleanVar(
+            value=get_ocr_downscale_enabled_config()
+        )
+        ttk.Checkbutton(
+            tr_row2,
+            text="OCR降采样",
+            variable=self.ocr_downscale_var,
+            command=self._on_ocr_downscale_toggle,
+        ).pack(side=tk.LEFT, padx=(0, 4), pady=2)
+        ttk.Label(tr_row2, text="最长边：", style="Card.TLabel").pack(
+            side=tk.LEFT, padx=(8, 0), pady=2
+        )
+        self.ocr_downscale_max_var = tk.StringVar(
+            value=str(get_ocr_downscale_max_long_side_config())
+        )
+        self._ocr_downscale_entry = ttk.Entry(
+            tr_row2, width=7, textvariable=self.ocr_downscale_max_var
+        )
+        self._ocr_downscale_entry.pack(side=tk.LEFT, padx=(0, 4), pady=2)
+        self._ocr_downscale_entry.bind(
+            "<FocusOut>", self._on_ocr_downscale_max_commit
+        )
+        self._ocr_downscale_entry.bind(
+            "<Return>", self._on_ocr_downscale_max_commit
+        )
+        ttk.Label(
+            tr_row2,
+            text="（默认关；开启后 OCR 前缩小到最长边，默认 1600）",
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, padx=6, pady=2)
+        self._sync_ocr_downscale_entry_state()
 
         # --- 导出 ---
         export_outer, export_fr = self._make_section(root, "导出", export=True)
@@ -1933,7 +2032,51 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._set_status(f"已选择 OCR 引擎：{name}（已写入配置）")
 
 
+    def _sync_ocr_downscale_entry_state(self) -> None:
+        """Enable max-long-side entry only when downscale checkbox is on."""
+        if self._ocr_downscale_entry is None or self.ocr_downscale_var is None:
+            return
+        state = tk.NORMAL if bool(self.ocr_downscale_var.get()) else tk.DISABLED
+        self._ocr_downscale_entry.configure(state=state)
+
+    def _on_ocr_downscale_toggle(self) -> None:
+        if self.ocr_downscale_var is None:
+            return
+        enabled = bool(self.ocr_downscale_var.get())
+        side = self._parse_ocr_downscale_max()
+        apply_ocr_downscale_to_runtime(enabled, side)
+        self._sync_ocr_downscale_entry_state()
+        if enabled:
+            self._set_status(
+                f"已开启 OCR 降采样（最长边 {side}，已写入配置）"
+            )
+        else:
+            self._set_status("已关闭 OCR 降采样（已写入配置）")
+
+    def _parse_ocr_downscale_max(self) -> int:
+        raw = ""
+        if self.ocr_downscale_max_var is not None:
+            raw = (self.ocr_downscale_max_var.get() or "").strip()
+        try:
+            side = max(1, int(raw))
+        except (TypeError, ValueError):
+            side = get_ocr_downscale_max_long_side_config()
+        if self.ocr_downscale_max_var is not None:
+            self.ocr_downscale_max_var.set(str(side))
+        return side
+
+    def _on_ocr_downscale_max_commit(self, _event=None) -> None:
+        enabled = (
+            bool(self.ocr_downscale_var.get())
+            if self.ocr_downscale_var is not None
+            else get_ocr_downscale_enabled_config()
+        )
+        side = self._parse_ocr_downscale_max()
+        apply_ocr_downscale_to_runtime(enabled, side)
+        self._set_status(f"OCR 降采样最长边已设为 {side}（已写入配置）")
+
     def export_ocr_english_txt(self) -> None:
+
         """OCR all listed images → one UTF-8 .txt with ===PAGE NNN=== keys."""
         if self._exporting:
             return
@@ -2002,6 +2145,14 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                     apply_ocr_engine_to_runtime(ocr_choice)
                 else:
                     apply_ocr_engine_to_runtime()
+                apply_ocr_downscale_to_runtime(
+                    bool(self.ocr_downscale_var.get())
+                    if self.ocr_downscale_var is not None
+                    else None,
+                    self._parse_ocr_downscale_max()
+                    if self.ocr_downscale_max_var is not None
+                    else None,
+                )
                 # OCR-only export: still use ensure_deps (keeps Ollama path intact
                 # for the separate「本地翻译后导出」button).
                 tl.ensure_deps(progress_callback=on_dep)
@@ -2289,6 +2440,14 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                     apply_ocr_engine_to_runtime(ocr_choice)
                 else:
                     apply_ocr_engine_to_runtime()
+                apply_ocr_downscale_to_runtime(
+                    bool(self.ocr_downscale_var.get())
+                    if self.ocr_downscale_var is not None
+                    else None,
+                    self._parse_ocr_downscale_max()
+                    if self.ocr_downscale_max_var is not None
+                    else None,
+                )
                 tl.ensure_deps(progress_callback=on_dep)
                 if self._cancelled():
                     raise tl.CancelledError("已取消")

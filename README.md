@@ -185,12 +185,15 @@ python translate_local.py path\to\image.jpg
   "output_dir": "C:\Users\你\Documents\PDF导出",
   "ollama_model": "qwen2.5:14b",
   "ocr_engine": "paddle",
-  "include_subfolders": true
+  "include_subfolders": true,
+  "ocr_downscale": false,
+  "ocr_downscale_max_long_side": 1600
 }
 ```
 
 其中 `ollama_model` 由 GUI 模型下拉框写入；未配置时若本机已安装则默认优先 `qwen2.5:14b`。
 `include_subfolders`（布尔，默认 `true`）控制「添加文件夹…」是否递归子目录，与界面勾选「包含子文件夹」同步。
+`ocr_downscale`（布尔，默认 `false`）与 `ocr_downscale_max_long_side`（整数，默认 `1600`）：GUI「OCR降采样」勾选写入；开启后 OCR 文本导出与本地翻译在调用 Paddle/EasyOCR 前将图片最长边缩小到该值（检测框坐标会映射回原图尺寸）。
 
 首次启动若尚未配置导出目录，会自动创建 `文档/PDF导出`（或 `~/Documents/PDF导出`）并写入该文件。
 

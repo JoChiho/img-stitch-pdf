@@ -12,9 +12,12 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
+
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,33 @@ OCR_ENGINES = ("paddle", "easyocr")
 DEFAULT_OCR_ENGINE = "paddle"
 _ocr_env = (os.environ.get("IMG_STITCH_OCR_ENGINE") or DEFAULT_OCR_ENGINE).strip().lower()
 OCR_ENGINE = _ocr_env if _ocr_env in OCR_ENGINES else DEFAULT_OCR_ENGINE
+
+DEFAULT_OCR_DOWNSCALE_ENABLED = False
+DEFAULT_OCR_DOWNSCALE_MAX_LONG_SIDE = 1600
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return max(1, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+OCR_DOWNSCALE_ENABLED = _env_flag(
+    "IMG_STITCH_OCR_DOWNSCALE", DEFAULT_OCR_DOWNSCALE_ENABLED
+)
+OCR_DOWNSCALE_MAX_LONG_SIDE = _env_int(
+    "IMG_STITCH_OCR_DOWNSCALE_MAX", DEFAULT_OCR_DOWNSCALE_MAX_LONG_SIDE
+)
 
 PADDLE_CPU_INDEX = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"
 PADDLEPADDLE_SPEC = "paddlepaddle"
@@ -60,6 +90,131 @@ def set_ocr_engine(engine: str) -> str:
     _last_ocr_engine_used = None
     logger.info("OCR engine set to %s", OCR_ENGINE)
     return OCR_ENGINE
+
+
+def get_ocr_downscale_enabled() -> bool:
+    return bool(OCR_DOWNSCALE_ENABLED)
+
+
+def get_ocr_downscale_max_long_side() -> int:
+    return int(OCR_DOWNSCALE_MAX_LONG_SIDE)
+
+
+def set_ocr_downscale_enabled(enabled: bool) -> bool:
+    global OCR_DOWNSCALE_ENABLED
+    OCR_DOWNSCALE_ENABLED = bool(enabled)
+    logger.info("OCR downscale enabled=%s", OCR_DOWNSCALE_ENABLED)
+    return OCR_DOWNSCALE_ENABLED
+
+
+def set_ocr_downscale_max_long_side(value: int) -> int:
+    global OCR_DOWNSCALE_MAX_LONG_SIDE
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = DEFAULT_OCR_DOWNSCALE_MAX_LONG_SIDE
+    OCR_DOWNSCALE_MAX_LONG_SIDE = max(1, n)
+    logger.info("OCR downscale max_long_side=%s", OCR_DOWNSCALE_MAX_LONG_SIDE)
+    return OCR_DOWNSCALE_MAX_LONG_SIDE
+
+
+def set_ocr_downscale(enabled: bool, max_long_side: Optional[int] = None) -> Tuple[bool, int]:
+    """Set both downscale flags; omit max_long_side to keep current value."""
+    set_ocr_downscale_enabled(enabled)
+    if max_long_side is not None:
+        set_ocr_downscale_max_long_side(max_long_side)
+    return get_ocr_downscale_enabled(), get_ocr_downscale_max_long_side()
+
+
+def prepare_image_for_ocr(
+    path: Path,
+    *,
+    enabled: Optional[bool] = None,
+    max_long_side: Optional[int] = None,
+) -> Tuple[Path, float, float, Optional[Path]]:
+    """Optionally downscale ``path`` for OCR.
+
+    Returns ``(ocr_path, scale_x, scale_y, temp_path)``.
+    Multiply OCR box coordinates by ``scale_x`` / ``scale_y`` to map back to
+    the original image. Caller must delete ``temp_path`` when not None.
+    """
+    path = Path(path)
+    use = OCR_DOWNSCALE_ENABLED if enabled is None else bool(enabled)
+    limit = (
+        OCR_DOWNSCALE_MAX_LONG_SIDE
+        if max_long_side is None
+        else max(1, int(max_long_side))
+    )
+    if not use:
+        return path, 1.0, 1.0, None
+    try:
+        with Image.open(path) as im:
+            im.load()
+            w, h = im.size
+            long_side = max(w, h)
+            if long_side <= limit:
+                return path, 1.0, 1.0, None
+            scale = limit / float(long_side)
+            nw = max(1, int(round(w * scale)))
+            nh = max(1, int(round(h * scale)))
+            rgb = im.convert("RGB")
+            resized = rgb.resize((nw, nh), Image.Resampling.LANCZOS)
+            fd, tmp_name = tempfile.mkstemp(prefix="ocr_ds_", suffix=".png")
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            resized.save(tmp_path, format="PNG")
+            sx = w / float(nw)
+            sy = h / float(nh)
+            logger.info(
+                "OCR downscale %s: %sx%s -> %sx%s (max_long=%s)",
+                path.name,
+                w,
+                h,
+                nw,
+                nh,
+                limit,
+            )
+            return tmp_path, sx, sy, tmp_path
+    except Exception as e:
+        logger.warning("OCR downscale skipped for %s: %s", path, e)
+        return path, 1.0, 1.0, None
+
+
+def _scale_ocr_boxes(boxes: list, scale_x: float, scale_y: float) -> list:
+    if scale_x == 1.0 and scale_y == 1.0:
+        return boxes
+    assert OcrBox is not None
+    out = []
+    for ob in boxes:
+        left, top, right, bottom = ob.box
+        out.append(
+            OcrBox(
+                text=ob.text,
+                box=(
+                    int(round(left * scale_x)),
+                    int(round(top * scale_y)),
+                    int(round(right * scale_x)),
+                    int(round(bottom * scale_y)),
+                ),
+                confidence=ob.confidence,
+            )
+        )
+    return out
+
+
+def _cleanup_temp(temp_path: Optional[Path]) -> None:
+    if temp_path is None:
+        return
+    try:
+        Path(temp_path).unlink(missing_ok=True)
+    except TypeError:
+        # Python <3.8 missing_ok
+        try:
+            Path(temp_path).unlink()
+        except OSError:
+            pass
+    except OSError:
+        pass
 
 
 def get_last_ocr_engine_used() -> Optional[str]:
@@ -436,29 +591,33 @@ def ocr_image(
         engine if engine is not None else OCR_ENGINE
     )
     path = Path(path)
-    if eng == "paddle":
-        try:
-            boxes = ocr_image_paddle(path, min_confidence=min_confidence)
-            _last_ocr_engine_used = "paddle"
-            return boxes
-        except Exception as e:
-            logger.warning(
-                "PaddleOCR failed (%s); falling back to EasyOCR", e
-            )
+    ocr_path, sx, sy, tmp = prepare_image_for_ocr(path)
+    try:
+        if eng == "paddle":
             try:
-                boxes = ocr_image_easyocr(
-                    path, min_confidence=min_confidence
+                boxes = ocr_image_paddle(ocr_path, min_confidence=min_confidence)
+                _last_ocr_engine_used = "paddle"
+                return _scale_ocr_boxes(boxes, sx, sy)
+            except Exception as e:
+                logger.warning(
+                    "PaddleOCR failed (%s); falling back to EasyOCR", e
                 )
-                _last_ocr_engine_used = "easyocr"
-                return boxes
-            except Exception as e2:
-                raise RuntimeError(
-                    "PaddleOCR failed and EasyOCR fallback also failed.\n"
-                    f"Paddle: {e}\nEasyOCR: {e2}"
-                ) from e2
-    boxes = ocr_image_easyocr(path, min_confidence=min_confidence)
-    _last_ocr_engine_used = "easyocr"
-    return boxes
+                try:
+                    boxes = ocr_image_easyocr(
+                        ocr_path, min_confidence=min_confidence
+                    )
+                    _last_ocr_engine_used = "easyocr"
+                    return _scale_ocr_boxes(boxes, sx, sy)
+                except Exception as e2:
+                    raise RuntimeError(
+                        "PaddleOCR failed and EasyOCR fallback also failed.\n"
+                        f"Paddle: {e}\nEasyOCR: {e2}"
+                    ) from e2
+        boxes = ocr_image_easyocr(ocr_path, min_confidence=min_confidence)
+        _last_ocr_engine_used = "easyocr"
+        return _scale_ocr_boxes(boxes, sx, sy)
+    finally:
+        _cleanup_temp(tmp)
 
 
 def preload_ocr(

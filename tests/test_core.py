@@ -348,3 +348,19 @@ def test_include_subfolders_config_roundtrip(tmp_path, monkeypatch):
     main.set_include_subfolders_config(True)
     assert main.get_include_subfolders_config() is True
 
+
+def test_ocr_downscale_config_roundtrip(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(main, "config_path", lambda: cfg)
+    monkeypatch.setattr(main, "config_dir", lambda: tmp_path)
+    assert main.get_ocr_downscale_enabled_config() is False
+    assert main.get_ocr_downscale_max_long_side_config() == 1600
+    main.set_ocr_downscale_config(True, 1200)
+    assert main.get_ocr_downscale_enabled_config() is True
+    assert main.get_ocr_downscale_max_long_side_config() == 1200
+    loaded = main.load_config()
+    assert loaded["ocr_downscale"] is True
+    assert loaded["ocr_downscale_max_long_side"] == 1200
+    main.set_ocr_downscale_config(False, 1600)
+    assert main.get_ocr_downscale_enabled_config() is False
+

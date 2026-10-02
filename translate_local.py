@@ -6,6 +6,8 @@ Offline-first translation for screenshot / comic panels:
   - OCR: PaddleOCR EN by default (lazy import; first run downloads models),
     with EasyOCR fallback if Paddle fails. Select via ``ocr_engine`` /
     ``IMG_STITCH_OCR_ENGINE`` (``paddle`` | ``easyocr``).
+    Optional OCR downscale (``ocr_downscale`` / max long-side) shrinks large
+    images before Paddle/EasyOCR; box coords are scaled back to original size.
   - MT: Ollama HTTP API (preferred, e.g. qwen2.5) with Argos en→zh fallback
   - Caption (default): after OCR reading-order, join ALL English into ONE
     paragraph (spaces), translate once via Ollama/Argos, then append that
@@ -777,6 +779,26 @@ def get_ocr_engine() -> str:
 
 def set_ocr_engine(engine: str) -> str:
     return _ocr_backend.set_ocr_engine(engine)
+
+
+def get_ocr_downscale_enabled() -> bool:
+    return _ocr_backend.get_ocr_downscale_enabled()
+
+
+def get_ocr_downscale_max_long_side() -> int:
+    return _ocr_backend.get_ocr_downscale_max_long_side()
+
+
+def set_ocr_downscale_enabled(enabled: bool) -> bool:
+    return _ocr_backend.set_ocr_downscale_enabled(enabled)
+
+
+def set_ocr_downscale_max_long_side(value: int) -> int:
+    return _ocr_backend.set_ocr_downscale_max_long_side(value)
+
+
+def set_ocr_downscale(enabled: bool, max_long_side=None):
+    return _ocr_backend.set_ocr_downscale(enabled, max_long_side)
 
 
 _easyocr_reader = None  # legacy; cache lives in ocr_backend

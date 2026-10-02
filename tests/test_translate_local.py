@@ -1042,3 +1042,50 @@ def test_export_and_translate_pipelines_reuse_ocr_reader(tmp_path, monkeypatch):
     assert ob.ocr_reader_cache_stats()["paddle_init_count"] == 1
     ob.reset_ocr_readers_for_tests()
 
+
+def test_ocr_downscale_prepare_and_scale(tmp_path):
+    from PIL import Image
+    import ocr_backend as ob
+
+    prev_en = ob.get_ocr_downscale_enabled()
+    prev_max = ob.get_ocr_downscale_max_long_side()
+    try:
+        src = tmp_path / "big.png"
+        Image.new("RGB", (3200, 1000), color=(255, 255, 255)).save(src)
+
+        ob.set_ocr_downscale(False, 1600)
+        p, sx, sy, tmp = ob.prepare_image_for_ocr(src)
+        assert p == src
+        assert sx == 1.0 and sy == 1.0 and tmp is None
+
+        ob.set_ocr_downscale(True, 1600)
+        p2, sx2, sy2, tmp2 = ob.prepare_image_for_ocr(src)
+        assert tmp2 is not None
+        assert p2 == tmp2
+        with Image.open(p2) as im:
+            assert max(im.size) == 1600
+            assert im.size == (1600, 500)
+        assert abs(sx2 - 2.0) < 1e-6
+        assert abs(sy2 - 2.0) < 1e-6
+
+        boxes = [tl.OcrBox("Hi", (10, 20, 30, 40), 0.9)]
+        scaled = ob._scale_ocr_boxes(boxes, sx2, sy2)
+        assert scaled[0].box == (20, 40, 60, 80)
+        ob._cleanup_temp(tmp2)
+        assert not Path(tmp2).exists()
+    finally:
+        ob.set_ocr_downscale(prev_en, prev_max)
+
+
+def test_ocr_downscale_get_set():
+    prev_en = tl.get_ocr_downscale_enabled()
+    prev_max = tl.get_ocr_downscale_max_long_side()
+    try:
+        assert tl.set_ocr_downscale(True, 800) == (True, 800)
+        assert tl.get_ocr_downscale_enabled() is True
+        assert tl.get_ocr_downscale_max_long_side() == 800
+        assert tl.set_ocr_downscale_enabled(False) is False
+        assert tl.set_ocr_downscale_max_long_side(1600) == 1600
+    finally:
+        tl.set_ocr_downscale(prev_en, prev_max)
+
