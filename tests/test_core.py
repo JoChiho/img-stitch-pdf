@@ -404,3 +404,36 @@ def test_resolve_dropped_paths_files_and_folders(tmp_path: Path):
     got_bytes = main.resolve_dropped_paths([str(img).encode("utf-8")], recurse=True)
     assert got_bytes == [img]
 
+
+def test_hook_win_dropfiles_smoke():
+    """Subclassing the Tk HWND must not crash; callback refs stay alive."""
+    import sys
+
+    if sys.platform != "win32" or main.tk is None:
+        return
+    root = main.tk.Tk()
+    root.withdraw()
+    seen = []
+
+    def on_files(files):
+        seen.append(list(files))
+
+    try:
+        ok = main.hook_win_dropfiles(root, on_files)
+        assert ok is True
+        assert getattr(root, "_win_drop_hook_refs", None)
+    finally:
+        root.destroy()
+
+
+def test_log_drop_exception_writes(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    try:
+        raise RuntimeError("drop-boom")
+    except RuntimeError:
+        main.log_drop_exception("unit_test")
+    log = tmp_path / "img-stitch-pdf" / "drop_errors.log"
+    assert log.is_file()
+    body = log.read_text(encoding="utf-8")
+    assert "drop-boom" in body
+    assert "unit_test" in body

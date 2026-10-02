@@ -57,10 +57,6 @@ except ImportError:
     PdfReader = None  # type: ignore
     PdfWriter = None  # type: ignore
 
-try:
-    import windnd  # Windows shell drag-and-drop onto Tk widgets
-except ImportError:
-    windnd = None  # type: ignore
 
 translate_local = None  # type: ignore  # lazy — avoid heavy imports on UI startup
 
@@ -202,6 +198,149 @@ def resolve_dropped_paths(
         except OSError:
             continue
     return out
+
+
+
+def drop_error_log_path() -> Path:
+    """Log file for drag-drop failures (pythonw has no console)."""
+    base = os.environ.get("APPDATA") or os.environ.get("TEMP") or str(Path.cwd())
+    return Path(base) / "img-stitch-pdf" / "drop_errors.log"
+
+
+def log_drop_exception(where: str) -> None:
+    """Append traceback for a drop-handler failure."""
+    try:
+        path = drop_error_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} [{where}] ---\n")
+            fh.write(traceback.format_exc())
+    except Exception:
+        pass
+
+
+def hook_win_dropfiles(tk_widget, on_files: Callable) -> bool:
+    """Enable WM_DROPFILES on a Tk widget with a crash-safe Unicode WndProc.
+
+    The ``windnd`` package uses ``SetWindowLongPtrA`` on 64-bit Python against
+    Tk's Unicode HWNDs (undefined, often process crash / 闪退 on drop) and
+    passes ``ctypes.sizeof`` (bytes) as ``DragQueryFileW``'s character count.
+    This helper uses the ``*W`` APIs, correct buffer sizes, never raises out of
+    the WndProc, and keeps ctypes callback refs alive on the widget.
+    """
+    if sys.platform != "win32" or tk_widget is None:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return False
+
+    try:
+        hwnd = int(tk_widget.winfo_id())
+    except Exception:
+        return False
+    if not hwnd:
+        return False
+
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+    is64 = ctypes.sizeof(ctypes.c_void_p) == 8
+
+    if is64:
+        GetWindowLongPtr = user32.GetWindowLongPtrW
+        SetWindowLongPtr = user32.SetWindowLongPtrW
+    else:
+        GetWindowLongPtr = user32.GetWindowLongW
+        SetWindowLongPtr = user32.SetWindowLongW
+
+    GetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int]
+    GetWindowLongPtr.restype = ctypes.c_void_p
+    SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+    SetWindowLongPtr.restype = ctypes.c_void_p
+    user32.CallWindowProcW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.CallWindowProcW.restype = ctypes.c_ssize_t
+    shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+    shell32.DragQueryFileW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.UINT,
+        wintypes.LPWSTR,
+        wintypes.UINT,
+    ]
+    shell32.DragQueryFileW.restype = wintypes.UINT
+    shell32.DragFinish.argtypes = [wintypes.HANDLE]
+
+    GWL_WNDPROC = -4
+    WM_DROPFILES = 0x0233
+    WNDPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
+
+    old_proc = GetWindowLongPtr(hwnd, GWL_WNDPROC)
+    if not old_proc:
+        return False
+
+    def _query_paths(hdrop) -> list:
+        count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+        out = []
+        for i in range(int(count)):
+            # First call with NULL returns required character count (without NUL).
+            nchars = shell32.DragQueryFileW(hdrop, i, None, 0)
+            buf = ctypes.create_unicode_buffer(int(nchars) + 1)
+            shell32.DragQueryFileW(hdrop, i, buf, int(nchars) + 1)
+            if buf.value:
+                out.append(buf.value)
+        return out
+
+    @WNDPROC
+    def wndproc(hwnd_, msg, wparam, lparam):
+        if msg == WM_DROPFILES:
+            try:
+                paths = _query_paths(wparam)
+                try:
+                    on_files(paths)
+                except Exception:
+                    log_drop_exception("drop_callback")
+            except Exception:
+                log_drop_exception("DragQueryFileW")
+            try:
+                shell32.DragFinish(wparam)
+            except Exception:
+                log_drop_exception("DragFinish")
+            return 0
+        try:
+            return int(
+                user32.CallWindowProcW(old_proc, hwnd_, msg, wparam, lparam) or 0
+            )
+        except Exception:
+            log_drop_exception("CallWindowProcW")
+            return 0
+
+    # Prevent GC of the callback while the HWND is subclassed.
+    refs = getattr(tk_widget, "_win_drop_hook_refs", None)
+    if refs is None:
+        refs = []
+        try:
+            tk_widget._win_drop_hook_refs = refs  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    refs.append((wndproc, old_proc, hwnd))
+
+    shell32.DragAcceptFiles(wintypes.HWND(hwnd), True)
+    new_ptr = ctypes.cast(wndproc, ctypes.c_void_p).value
+    SetWindowLongPtr(hwnd, GWL_WNDPROC, new_ptr)
+    return True
+
 
 
 def move_items_to_index(
@@ -1734,11 +1873,27 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
 
 
     def _setup_file_drop(self) -> None:
-        """Enable Windows shell drag-and-drop onto the file list (windnd)."""
-        if windnd is None or sys.platform != "win32":
+        """Enable Windows shell drag-and-drop onto the file list / window.
+
+        Hooks the top-level HWND and child HWNDs that cover the drop surface
+        (Listbox / Canvas create their own windows on Win32). Uses
+        ``hook_win_dropfiles`` (Unicode ``*W`` APIs) instead of ``windnd``,
+        which crashes on 64-bit Tk via SetWindowLongPtrA / bad buffer sizes.
+        """
+        if sys.platform != "win32":
             return
+
+        def _callback(files):
+            # WndProc context: only schedule work on the Tk event loop.
+            try:
+                payload = list(files) if files else []
+                self.after(0, lambda f=payload: self._safe_add_dropped_paths(f))
+            except Exception:
+                log_drop_exception("schedule_add_dropped_paths")
+
         targets = []
         for w in (
+            self,
             getattr(self, "_view_container", None),
             getattr(self, "_list_frame", None),
             self.listbox,
@@ -1746,21 +1901,40 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             getattr(self, "_thumb_outer", None),
             getattr(self, "_thumb_inner", None),
         ):
-            if w is not None:
+            if w is not None and w not in targets:
                 targets.append(w)
-        if not targets:
-            return
 
-        def _callback(files):
-            # windnd may call from the Win32 wndproc; marshal onto Tk.
-            self.after(0, lambda f=list(files): self.add_dropped_paths(f))
-
+        hooked = 0
         for w in targets:
             try:
-                windnd.hook_dropfiles(w, func=_callback, force_unicode=True)
+                if hook_win_dropfiles(w, _callback):
+                    hooked += 1
             except Exception:
-                # Non-fatal: other targets / dialogs still work.
-                traceback.print_exc()
+                log_drop_exception("_setup_file_drop_target")
+        if hooked == 0:
+            try:
+                path = drop_error_log_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"[hook_win_dropfiles: no targets hooked] ---\n"
+                    )
+            except Exception:
+                pass
+
+    def _safe_add_dropped_paths(self, dropped) -> None:
+        """Tk-thread wrapper: never let drop handling kill the process."""
+        try:
+            self.add_dropped_paths(dropped)
+        except Exception:
+            log_drop_exception("add_dropped_paths")
+            try:
+                self._set_status(
+                    "拖放处理失败，详见 %APPDATA%/img-stitch-pdf/drop_errors.log"
+                )
+            except Exception:
+                pass
 
     def add_dropped_paths(self, dropped) -> None:
         """Add image/PDF files and folder contents from a Windows file drop."""
