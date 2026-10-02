@@ -57,6 +57,11 @@ except ImportError:
     PdfReader = None  # type: ignore
     PdfWriter = None  # type: ignore
 
+try:
+    import windnd  # Windows shell drag-and-drop onto Tk widgets
+except ImportError:
+    windnd = None  # type: ignore
+
 translate_local = None  # type: ignore  # lazy — avoid heavy imports on UI startup
 
 
@@ -140,6 +145,63 @@ def list_images_in_folder(
         found.append(p)
     found.sort(key=lambda p: natural_key(p.relative_to(folder).as_posix()))
     return found
+
+
+
+def decode_drop_path(raw) -> str:
+    """Normalize a Windows drop path (bytes or str) to a filesystem str."""
+    if isinstance(raw, bytes):
+        for enc in ("utf-8", "mbcs", "gbk", "cp936"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
+
+def resolve_dropped_paths(
+    dropped,
+    *,
+    recurse: bool = True,
+) -> List[Path]:
+    """Turn Windows drop items into image/PDF paths for the file list.
+
+    - Files: keep only MEDIA_EXTS (images + PDF; gif skipped like folder scan).
+    - Directories: scan with ``list_images_in_folder(..., recurse=recurse)``
+      so the GUI ``include_subfolders`` checkbox is honored.
+    - Order: preserve drop order; within each folder, natural relative sort.
+    - Deduplicate while preserving first occurrence.
+    """
+    out: List[Path] = []
+    seen: Set[Path] = set()
+
+    def _add(p: Path) -> None:
+        try:
+            key = p.resolve()
+        except OSError:
+            key = p
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    for raw in dropped or ():
+        try:
+            path = Path(decode_drop_path(raw))
+        except (TypeError, ValueError, OSError):
+            continue
+        try:
+            if path.is_dir():
+                for item in list_images_in_folder(path, recurse=recurse):
+                    _add(item)
+            elif path.is_file():
+                suf = path.suffix.lower()
+                if suf in MEDIA_EXTS:
+                    _add(path)
+        except OSError:
+            continue
+    return out
 
 
 def move_items_to_index(
@@ -825,7 +887,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         apply_ocr_downscale_to_runtime()
         self._update_count_label()
         self._set_status(
-            "请添加图片、PDF 或文件夹。添加后可切换「列表 / 缩略图」视图；"
+            "请添加图片、PDF 或文件夹，也可拖放到文件列表。添加后可切换「列表 / 缩略图」视图；"
             "用「移到第…位」或双击调整顺序。"
             f" 默认导出目录：{self.output_dir}"
         )
@@ -1045,6 +1107,11 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         # --- 内容区（列表 / 缩略图）---
         list_outer, list_body = self._make_section(root, "文件列表")
         list_outer.pack(fill=tk.BOTH, expand=True, **pad)
+        ttk.Label(
+            list_body,
+            text="可将图片 / PDF / 文件夹拖放到下方列表（子文件夹随「包含子文件夹」）",
+            style="Muted.TLabel",
+        ).pack(fill=tk.X, pady=(0, 4))
         self._view_container = ttk.Frame(list_body, style="Card.TFrame")
         self._view_container.pack(fill=tk.BOTH, expand=True)
 
@@ -1101,6 +1168,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._thumb_inner.bind("<Leave>", self._unbind_thumb_wheel)
 
         self._show_list_view()
+
+        self._setup_file_drop()
 
         # --- 设定 ---
         settings_outer, settings_fr = self._make_section(root, "设定")
@@ -1663,7 +1732,90 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         else:
             self.source_folder = None
 
+
+    def _setup_file_drop(self) -> None:
+        """Enable Windows shell drag-and-drop onto the file list (windnd)."""
+        if windnd is None or sys.platform != "win32":
+            return
+        targets = []
+        for w in (
+            getattr(self, "_view_container", None),
+            getattr(self, "_list_frame", None),
+            self.listbox,
+            getattr(self, "_thumb_canvas", None),
+            getattr(self, "_thumb_outer", None),
+            getattr(self, "_thumb_inner", None),
+        ):
+            if w is not None:
+                targets.append(w)
+        if not targets:
+            return
+
+        def _callback(files):
+            # windnd may call from the Win32 wndproc; marshal onto Tk.
+            self.after(0, lambda f=list(files): self.add_dropped_paths(f))
+
+        for w in targets:
+            try:
+                windnd.hook_dropfiles(w, func=_callback, force_unicode=True)
+            except Exception:
+                # Non-fatal: other targets / dialogs still work.
+                traceback.print_exc()
+
+    def add_dropped_paths(self, dropped) -> None:
+        """Add image/PDF files and folder contents from a Windows file drop."""
+        if self._exporting:
+            return
+        recurse = True
+        if self.include_subfolders_var is not None:
+            recurse = bool(self.include_subfolders_var.get())
+            set_include_subfolders_config(recurse)
+        items = resolve_dropped_paths(dropped, recurse=recurse)
+        if not items:
+            scope = "含所有子目录" if recurse else "仅顶层"
+            self._set_status(
+                f"拖放未加入任何图片或 PDF（文件夹按「包含子文件夹」={scope} 扫描）。"
+            )
+            return
+        added = 0
+        for path in items:
+            if path not in self.paths:
+                self.paths.append(path)
+                added += 1
+        # If every drop root that was a folder is a common ancestor, prefer it.
+        folder_roots: List[Path] = []
+        for raw in dropped or ():
+            try:
+                p = Path(decode_drop_path(raw))
+                if p.is_dir():
+                    folder_roots.append(p.resolve())
+            except OSError:
+                continue
+        if len(folder_roots) == 1:
+            root = folder_roots[0]
+
+            def _under_root(p: Path) -> bool:
+                try:
+                    p.resolve().relative_to(root)
+                    return True
+                except ValueError:
+                    return False
+
+            if self.paths and all(_under_root(p) for p in self.paths):
+                self.source_folder = root
+            else:
+                self._update_source_folder_from_paths()
+        else:
+            self._update_source_folder_from_paths()
+        self._refresh_view()
+        scope = "含所有子目录" if recurse else "仅顶层"
+        self._set_status(
+            f"拖放添加了 {added} 项（图片+PDF；文件夹扫描：{scope}），"
+            f"当前共 {len(self.paths)} 项。"
+        )
+
     def add_images(self) -> None:
+
         if self._exporting:
             return
         files = filedialog.askopenfilenames(

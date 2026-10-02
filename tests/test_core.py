@@ -364,3 +364,43 @@ def test_ocr_downscale_config_roundtrip(tmp_path, monkeypatch):
     main.set_ocr_downscale_config(False, 1600)
     assert main.get_ocr_downscale_enabled_config() is False
 
+def test_decode_drop_path_bytes_and_str():
+    assert main.decode_drop_path("C:/a.png") == "C:/a.png"
+    assert main.decode_drop_path(b"C:/b.jpg") == "C:/b.jpg"
+
+
+def test_resolve_dropped_paths_files_and_folders(tmp_path: Path):
+    img = tmp_path / "a.png"
+    img.write_bytes(b"x")
+    pdf = tmp_path / "b.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    skip = tmp_path / "note.txt"
+    skip.write_bytes(b"x")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    (folder / "c.jpg").write_bytes(b"x")
+    sub = folder / "sub"
+    sub.mkdir()
+    (sub / "d.webp").write_bytes(b"x")
+    (sub / "e.gif").write_bytes(b"x")  # skipped by default
+
+    # Direct files + ignore non-media
+    got = main.resolve_dropped_paths([img, pdf, skip], recurse=True)
+    assert [p.name for p in got] == ["a.png", "b.pdf"]
+
+    # Folder recurse honors include_subfolders=True
+    got_rec = main.resolve_dropped_paths([folder], recurse=True)
+    assert [p.relative_to(folder).as_posix() for p in got_rec] == ["c.jpg", "sub/d.webp"]
+
+    # Folder top-only
+    got_top = main.resolve_dropped_paths([folder], recurse=False)
+    assert [p.name for p in got_top] == ["c.jpg"]
+
+    # Mixed drop order preserved; dedupe
+    got_mix = main.resolve_dropped_paths([img, folder, img], recurse=False)
+    assert [p.name for p in got_mix] == ["a.png", "c.jpg"]
+
+    # bytes paths (windnd default without force_unicode)
+    got_bytes = main.resolve_dropped_paths([str(img).encode("utf-8")], recurse=True)
+    assert got_bytes == [img]
+

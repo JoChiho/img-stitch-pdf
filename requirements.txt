@@ -3,6 +3,8 @@
 pillow>=10.0.0
 img2pdf>=0.5.0
 pypdf>=4.0.0
+# Windows shell drag-and-drop onto the file list
+windnd>=1.0.7
 # Optional local EN→ZH pipeline (first run downloads OCR models; see README)
 paddlepaddle
 paddleocr>=2.7.0
