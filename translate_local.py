@@ -25,6 +25,9 @@ import logging
 import os
 import subprocess
 import sys
+import socket
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -36,6 +39,15 @@ from PIL import Image, ImageDraw, ImageFont
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int, str], None]  # (current, total, message)
+
+CancelCheck = Callable[[], bool]
+
+class CancelledError(RuntimeError):
+    """Raised when the user cancels OCR/translate/PDF work."""
+
+    def __init__(self, message: str = "已取消") -> None:
+        super().__init__(message)
+
 
 # ---------------------------------------------------------------------------
 # Naming / path helpers (no heavy deps)
@@ -1113,14 +1125,18 @@ def translate_via_ollama(
     model: Optional[str] = None,
     host: Optional[str] = None,
     timeout: Optional[float] = None,
+    cancel_check: Optional[CancelCheck] = None,
 ) -> str:
-    """Translate English → Simplified Chinese via Ollama ``/api/generate``.
+    """Translate English to Simplified Chinese via Ollama ``/api/generate``.
 
-    Prompt asks for translation only (no explanation). Raises on HTTP / empty errors.
+    Prompt asks for translation only (no explanation). Raises on HTTP / empty /
+    timeout errors. ``cancel_check`` is polled while waiting so the UI can abort.
     """
     model = (model or OLLAMA_MODEL).strip()
     host = (host or OLLAMA_HOST).rstrip("/")
     timeout = float(timeout if timeout is not None else OLLAMA_TIMEOUT_SEC)
+    if cancel_check and cancel_check():
+        raise CancelledError("已取消 Ollama 翻译")
     prompt = (
         "Translate the following English text to Simplified Chinese. "
         "Output only the translation, with no explanation or quotes.\n\n"
@@ -1139,18 +1155,65 @@ def translate_via_ollama(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:300] if e.fp else ""
-        raise RuntimeError(f"Ollama HTTP {e.code}: {detail or e.reason}") from e
-    except Exception as e:
-        raise RuntimeError(f"Ollama request failed: {e}") from e
 
+    def _timeout_error(exc: BaseException) -> RuntimeError:
+        return RuntimeError(
+            f"Ollama HTTP 超时（{timeout:.0f}s）：模型 {model} @ {host} 未在限时内返回。"
+            f"较大模型（如 qwen2.5:32b）推理较慢时可设置环境变量 "
+            f"IMG_STITCH_OLLAMA_TIMEOUT（秒）增大超时，或改用更小模型。"
+            f" 原始错误: {exc}"
+        )
+
+    result: dict = {"raw": None, "err": None}
+
+    def _do_request() -> None:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result["raw"] = resp.read().decode("utf-8", errors="replace")
+        except BaseException as e:  # noqa: BLE001 — marshal to caller thread
+            result["err"] = e
+
+    t = threading.Thread(target=_do_request, name="ollama-http", daemon=True)
+    t.start()
+    while t.is_alive():
+        if cancel_check and cancel_check():
+            raise CancelledError("已取消 Ollama 翻译")
+        t.join(0.25)
+    err = result["err"]
+    if err is not None:
+        if isinstance(err, urllib.error.HTTPError):
+            detail = ""
+            try:
+                detail = (
+                    err.read().decode("utf-8", errors="replace")[:300]
+                    if err.fp
+                    else ""
+                )
+            except Exception:
+                detail = ""
+            raise RuntimeError(
+                f"Ollama HTTP {err.code}: {detail or err.reason}"
+            ) from err
+        if isinstance(err, TimeoutError) or isinstance(err, socket.timeout):
+            raise _timeout_error(err) from err
+        if isinstance(err, urllib.error.URLError):
+            reason = getattr(err, "reason", err)
+            reason_s = str(reason).lower()
+            if (
+                isinstance(reason, (TimeoutError, socket.timeout))
+                or "timed out" in reason_s
+                or "timeout" in reason_s
+            ):
+                raise _timeout_error(err) from err
+            raise RuntimeError(f"Ollama 无法连接 ({host}): {reason}") from err
+        err_s = str(err).lower()
+        if "timed out" in err_s or "timeout" in err_s:
+            raise _timeout_error(err) from err
+        raise RuntimeError(f"Ollama request failed: {err}") from err
+
+    raw = result["raw"] or ""
     data = json.loads(raw)
     out = (data.get("response") or "").strip()
-    # Strip common wrappers models sometimes add
     if out.startswith("```") and out.endswith("```"):
         out = out.strip("`").strip()
     if (out.startswith('"') and out.endswith('"')) or (
@@ -1160,6 +1223,7 @@ def translate_via_ollama(
     if not out:
         raise RuntimeError("Ollama returned empty translation")
     return out
+
 
 
 def ensure_ollama(
@@ -1308,11 +1372,17 @@ def _get_translator():
         ) from e
 
 
-def translate_en_to_zh(text: str) -> str:
+def translate_en_to_zh(
+    text: str,
+    *,
+    cancel_check: Optional[CancelCheck] = None,
+) -> str:
     """Translate a single English string to Chinese (Ollama / Argos / fallback)."""
     text = (text or "").strip()
     if not text:
         return text
+    if cancel_check and cancel_check():
+        raise CancelledError("已取消翻译")
     fn, backend = _get_translator()
     if not callable(fn):
         logger.error(
@@ -1322,7 +1392,10 @@ def translate_en_to_zh(text: str) -> str:
         )
         return text
     try:
-        out = fn(text)
+        if backend == "ollama":
+            out = translate_via_ollama(text, cancel_check=cancel_check)
+        else:
+            out = fn(text)
         out = (out or "").strip() or text
         if out == text:
             logger.warning(
@@ -1338,11 +1411,16 @@ def translate_en_to_zh(text: str) -> str:
                 out[:60],
             )
         return out
+    except CancelledError:
+        raise
     except Exception as e:
+        if backend == "ollama" and isinstance(e, RuntimeError):
+            raise
         logger.exception(
             "Translate failed for %r (backend=%s): %s", text[:60], backend, e
         )
         return text
+
 
 
 def translate_text(text: str) -> str:
@@ -1373,6 +1451,7 @@ def translate_image_file(
     min_confidence: float = 0.3,
     render_mode: str = "caption",
     merge_nearby: bool = False,
+    cancel_check: Optional[CancelCheck] = None,
 ) -> Path:
     """OCR → whole-page English paragraph → one MT call → caption band.
 
@@ -1396,6 +1475,8 @@ def translate_image_file(
     if mode not in ("caption", "overlay"):
         mode = "caption"
 
+    if cancel_check and cancel_check():
+        raise CancelledError("已取消 OCR")
     boxes = ocr_image(src, min_confidence=min_confidence)
     # Ensure translator is ready before the loop so status/logging is accurate
     _get_translator()
@@ -1417,7 +1498,9 @@ def translate_image_file(
             canvas = original
             translated_boxes = 0
             for ob in boxes:
-                zh = translate_en_to_zh(ob.text)
+                if cancel_check and cancel_check():
+                    raise CancelledError("已取消翻译")
+                zh = translate_en_to_zh(ob.text, cancel_check=cancel_check)
                 if not zh:
                     continue
                 if contains_cjk(zh) or zh != ob.text:
@@ -1434,7 +1517,11 @@ def translate_image_file(
             english = join_english_paragraph(boxes, merge_nearby=merge_nearby)
             caption = ""
             if english:
-                caption = translate_en_to_zh(english)
+                if cancel_check and cancel_check():
+                    raise CancelledError("已取消翻译")
+                caption = translate_en_to_zh(
+                    english, cancel_check=cancel_check
+                )
             canvas = append_caption_band(
                 original, caption, font_path=font_path
             )
@@ -1479,6 +1566,7 @@ def translate_image_paths(
     *,
     progress_callback: Optional[ProgressCallback] = None,
     skip_non_images: bool = True,
+    cancel_check: Optional[CancelCheck] = None,
 ) -> Tuple[List[Path], List[Path], List[str]]:
     """Translate each image into ``<parent>/translated_zh/*_zh.*``.
 
@@ -1516,11 +1604,17 @@ def translate_image_paths(
 
     n = len(image_paths)
     for i, src in enumerate(image_paths, start=1):
+        if cancel_check and cancel_check():
+            raise CancelledError(
+                f"已取消翻译（完成 {len(translated)}/{n}）"
+            )
         if progress_callback is not None:
             progress_callback(i, n, f"正在翻译 {src.name}")
         try:
-            out = translate_image_file(src)
+            out = translate_image_file(src, cancel_check=cancel_check)
             translated.append(out)
+        except CancelledError:
+            raise
         except Exception as e:
             warnings.append(f"{src.name}: {e}")
             logger.exception("Failed translating %s", src)

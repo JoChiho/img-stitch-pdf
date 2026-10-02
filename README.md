@@ -187,3 +187,11 @@ img-stitch-pdf/
 
 - 本地目录：`D:\workspace\king\img-stitch-pdf`
 - GitHub：https://github.com/JoChiho/img-stitch-pdf
+
+## UI 响应性（OCR / 翻译 / PDF）
+
+- 所有 OCR、Ollama 翻译、PDF 合并均在**后台线程**执行；Tk 主线程只通过队列刷新状态。
+- 导出过程中可点 **取消**；状态栏约每 3 秒心跳更新（避免 Windows「未响应」）。
+- Ollama HTTP 有超时（默认见 `IMG_STITCH_OLLAMA_TIMEOUT`，秒）。超时会给出明确错误；大模型（如 `qwen2.5:32b`）可增大该值。
+- 启动时不在 UI 线程阻塞导入/拉取 Ollama 模型列表（后台刷新）。
+

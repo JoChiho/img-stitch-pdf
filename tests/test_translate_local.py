@@ -654,7 +654,7 @@ def test_translate_image_file_default_is_caption_not_overlay(tmp_path: Path):
     ]
     calls = []
 
-    def fake_tr(t):
+    def fake_tr(t, **_kwargs):
         calls.append(t)
         return {"One Two": "一二", "One": "一", "Two": "二"}.get(t, t)
 
@@ -681,7 +681,7 @@ def test_translate_image_file_merge_nearby_optional(tmp_path: Path):
     ]
     calls = []
 
-    def fake_tr(t):
+    def fake_tr(t, **_kwargs):
         calls.append(t)
         return "合并译文"
 
@@ -782,3 +782,43 @@ def test_ocr_boxes_from_paddle_page_legacy():
     out = tl._ocr_backend._boxes_from_paddle_page(page)
     assert [o.text for o in out] == ["Alpha", "Beta"]
 
+
+def test_translate_via_ollama_timeout_clear_error(monkeypatch):
+    """Timeout / URLError must surface a clear Chinese Ollama HTTP timeout message."""
+    import translate_local as tl
+    import socket
+    import urllib.error
+
+    def boom(*_a, **_k):
+        raise urllib.error.URLError(socket.timeout("timed out"))
+
+    monkeypatch.setattr(tl.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(tl, "OLLAMA_TIMEOUT_SEC", 1.0)
+    with pytest.raises(RuntimeError) as ei:
+        tl.translate_via_ollama("Hello", timeout=1.0)
+    msg = str(ei.value)
+    assert "超时" in msg
+    assert "IMG_STITCH_OLLAMA_TIMEOUT" in msg
+
+
+def test_translate_via_ollama_cancel_check():
+    import translate_local as tl
+
+    with pytest.raises(tl.CancelledError):
+        tl.translate_via_ollama("Hello", cancel_check=lambda: True)
+
+
+def test_translate_image_paths_honors_cancel(tmp_path, monkeypatch):
+    import translate_local as tl
+    from PIL import Image
+
+    img = tmp_path / "a.png"
+    Image.new("RGB", (20, 20), (255, 255, 255)).save(img)
+
+    monkeypatch.setattr(
+        tl,
+        "translate_image_file",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run")),
+    )
+    with pytest.raises(tl.CancelledError):
+        tl.translate_image_paths([img], cancel_check=lambda: True)

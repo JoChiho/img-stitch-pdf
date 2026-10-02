@@ -18,8 +18,10 @@ import os
 import re
 import subprocess
 import sys
+import queue
 import tempfile
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -55,10 +57,17 @@ except ImportError:
     PdfReader = None  # type: ignore
     PdfWriter = None  # type: ignore
 
-try:
-    import translate_local
-except ImportError:
-    translate_local = None  # type: ignore
+translate_local = None  # type: ignore  # lazy — avoid heavy imports on UI startup
+
+
+def _ensure_translate_local():
+    """Import translate_local on first use (worker thread preferred)."""
+    global translate_local
+    if translate_local is None:
+        import translate_local as _tl
+
+        translate_local = _tl
+    return translate_local
 
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")  # skip .gif by default
@@ -476,10 +485,12 @@ def set_ollama_model_config(model: str) -> str:
 
 def list_ollama_models_for_ui() -> List[str]:
     """Model names from Ollama (``/api/tags``, same as ``ollama list``). Empty if down."""
-    if translate_local is None:
+    try:
+        tl = _ensure_translate_local()
+    except ImportError:
         return []
     try:
-        names = list(translate_local.ollama_list_models())
+        names = list(tl.ollama_list_models())
     except Exception:
         return []
     seen = set()
@@ -733,9 +744,19 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self.move_pos_entry: Optional[ttk.Entry] = None
         self.status: Optional[tk.StringVar] = None
 
+        self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._cancel_event = threading.Event()
+        self._worker_thread: Optional[threading.Thread] = None
+        self._cancel_btn: Optional[ttk.Button] = None
+        self._heartbeat_job: Optional[str] = None
+        self._status_base: str = ""
+        self._job_started_monotonic: float = 0.0
+
         self._build_ui()
         self._refresh_output_dir_label()
-        self._refresh_ollama_model_combo()
+        # Do NOT block Tk startup with Ollama HTTP or translate_local import.
+        self.after(150, self._refresh_ollama_model_combo_async)
+        self.after(200, self._poll_ui_queue)
         apply_ocr_engine_to_runtime(resolve_ocr_engine_choice())
         self._update_count_label()
         self._set_status(
@@ -1055,7 +1076,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             "<<ComboboxSelected>>", self._on_ollama_model_selected
         )
         ttk.Button(
-            tr_fr, text="刷新模型列表", command=self._refresh_ollama_model_combo
+            tr_fr, text="刷新模型列表", command=self._refresh_ollama_model_combo_async
         ).pack(side=tk.LEFT, padx=2, pady=2)
         ttk.Label(tr_fr, text="OCR：", style="Card.TLabel").pack(
             side=tk.LEFT, padx=(12, 0), pady=2
@@ -1101,6 +1122,10 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             export_fr, text="本地翻译后导出…", command=self.export_pdf_translated
         )
         self._translate_export_btn.pack(side=tk.LEFT, padx=4, pady=2)
+        self._cancel_btn = ttk.Button(
+            export_fr, text="取消", command=self.cancel_export, state=tk.DISABLED
+        )
+        self._cancel_btn.pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Button(export_fr, text="退出", command=self.destroy).pack(
             side=tk.RIGHT, padx=(4, 0), pady=2
         )
@@ -1785,9 +1810,77 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             return str(self.paths[0].parent)
         return str(Path.home())
 
-    def _refresh_ollama_model_combo(self) -> None:
-        """Reload Ollama model names into the dropdown and apply persisted choice."""
-        names = list_ollama_models_for_ui()
+    def _post_ui(self, fn, *args, **kwargs) -> None:
+        """Enqueue a callable to run on the Tk main thread (thread-safe)."""
+        self._ui_queue.put((fn, args, kwargs))
+
+    def _poll_ui_queue(self) -> None:
+        """Drain background→UI messages; never call Tk from worker threads."""
+        try:
+            while True:
+                fn, args, kwargs = self._ui_queue.get_nowait()
+                try:
+                    fn(*args, **kwargs)
+                except Exception:
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        try:
+            self.after(100, self._poll_ui_queue)
+        except tk.TclError:
+            pass
+
+    def _set_status_threadsafe(self, msg: str) -> None:
+        self._post_ui(self._set_status_from_worker, msg)
+
+    def _set_status_from_worker(self, msg: str) -> None:
+        self._status_base = msg
+        self._set_status(msg)
+
+    def _start_heartbeat(self) -> None:
+        self._job_started_monotonic = time.monotonic()
+        self._schedule_heartbeat()
+
+    def _schedule_heartbeat(self) -> None:
+        if not self._exporting:
+            return
+        elapsed = int(time.monotonic() - self._job_started_monotonic)
+        base = self._status_base or "处理中"
+        # Heartbeat keeps Windows from marking the app Not Responding during
+        # long Ollama waits (e.g. qwen2.5:32b).
+        if elapsed > 0:
+            self._set_status(f"{base} · 已运行 {elapsed}s")
+        try:
+            self.after(3000, self._schedule_heartbeat)
+        except tk.TclError:
+            pass
+
+    def cancel_export(self) -> None:
+        """Request cancel of the running OCR/translate/PDF worker."""
+        if not self._exporting:
+            return
+        self._cancel_event.set()
+        self._status_base = "正在取消…"
+        self._set_status("正在取消…（等待当前步骤结束）")
+
+    def _cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def _refresh_ollama_model_combo_async(self) -> None:
+        """Fetch Ollama tags on a background thread; apply on UI thread."""
+        self._set_status("正在刷新 Ollama 模型列表…")
+
+        def worker() -> None:
+            try:
+                names = list_ollama_models_for_ui()
+            except Exception:
+                names = []
+            self._post_ui(self._apply_ollama_model_names, names)
+
+        threading.Thread(target=worker, daemon=True, name="ollama-tags").start()
+
+    def _apply_ollama_model_names(self, names: List[str]) -> None:
+        """UI-thread: fill combobox from background-fetched names."""
         chosen = resolve_ollama_model_choice(names)
         values = list(names)
         if chosen and chosen not in values:
@@ -1798,7 +1891,12 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             self._ollama_model_combo["values"] = values
         if self.ollama_model_var is not None:
             self.ollama_model_var.set(chosen)
-        apply_ollama_model_to_runtime(chosen)
+        set_ollama_model_config(chosen)
+        self._set_status(f"Ollama 模型：{chosen}（共 {len(names)} 个可用）")
+
+    def _refresh_ollama_model_combo(self) -> None:
+        """Compat wrapper — prefer async to avoid blocking Tk."""
+        self._refresh_ollama_model_combo_async()
 
     def _on_ollama_model_selected(self, _event=None) -> None:
         if self.ollama_model_var is None:
@@ -1806,7 +1904,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         name = (self.ollama_model_var.get() or "").strip()
         if not name:
             return
-        apply_ollama_model_to_runtime(name)
+        # Persist only — do not block UI with another /api/tags round-trip.
+        set_ollama_model_config(name)
         self._set_status(f"已选择 Ollama 模型：{name}（已写入配置）")
 
     def _on_ocr_engine_selected(self, _event=None) -> None:
@@ -1850,7 +1949,9 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             messagebox.showwarning("提示", "请先添加至少一张图片。")
             self._set_status("导出列表为空。")
             return
-        if translate_local is None:
+        try:
+            _ensure_translate_local()
+        except ImportError:
             messagebox.showerror(
                 "缺少模块",
                 "未找到 translate_local.py。请确认项目文件完整。",
@@ -1884,47 +1985,60 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             return
 
         paths_snapshot = list(self.paths)
-        self._set_exporting(True)
-        self._set_status(
-            f"检查/安装翻译依赖后开始本地翻译… 0/{image_count}"
+        model_choice = (
+            (self.ollama_model_var.get() or "").strip()
+            if self.ollama_model_var is not None
+            else ""
         )
+        ocr_choice = (
+            (self.ocr_engine_var.get() or "").strip()
+            if self.ocr_engine_var is not None
+            else ""
+        )
+        self._set_exporting(True)
+        self._status_base = f"检查/安装翻译依赖后开始本地翻译… 0/{image_count}"
+        self._set_status(self._status_base)
 
         def worker() -> None:
+            page_count = 0
+            note = ""
             try:
-                def on_dep(msg: str) -> None:
-                    self.after(0, lambda m=msg: self._set_status(m))
+                tl = _ensure_translate_local()
 
-                # Auto-install missing packages into this interpreter (no manual pip)
-                # Honor UI / config model before loading MT
-                if self.ollama_model_var is not None:
-                    apply_ollama_model_to_runtime(self.ollama_model_var.get())
+                def on_dep(msg: str) -> None:
+                    self._set_status_threadsafe(msg)
+
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                if model_choice:
+                    set_ollama_model_config(model_choice)
                 else:
                     apply_ollama_model_to_runtime()
-                if self.ocr_engine_var is not None:
-                    apply_ocr_engine_to_runtime(self.ocr_engine_var.get())
+                if ocr_choice:
+                    apply_ocr_engine_to_runtime(ocr_choice)
                 else:
                     apply_ocr_engine_to_runtime()
-                translate_local.ensure_deps(progress_callback=on_dep)
+                tl.ensure_deps(progress_callback=on_dep)
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
                 on_dep("正在准备 OCR / 翻译模型（首次可能下载）…")
                 try:
-                    translate_local.preload_models(progress_callback=on_dep)
+                    tl.preload_models(progress_callback=on_dep)
                 except Exception as warm_err:
-                    # Non-fatal: translate_image_paths will surface real failures
                     on_dep(f"模型预加载提示：{warm_err}")
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
 
                 def on_tr(i: int, n: int, msg: str) -> None:
-                    self.after(
-                        0,
-                        lambda i=i, n=n, msg=msg: self._set_status(
-                            f"本地翻译 {i}/{n}：{msg}"
-                        ),
-                    )
+                    self._set_status_threadsafe(f"本地翻译 {i}/{n}：{msg}")
 
-                translated, skipped_pdfs, warnings = (
-                    translate_local.translate_image_paths(
-                        paths_snapshot, progress_callback=on_tr
-                    )
+                translated, skipped_pdfs, warnings = tl.translate_image_paths(
+                    paths_snapshot,
+                    progress_callback=on_tr,
+                    cancel_check=self._cancelled,
                 )
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
                 if not translated:
                     raise RuntimeError(
                         "没有成功翻译任何图片。"
@@ -1932,15 +2046,13 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                     )
 
                 def on_progress(i: int, n: int) -> None:
-                    self.after(
-                        0, lambda i=i, n=n: self._set_status(f"正在导出 {i}/{n}…")
-                    )
+                    self._set_status_threadsafe(f"正在导出 {i}/{n}…")
 
                 page_count = items_to_multipage_pdf(
                     translated, out_path, progress_callback=on_progress
                 )
                 note_parts = [
-                    f"已生成 {len(translated)} 张翻译图（写入 translated_zh/ 子文件夹，未覆盖原图）"
+                    f"已生成 {len(translated)} 张译图（写入 translated_zh/ 子文件夹，未覆盖原图）",
                 ]
                 if skipped_pdfs:
                     note_parts.append(f"跳过 PDF {len(skipped_pdfs)} 个")
@@ -1948,18 +2060,24 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                     note_parts.append("；".join(warnings[:5]))
                 note = "。".join(note_parts)
             except Exception as e:
+                is_cancel = type(e).__name__ == "CancelledError" or (
+                    translate_local is not None
+                    and isinstance(e, getattr(translate_local, "CancelledError", ()))
+                )
+                if is_cancel:
+                    self._post_ui(self._on_export_cancelled, str(e))
+                    return
                 traceback.print_exc()
-                err = e
-                self.after(0, lambda: self._on_export_error(err))
+                self._post_ui(self._on_export_error, e)
             else:
-                self.after(
-                    0,
-                    lambda: self._on_export_success(
-                        out_path, page_count, extra=note
-                    ),
+                self._post_ui(
+                    self._on_export_success, out_path, page_count, note
                 )
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._worker_thread = threading.Thread(
+            target=worker, daemon=True, name="translate-export"
+        )
+        self._worker_thread.start()
 
     def _ask_pdf_out_path(self, default_name: str) -> Optional[Path]:
         """Resolve output PDF path via direct-export flag or save dialog."""
@@ -1997,32 +2115,37 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         if out_path is None:
             return
         self._set_exporting(True)
-        self._set_status(f"正在导出多页 PDF：0/{len(paths_snapshot)}…")
+        self._status_base = f"正在导出多页 PDF：0/{len(paths_snapshot)}…"
+        self._set_status(self._status_base)
 
         def worker() -> None:
+            page_count = 0
             try:
-
                 def on_progress(i: int, n: int) -> None:
-                    self.after(
-                        0, lambda i=i, n=n: self._set_status(f"正在导出 {i}/{n}…")
-                    )
+                    if self._cancelled():
+                        raise RuntimeError("已取消导出")
+                    self._set_status_threadsafe(f"正在导出 {i}/{n}…")
 
                 page_count = items_to_multipage_pdf(
                     paths_snapshot, out_path, progress_callback=on_progress
                 )
+                if self._cancelled():
+                    raise RuntimeError("已取消导出")
             except Exception as e:
+                if "已取消" in str(e):
+                    self._post_ui(self._on_export_cancelled, str(e))
+                    return
                 traceback.print_exc()
-                err = e
-                self.after(0, lambda: self._on_export_error(err))
+                self._post_ui(self._on_export_error, e)
             else:
-                self.after(
-                    0,
-                    lambda: self._on_export_success(
-                        out_path, page_count, extra=translate_note
-                    ),
+                self._post_ui(
+                    self._on_export_success, out_path, page_count, translate_note
                 )
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._worker_thread = threading.Thread(
+            target=worker, daemon=True, name="pdf-export"
+        )
+        self._worker_thread.start()
 
     def _set_exporting(self, running: bool) -> None:
         self._exporting = running
@@ -2031,6 +2154,15 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             self._export_btn.configure(state=state)
         if self._translate_export_btn is not None:
             self._translate_export_btn.configure(state=state)
+        if self._cancel_btn is not None:
+            self._cancel_btn.configure(
+                state=tk.NORMAL if running else tk.DISABLED
+            )
+        if running:
+            self._cancel_event.clear()
+            self._start_heartbeat()
+        else:
+            self._cancel_event.clear()
 
     def _on_export_success(
         self, out_path: Path, page_count: int, extra: Optional[str] = None
@@ -2044,6 +2176,12 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         if extra:
             detail = f"{detail}\n\n{extra}"
         messagebox.showinfo("完成", detail)
+
+    def _on_export_cancelled(self, detail: str = "") -> None:
+        self._set_exporting(False)
+        msg = (detail or "").strip() or "已取消"
+        self._set_status(msg)
+        messagebox.showinfo("已取消", msg)
 
     def _on_export_error(self, err: BaseException) -> None:
         self._set_exporting(False)
