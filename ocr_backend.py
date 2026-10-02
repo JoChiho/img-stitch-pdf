@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -23,6 +24,9 @@ OcrBox = None
 _easyocr_reader = None
 _paddleocr_reader = None
 _last_ocr_engine_used: Optional[str] = None
+_reader_lock = threading.Lock()
+_paddleocr_init_count = 0
+_easyocr_init_count = 0
 
 OCR_ENGINES = ("paddle", "easyocr")
 DEFAULT_OCR_ENGINE = "paddle"
@@ -177,60 +181,104 @@ def ensure_paddle_stack(
         _msg("paddleocr ready")
 
 
+def ocr_reader_cache_stats() -> dict:
+    """Return process-level OCR reader cache / cold-start counters."""
+    return {
+        "paddle_cached": _paddleocr_reader is not None,
+        "easyocr_cached": _easyocr_reader is not None,
+        "paddle_init_count": _paddleocr_init_count,
+        "easyocr_init_count": _easyocr_init_count,
+        "engine": OCR_ENGINE,
+        "last_used": _last_ocr_engine_used,
+    }
+
+
+def reset_ocr_readers_for_tests() -> None:
+    """Clear cached readers (tests only)."""
+    global _paddleocr_reader, _easyocr_reader
+    global _paddleocr_init_count, _easyocr_init_count, _last_ocr_engine_used
+    with _reader_lock:
+        _paddleocr_reader = None
+        _easyocr_reader = None
+        _paddleocr_init_count = 0
+        _easyocr_init_count = 0
+        _last_ocr_engine_used = None
+
+
 def get_paddleocr_reader(languages: Optional[Sequence[str]] = None):
-    global _paddleocr_reader
+    """Return the process-wide PaddleOCR instance (create once, then reuse)."""
+    global _paddleocr_reader, _paddleocr_init_count
     if _paddleocr_reader is not None:
         return _paddleocr_reader
-    apply_paddle_windows_quirks()
-    try:
-        from paddleocr import PaddleOCR
-    except ImportError as e:
-        raise ImportError(
-            "PaddleOCR is required (auto-install should have run). "
-            "On Windows use CPU paddlepaddle from the official CPU index."
-        ) from e
-    langs = list(languages) if languages else ["en"]
-    lang = langs[0] if langs else "en"
-    kwargs_list = [
-        dict(
-            lang=lang,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            enable_mkldnn=False,
-        ),
-        dict(lang=lang, use_angle_cls=True, show_log=False, use_gpu=False),
-        dict(lang=lang),
-    ]
-    last_err: Optional[BaseException] = None
-    for kwargs in kwargs_list:
+    with _reader_lock:
+        if _paddleocr_reader is not None:
+            return _paddleocr_reader
+        apply_paddle_windows_quirks()
         try:
-            _paddleocr_reader = PaddleOCR(**kwargs)
-            break
-        except TypeError as e:
-            last_err = e
-        except Exception as e:
-            last_err = e
-    if _paddleocr_reader is None:
-        raise RuntimeError(f"Cannot init PaddleOCR: {last_err}")
-    return _paddleocr_reader
+            from paddleocr import PaddleOCR
+        except ImportError as e:
+            raise ImportError(
+                "PaddleOCR is required (auto-install should have run). "
+                "On Windows use CPU paddlepaddle from the official CPU index."
+            ) from e
+        langs = list(languages) if languages else ["en"]
+        lang = langs[0] if langs else "en"
+        kwargs_list = [
+            dict(
+                lang=lang,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                enable_mkldnn=False,
+            ),
+            dict(lang=lang, use_angle_cls=True, show_log=False, use_gpu=False),
+            dict(lang=lang),
+        ]
+        last_err: Optional[BaseException] = None
+        logger.info("OCR cold-start: creating PaddleOCR reader (lang=%s)", lang)
+        for kwargs in kwargs_list:
+            try:
+                _paddleocr_reader = PaddleOCR(**kwargs)
+                break
+            except TypeError as e:
+                last_err = e
+            except Exception as e:
+                last_err = e
+        if _paddleocr_reader is None:
+            raise RuntimeError(f"Cannot init PaddleOCR: {last_err}")
+        _paddleocr_init_count += 1
+        logger.info(
+            "OCR ready: PaddleOCR reader cached (init_count=%s)",
+            _paddleocr_init_count,
+        )
+        return _paddleocr_reader
 
 
 def get_easyocr_reader(languages: Optional[Sequence[str]] = None):
-    global _easyocr_reader
+    """Return the process-wide EasyOCR Reader (create once, then reuse)."""
+    global _easyocr_reader, _easyocr_init_count
     if _easyocr_reader is not None:
         return _easyocr_reader
-    try:
-        import easyocr
-    except Exception as e:
-        # ImportError or OSError (torch shm.dll after paddle on Windows)
-        raise ImportError(
-            "easyocr is unavailable (optional when using PaddleOCR). "
-            f"Underlying error: {type(e).__name__}: {e}"
-        ) from e
-    langs = list(languages) if languages else ["en"]
-    _easyocr_reader = easyocr.Reader(langs, gpu=False, verbose=False)
-    return _easyocr_reader
+    with _reader_lock:
+        if _easyocr_reader is not None:
+            return _easyocr_reader
+        try:
+            import easyocr
+        except Exception as e:
+            # ImportError or OSError (torch shm.dll after paddle on Windows)
+            raise ImportError(
+                "easyocr is unavailable (optional when using PaddleOCR). "
+                f"Underlying error: {type(e).__name__}: {e}"
+            ) from e
+        langs = list(languages) if languages else ["en"]
+        logger.info("OCR cold-start: creating EasyOCR Reader (langs=%s)", langs)
+        _easyocr_reader = easyocr.Reader(langs, gpu=False, verbose=False)
+        _easyocr_init_count += 1
+        logger.info(
+            "OCR ready: EasyOCR reader cached (init_count=%s)",
+            _easyocr_init_count,
+        )
+        return _easyocr_reader
 
 
 def _poly_to_aabb(poly) -> Optional[Tuple[int, int, int, int]]:

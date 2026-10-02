@@ -1620,6 +1620,16 @@ def export_ocr_text_for_paths(
         warnings.append(
             f"OCR 导出跳过 {len(skipped_pdfs)} 个 PDF（仅处理图片）。"
         )
+    # Create PaddleOCR/EasyOCR once for this batch/process; reuse for every image.
+    if image_paths:
+        if progress_callback is not None:
+            progress_callback(0, len(image_paths), "OCR model warm-up")
+        try:
+            _ocr_backend.preload_ocr(get_ocr_engine())
+        except Exception as warm_err:
+            warnings.append(f"OCR preload note: {warm_err}")
+            logger.warning("OCR preload failed before export batch: %s", warm_err)
+
     pages: List[Tuple[int, str, str]] = []
     n = len(image_paths)
     for i, src in enumerate(image_paths, start=1):
@@ -1909,6 +1919,16 @@ def translate_image_paths(
         warnings.append(
             f"翻译模式跳过 {len(skipped_pdfs)} 个 PDF（仅处理图片）。"
         )
+
+    # Create PaddleOCR/EasyOCR once for this batch/process; reuse for every image.
+    if image_paths:
+        if progress_callback is not None:
+            progress_callback(0, len(image_paths), "OCR model warm-up")
+        try:
+            _ocr_backend.preload_ocr(get_ocr_engine())
+        except Exception as warm_err:
+            warnings.append(f"OCR preload note: {warm_err}")
+            logger.warning("OCR preload failed before translate batch: %s", warm_err)
 
     n = len(image_paths)
     for i, src in enumerate(image_paths, start=1):

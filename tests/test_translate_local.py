@@ -950,3 +950,95 @@ def test_export_ocr_text_for_paths_uses_page_keys(tmp_path: Path, monkeypatch):
     assert "Hello from OCR" in text
     blocks = tl.parse_ocr_export_text(text)
     assert blocks[0].text == "Hello from OCR"
+
+
+def test_ocr_reader_getters_reuse_same_instance(monkeypatch):
+    """PaddleOCR and EasyOCR constructors run once; later calls reuse cache."""
+    import sys
+    import types
+    import ocr_backend as ob
+
+    ob.reset_ocr_readers_for_tests()
+    paddle_calls = {"n": 0}
+    easy_calls = {"n": 0}
+
+    class FakePaddle:
+        def __init__(self, **_kwargs):
+            paddle_calls["n"] += 1
+
+    class FakeEasyReader:
+        def __init__(self, *_a, **_k):
+            easy_calls["n"] += 1
+
+    fake_paddle_mod = types.ModuleType("paddleocr")
+    fake_paddle_mod.PaddleOCR = FakePaddle
+    monkeypatch.setitem(sys.modules, "paddleocr", fake_paddle_mod)
+    monkeypatch.setattr(ob, "apply_paddle_windows_quirks", lambda: None)
+
+    fake_easy_mod = types.ModuleType("easyocr")
+    fake_easy_mod.Reader = FakeEasyReader
+    monkeypatch.setitem(sys.modules, "easyocr", fake_easy_mod)
+
+    r1 = ob.get_paddleocr_reader(["en"])
+    r2 = ob.get_paddleocr_reader(["en"])
+    r3 = ob.get_paddleocr_reader(["en"])
+    assert r1 is r2 is r3
+    assert paddle_calls["n"] == 1
+    assert ob.ocr_reader_cache_stats()["paddle_init_count"] == 1
+
+    e1 = ob.get_easyocr_reader(["en"])
+    e2 = ob.get_easyocr_reader(["en"])
+    assert e1 is e2
+    assert easy_calls["n"] == 1
+    assert ob.ocr_reader_cache_stats()["easyocr_init_count"] == 1
+    ob.reset_ocr_readers_for_tests()
+
+
+def test_export_and_translate_pipelines_reuse_ocr_reader(tmp_path, monkeypatch):
+    """Export OCR txt and translate batches must not re-init OCR per image."""
+    import sys
+    import types
+    import ocr_backend as ob
+
+    ob.reset_ocr_readers_for_tests()
+    paddle_calls = {"n": 0}
+
+    class FakePaddle:
+        def __init__(self, **_kwargs):
+            paddle_calls["n"] += 1
+
+        def predict(self, _path):
+            return []
+
+        def ocr(self, _path, **_k):
+            return []
+
+    fake_mod = types.ModuleType("paddleocr")
+    fake_mod.PaddleOCR = FakePaddle
+    monkeypatch.setitem(sys.modules, "paddleocr", fake_mod)
+    monkeypatch.setattr(ob, "apply_paddle_windows_quirks", lambda: None)
+    monkeypatch.setattr(ob, "OCR_ENGINE", "paddle")
+    monkeypatch.setattr(tl, "get_ocr_engine", lambda: "paddle")
+    monkeypatch.setattr(ob, "get_ocr_engine", lambda: "paddle")
+
+    imgs = []
+    for i in range(3):
+        img = tmp_path / f"p{i}.png"
+        Image.new("RGB", (16, 16), (i * 40, 10, 10)).save(img)
+        imgs.append(img)
+
+    text, paths, _warnings = tl.export_ocr_text_for_paths(imgs, root=tmp_path)
+    assert len(paths) == 3
+    assert "===PAGE 001===" in text
+    assert paddle_calls["n"] == 1
+    assert ob.ocr_reader_cache_stats()["paddle_init_count"] == 1
+
+    monkeypatch.setattr(tl, "translate_en_to_zh", lambda *_a, **_k: "你好")
+    monkeypatch.setattr(tl, "_get_translator", lambda: (lambda t: "你好", "mock"))
+    outs, _skipped, _w2 = tl.translate_image_paths(imgs)
+    assert len(outs) == 3
+    # Same process cache: still a single PaddleOCR construction
+    assert paddle_calls["n"] == 1
+    assert ob.ocr_reader_cache_stats()["paddle_init_count"] == 1
+    ob.reset_ocr_readers_for_tests()
+
