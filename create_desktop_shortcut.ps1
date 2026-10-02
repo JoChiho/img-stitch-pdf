@@ -45,19 +45,20 @@ $Desktop = [Environment]::GetFolderPath("Desktop")
 if (-not $Desktop) {
     $Desktop = Join-Path $env:USERPROFILE "Desktop"
 }
-$LnkPath = Join-Path $Desktop "图片拼接转PDF.lnk"
-
+$LnkNames = @("PDF.lnk", "图片拼接转PDF.lnk")
 $WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut($LnkPath)
-$Shortcut.TargetPath = $Pythonw
-$Shortcut.Arguments = "`"$MainPy`""
-$Shortcut.WorkingDirectory = $ProjectDir
-$Shortcut.WindowStyle = 1
-$Shortcut.Description = "图片导出为多页 PDF"
-$Shortcut.Save()
-
-Write-Host "Created shortcut:"
-Write-Host "  $LnkPath"
+foreach ($name in $LnkNames) {
+    $LnkPath = Join-Path $Desktop $name
+    $Shortcut = $WshShell.CreateShortcut($LnkPath)
+    $Shortcut.TargetPath = $Pythonw
+    $Shortcut.Arguments = "`"$MainPy`""
+    $Shortcut.WorkingDirectory = $ProjectDir
+    $Shortcut.WindowStyle = 1
+    $Shortcut.Description = "图片导出为多页 PDF"
+    $Shortcut.Save()
+    Write-Host "Created shortcut:"
+    Write-Host "  $LnkPath"
+}
 Write-Host "Target: $Pythonw"
 Write-Host "Args:   `"$MainPy`""
 Write-Host "Start in: $ProjectDir"

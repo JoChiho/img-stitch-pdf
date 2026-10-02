@@ -12,3 +12,5 @@ paddleocr>=2.7.0
 argostranslate>=1.9.0
 # Last-resort online MT only if Ollama and Argos both fail:
 # deep-translator>=1.11.0
+# Optional: more reliable Windows OLE drag-drop (falls back to built-in hook)
+# tkinterdnd2>=0.3.0

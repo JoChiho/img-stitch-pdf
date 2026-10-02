@@ -222,11 +222,15 @@ def log_drop_exception(where: str) -> None:
 def hook_win_dropfiles(tk_widget, on_files: Callable) -> bool:
     """Enable WM_DROPFILES on a Tk widget with a crash-safe Unicode WndProc.
 
-    The ``windnd`` package uses ``SetWindowLongPtrA`` on 64-bit Python against
-    Tk's Unicode HWNDs (undefined, often process crash / 闪退 on drop) and
-    passes ``ctypes.sizeof`` (bytes) as ``DragQueryFileW``'s character count.
-    This helper uses the ``*W`` APIs, correct buffer sizes, never raises out of
-    the WndProc, and keeps ctypes callback refs alive on the widget.
+    Critical: ``on_files`` must NOT call into Tk/Tcl (no ``after``, widget
+    updates, etc.). Explorer delivers WM_DROPFILES via the Win32 message pump;
+    touching Tk from the subclassed WndProc re-enters Tcl and aborts the
+    process (``PyEval_RestoreThread`` / flash-crash). Only enqueue paths;
+    drain from a poller started with ``root.after`` *before* any drop.
+
+    Also avoids ``windnd``'s 64-bit bugs (``SetWindowLongPtrA``, byte-sized
+    ``DragQueryFileW`` buffers). Uses ``*W`` APIs and keeps the ctypes
+    callback alive on the widget.
     """
     if sys.platform != "win32" or tk_widget is None:
         return False
@@ -286,7 +290,8 @@ def hook_win_dropfiles(tk_widget, on_files: Callable) -> bool:
         wintypes.LPARAM,
     )
 
-    old_proc = GetWindowLongPtr(hwnd, GWL_WNDPROC)
+    old_raw = GetWindowLongPtr(hwnd, GWL_WNDPROC)
+    old_proc = int(old_raw) if old_raw else 0
     if not old_proc:
         return False
 
@@ -308,6 +313,7 @@ def hook_win_dropfiles(tk_widget, on_files: Callable) -> bool:
             try:
                 paths = _query_paths(wparam)
                 try:
+                    # Must not touch Tk here — see docstring.
                     on_files(paths)
                 except Exception:
                     log_drop_exception("drop_callback")
@@ -1875,31 +1881,47 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     def _setup_file_drop(self) -> None:
         """Enable Windows shell drag-and-drop onto the file list / window.
 
-        Hooks the top-level HWND and child HWNDs that cover the drop surface
-        (Listbox / Canvas create their own windows on Win32). Uses
-        ``hook_win_dropfiles`` (Unicode ``*W`` APIs) instead of ``windnd``,
-        which crashes on 64-bit Tk via SetWindowLongPtrA / bad buffer sizes.
+        Prefer ``tkinterdnd2`` (OLE IDropTarget via tkdnd) when installed —
+        callbacks run inside Tcl and are safe. Fallback: subclass HWND with
+        WM_DROPFILES, but never call Tk from the WndProc (enqueue only; a
+        poller started here drains onto the Tk thread). Calling ``after`` from
+        WndProc aborts the process under real Explorer drops.
         """
         if sys.platform != "win32":
             return
 
-        def _callback(files):
-            # WndProc context: only schedule work on the Tk event loop.
-            try:
-                payload = list(files) if files else []
-                self.after(0, lambda f=payload: self._safe_add_dropped_paths(f))
-            except Exception:
-                log_drop_exception("schedule_add_dropped_paths")
+        self._drop_path_queue: queue.Queue = queue.Queue()
 
+        def _poll_drop_queue() -> None:
+            try:
+                while True:
+                    paths = self._drop_path_queue.get_nowait()
+                    self._safe_add_dropped_paths(paths)
+            except queue.Empty:
+                pass
+            except Exception:
+                log_drop_exception("poll_drop_queue")
+            try:
+                self.after(100, _poll_drop_queue)
+            except Exception:
+                pass
+
+        if self._try_setup_tkdnd_drop():
+            return
+
+        def _callback(files) -> None:
+            # WndProc context: enqueue only — never touch Tk here.
+            try:
+                self._drop_path_queue.put(list(files) if files else [])
+            except Exception:
+                log_drop_exception("drop_queue_put")
+
+        # Hook classic tk HWNDs only (ttk Frames are unnecessary and riskier).
         targets = []
         for w in (
             self,
-            getattr(self, "_view_container", None),
-            getattr(self, "_list_frame", None),
             self.listbox,
             getattr(self, "_thumb_canvas", None),
-            getattr(self, "_thumb_outer", None),
-            getattr(self, "_thumb_inner", None),
         ):
             if w is not None and w not in targets:
                 targets.append(w)
@@ -1917,11 +1939,65 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as fh:
                     fh.write(
-                        f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                        f"[hook_win_dropfiles: no targets hooked] ---\n"
+                        "\n--- %s [hook_win_dropfiles: no targets hooked] ---\n"
+                        % time.strftime("%Y-%m-%d %H:%M:%S")
                     )
             except Exception:
                 pass
+            return
+
+        self.after(100, _poll_drop_queue)
+
+    def _try_setup_tkdnd_drop(self) -> bool:
+        """Register OLE drop targets via tkinterdnd2/tkdnd if available."""
+        try:
+            from tkinterdnd2 import TkinterDnD, DND_FILES
+        except ImportError:
+            return False
+        try:
+            TkinterDnD._require(self)
+        except Exception:
+            log_drop_exception("tkdnd_require")
+            return False
+
+        def on_drop(event):
+            try:
+                data = getattr(event, "data", None) or ""
+                paths = list(self.tk.splitlist(data)) if data else []
+                # <<Drop>> runs inside Tcl — after() is safe here.
+                self.after(0, lambda p=paths: self._safe_add_dropped_paths(p))
+            except Exception:
+                log_drop_exception("tkdnd_drop")
+            return "copy"
+
+        targets = []
+        for w in (
+            self,
+            getattr(self, "_view_container", None),
+            getattr(self, "_list_frame", None),
+            self.listbox,
+            getattr(self, "_thumb_canvas", None),
+            getattr(self, "_thumb_outer", None),
+        ):
+            if w is not None and w not in targets:
+                targets.append(w)
+
+        hooked = 0
+        for w in targets:
+            try:
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", on_drop)
+                hooked += 1
+            except Exception:
+                log_drop_exception("tkdnd_register_target")
+        if hooked == 0:
+            return False
+        try:
+            self._tkdnd_drop_hooked = hooked  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return True
+
 
     def _safe_add_dropped_paths(self, dropped) -> None:
         """Tk-thread wrapper: never let drop handling kill the process."""
