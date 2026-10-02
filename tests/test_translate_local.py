@@ -822,3 +822,131 @@ def test_translate_image_paths_honors_cancel(tmp_path, monkeypatch):
     )
     with pytest.raises(tl.CancelledError):
         tl.translate_image_paths([img], cancel_check=lambda: True)
+
+
+# ---------------------------------------------------------------------------
+# OCR text export / import (===PAGE NNN===) parse + roundtrip
+# ---------------------------------------------------------------------------
+
+
+def test_format_page_marker_stable():
+    assert tl.format_page_marker(1) == "===PAGE 001==="
+    assert tl.format_page_marker(12) == "===PAGE 012==="
+    assert tl.format_page_marker(1000) == "===PAGE 1000==="
+
+
+def test_build_and_parse_ocr_export_roundtrip():
+    pages = [
+        (1, "a/foo.jpg", "Hello world"),
+        (2, "bar.png", "Line one\n\nLine two"),
+        (3, "baz.webp", ""),
+    ]
+    text = tl.build_ocr_export_text(pages)
+    assert "===PAGE 001===" in text
+    assert "path: a/foo.jpg" in text
+    assert "Hello world" in text
+    assert "===PAGE 002===" in text
+    assert "Line one\n\nLine two" in text
+    assert "===PAGE 003===" in text
+
+    blocks = tl.parse_ocr_export_text(text)
+    assert len(blocks) == 3
+    assert blocks[0].page == 1
+    assert blocks[0].path == "a/foo.jpg"
+    assert blocks[0].text == "Hello world"
+    assert blocks[1].page == 2
+    assert blocks[1].path == "bar.png"
+    assert blocks[1].text == "Line one\n\nLine two"
+    assert blocks[2].page == 3
+    assert blocks[2].text == ""
+
+
+def test_parse_ocr_export_maps_by_page_index_not_path_order():
+    # Out-of-order markers still sort by page index
+    raw = (
+        "===PAGE 002===\n"
+        "path: second.png\n"
+        "\n"
+        "中文二\n"
+        "\n"
+        "===PAGE 001===\n"
+        "path: first.jpg\n"
+        "\n"
+        "中文一\n"
+    )
+    blocks = tl.parse_ocr_export_text(raw)
+    assert [b.page for b in blocks] == [1, 2]
+    assert blocks[0].text == "中文一"
+    assert blocks[1].text == "中文二"
+
+
+def test_parse_ocr_export_rejects_missing_or_duplicate_markers():
+    with pytest.raises(ValueError, match="===PAGE"):
+        tl.parse_ocr_export_text("no markers here")
+    dup = (
+        "===PAGE 001===\npath: a.jpg\n\nA\n\n"
+        "===PAGE 001===\npath: b.jpg\n\nB\n"
+    )
+    with pytest.raises(ValueError, match="重复"):
+        tl.parse_ocr_export_text(dup)
+
+
+def test_page_path_label_relative_or_basename(tmp_path: Path):
+    root = tmp_path / "root"
+    sub = root / "sub"
+    sub.mkdir(parents=True)
+    img = sub / "shot.jpg"
+    img.write_bytes(b"x")
+    assert tl.page_path_label(img, root=root) == "sub/shot.jpg"
+    assert tl.page_path_label(img, root=None) == "shot.jpg"
+    # Outside root → basename
+    other = tmp_path / "other" / "x.png"
+    other.parent.mkdir()
+    other.write_bytes(b"x")
+    assert tl.page_path_label(other, root=root) == "x.png"
+
+
+def test_apply_translated_captions_maps_page_index(tmp_path: Path):
+    img1 = tmp_path / "a.png"
+    img2 = tmp_path / "b.png"
+    Image.new("RGB", (40, 30), (10, 20, 30)).save(img1)
+    Image.new("RGB", (40, 30), (40, 50, 60)).save(img2)
+    pdf = tmp_path / "skip.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+
+    text = tl.build_ocr_export_text(
+        [
+            (1, "a.png", "第一页中文"),
+            (2, "b.png", "第二页中文"),
+        ]
+    )
+    blocks = tl.parse_ocr_export_text(text)
+    # List order: pdf then images — filter skips pdf; PAGE 001 → a, PAGE 002 → b
+    outs, warnings = tl.apply_translated_captions(
+        [pdf, img1, img2], blocks
+    )
+    assert len(outs) == 2
+    assert outs[0].parent.name == "translated_zh"
+    assert outs[0].name == "a_zh.png"
+    assert outs[1].name == "b_zh.png"
+    assert any("PDF" in w for w in warnings)
+    # Caption band makes image taller
+    with Image.open(outs[0]) as im:
+        assert im.size[1] > 30
+
+
+def test_export_ocr_text_for_paths_uses_page_keys(tmp_path: Path, monkeypatch):
+    img = tmp_path / "shot.jpg"
+    Image.new("RGB", (20, 20), (255, 255, 255)).save(img)
+
+    def fake_ocr(_path, **_kw):
+        return "Hello from OCR"
+
+    monkeypatch.setattr(tl, "ocr_image_to_english", fake_ocr)
+    text, paths, warnings = tl.export_ocr_text_for_paths([img], root=tmp_path)
+    assert paths == [img]
+    assert "===PAGE 001===" in text
+    assert "path: shot.jpg" in text
+    assert "Hello from OCR" in text
+    blocks = tl.parse_ocr_export_text(text)
+    assert blocks[0].text == "Hello from OCR"

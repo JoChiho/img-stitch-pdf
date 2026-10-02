@@ -712,6 +712,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._exporting = False
         self._export_btn: Optional[ttk.Button] = None
         self._translate_export_btn: Optional[ttk.Button] = None
+        self._ocr_export_btn: Optional[ttk.Button] = None
+        self._ocr_import_btn: Optional[ttk.Button] = None
         self.output_dir: Path = ensure_default_output_dir()
         self.direct_export_var: Optional[tk.BooleanVar] = None
         self.translate_then_export_var: Optional[tk.BooleanVar] = None
@@ -1122,6 +1124,18 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             export_fr, text="本地翻译后导出…", command=self.export_pdf_translated
         )
         self._translate_export_btn.pack(side=tk.LEFT, padx=4, pady=2)
+        self._ocr_export_btn = ttk.Button(
+            export_fr,
+            text="导出英文OCR文本",
+            command=self.export_ocr_english_txt,
+        )
+        self._ocr_export_btn.pack(side=tk.LEFT, padx=4, pady=2)
+        self._ocr_import_btn = ttk.Button(
+            export_fr,
+            text="导入译文并生成图/PDF",
+            command=self.import_translated_txt,
+        )
+        self._ocr_import_btn.pack(side=tk.LEFT, padx=4, pady=2)
         self._cancel_btn = ttk.Button(
             export_fr, text="取消", command=self.cancel_export, state=tk.DISABLED
         )
@@ -1136,7 +1150,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         ttk.Label(
             hint,
             text="多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
-            "PDF 直接合并页。翻译后写入 translated_zh/（不覆盖原图），跳过 PDF/GIF。",
+            "PDF 直接合并页。翻译后写入 translated_zh/（不覆盖原图），跳过 PDF/GIF。"
+            "也可「导出英文OCR文本」→ 外部翻译 →「导入译文并生成图/PDF」（===PAGE NNN===）。",
             style="Hint.TLabel",
             wraplength=980,
             justify=tk.LEFT,
@@ -1917,6 +1932,262 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         apply_ocr_engine_to_runtime(name)
         self._set_status(f"已选择 OCR 引擎：{name}（已写入配置）")
 
+
+    def export_ocr_english_txt(self) -> None:
+        """OCR all listed images → one UTF-8 .txt with ===PAGE NNN=== keys."""
+        if self._exporting:
+            return
+        if not self.paths:
+            messagebox.showwarning("提示", "请先添加至少一张图片。")
+            self._set_status("导出列表为空。")
+            return
+        try:
+            tl = _ensure_translate_local()
+        except ImportError:
+            messagebox.showerror(
+                "缺少模块",
+                "未找到 translate_local.py。请确认项目文件完整。",
+            )
+            return
+
+        image_count = sum(
+            1
+            for p in self.paths
+            if is_image(p) and not tl.is_already_translated_name(p)
+        )
+        if image_count == 0:
+            messagebox.showwarning(
+                "提示",
+                "当前列表没有可 OCR 的图片（PDF/GIF/译图会跳过）。",
+            )
+            return
+
+        default_name = "ocr_english.txt"
+        if self.source_folder is not None and self.source_folder.name.strip():
+            default_name = f"{self.source_folder.name.strip()}_ocr_en.txt"
+        out = filedialog.asksaveasfilename(
+            title="保存英文 OCR 文本",
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            initialfile=default_name,
+            initialdir=self._export_initial_dir(),
+        )
+        if not out:
+            self._set_status("已取消 OCR 文本导出。")
+            return
+        out_path = Path(out)
+
+        paths_snapshot = list(self.paths)
+        root = self.source_folder
+        ocr_choice = (
+            (self.ocr_engine_var.get() or "").strip()
+            if self.ocr_engine_var is not None
+            else ""
+        )
+        self._set_exporting(True)
+        self._status_base = f"准备 OCR 导出… 0/{image_count}"
+        self._set_status(self._status_base)
+
+        def worker() -> None:
+            note = ""
+            try:
+                tl = _ensure_translate_local()
+
+                def on_dep(msg: str) -> None:
+                    self._set_status_threadsafe(msg)
+
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                if ocr_choice:
+                    apply_ocr_engine_to_runtime(ocr_choice)
+                else:
+                    apply_ocr_engine_to_runtime()
+                # OCR-only export: still use ensure_deps (keeps Ollama path intact
+                # for the separate「本地翻译后导出」button).
+                tl.ensure_deps(progress_callback=on_dep)
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                try:
+                    tl._ocr_backend.preload_ocr(
+                        tl.get_ocr_engine(), progress_callback=on_dep
+                    )
+                except Exception as warm_err:
+                    on_dep(f"OCR 预加载提示：{warm_err}")
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+
+                def on_tr(i: int, n: int, msg: str) -> None:
+                    self._set_status_threadsafe(f"OCR 导出 {i}/{n}：{msg}")
+
+                text_body, image_paths, warnings = tl.export_ocr_text_for_paths(
+                    paths_snapshot,
+                    root=root,
+                    progress_callback=on_tr,
+                    cancel_check=self._cancelled,
+                )
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                if not image_paths:
+                    raise RuntimeError(
+                        "没有可 OCR 的图片。"
+                        + (" ".join(warnings) if warnings else "")
+                    )
+                out_path.write_text(text_body, encoding="utf-8")
+                note_parts = [
+                    f"已写入 {len(image_paths)} 页 OCR 文本（UTF-8，===PAGE NNN===）"
+                ]
+                if warnings:
+                    note_parts.append("；".join(warnings[:5]))
+                note = "。".join(note_parts)
+            except Exception as e:
+                traceback.print_exc()
+                is_cancel = type(e).__name__ == "CancelledError" or (
+                    self._cancelled()
+                )
+                if is_cancel:
+                    self._post_ui(self._on_export_cancelled, str(e))
+                else:
+                    self._post_ui(self._on_export_error, e)
+            else:
+                def done() -> None:
+                    self._set_exporting(False)
+                    self._set_status(f"OCR 文本已保存：{out_path} — {note}")
+                    messagebox.showinfo(
+                        "完成",
+                        f"已导出英文 OCR 文本：\n{out_path}\n\n{note}\n\n"
+                        "请保留 ===PAGE NNN=== 与 path: 行，将英文译为中文后"
+                        "使用「导入译文并生成图/PDF」。",
+                    )
+
+                self._post_ui(done)
+
+        threading.Thread(target=worker, daemon=True, name="ocr-export-txt").start()
+
+    def import_translated_txt(self) -> None:
+        """Import translated .txt with ===PAGE NNN=== → caption images; optional PDF."""
+        if self._exporting:
+            return
+        if not self.paths:
+            messagebox.showwarning(
+                "提示",
+                "请先添加至少一张图片（顺序须与导出 OCR 文本时一致）。",
+            )
+            self._set_status("导入列表为空。")
+            return
+        try:
+            tl = _ensure_translate_local()
+        except ImportError:
+            messagebox.showerror(
+                "缺少模块",
+                "未找到 translate_local.py。请确认项目文件完整。",
+            )
+            return
+
+        txt = filedialog.askopenfilename(
+            title="选择译文文本（须含 ===PAGE NNN===）",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            initialdir=self._export_initial_dir(),
+        )
+        if not txt:
+            self._set_status("已取消导入译文。")
+            return
+        txt_path = Path(txt)
+        try:
+            content = txt_path.read_text(encoding="utf-8")
+            blocks = tl.parse_ocr_export_text(content)
+        except Exception as e:
+            messagebox.showerror("解析失败", f"无法解析译文文件：\n{e}")
+            self._set_status(f"解析译文失败：{e}")
+            return
+        if not blocks:
+            messagebox.showwarning("提示", "译文文件没有有效页块。")
+            return
+
+        want_pdf = messagebox.askyesno(
+            "导入译文",
+            f"已解析 {len(blocks)} 个页块（===PAGE NNN===）。\n\n"
+            "将按页序号映射到当前列表中的图片，在下方追加中文译文条，"
+            "写入 translated_zh/（不覆盖原图）。\n\n"
+            "是否在完成后额外导出多页 PDF？",
+        )
+
+        out_path: Optional[Path] = None
+        if want_pdf:
+            out_path = self._ask_pdf_out_path(
+                default_name=default_pdf_name(self.paths, self.source_folder)
+            )
+            if out_path is None:
+                want_pdf = False
+
+        paths_snapshot = list(self.paths)
+        self._set_exporting(True)
+        self._status_base = f"导入译文并生成图… 0/{len(blocks)}"
+        self._set_status(self._status_base)
+
+        def worker() -> None:
+            note = ""
+            try:
+                tl = _ensure_translate_local()
+
+                def on_tr(i: int, n: int, msg: str) -> None:
+                    self._set_status_threadsafe(f"写译文图 {i}/{n}：{msg}")
+
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                translated, warnings = tl.apply_translated_captions(
+                    paths_snapshot,
+                    blocks,
+                    progress_callback=on_tr,
+                    cancel_check=self._cancelled,
+                )
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                if not translated:
+                    raise RuntimeError(
+                        "没有生成任何译文图。"
+                        + (" ".join(warnings) if warnings else "")
+                    )
+
+                page_count = 0
+                if want_pdf and out_path is not None:
+                    def on_progress(i: int, n: int) -> None:
+                        self._set_status_threadsafe(f"正在导出 PDF {i}/{n}…")
+
+                    page_count = items_to_multipage_pdf(
+                        translated, out_path, progress_callback=on_progress
+                    )
+
+                note_parts = [
+                    f"已生成 {len(translated)} 张译文图（translated_zh/）"
+                ]
+                if want_pdf and out_path is not None:
+                    note_parts.append(f"并导出 PDF {page_count} 页：{out_path}")
+                if warnings:
+                    note_parts.append("；".join(warnings[:5]))
+                note = "。".join(note_parts)
+            except Exception as e:
+                traceback.print_exc()
+                is_cancel = type(e).__name__ == "CancelledError" or (
+                    self._cancelled()
+                )
+                if is_cancel:
+                    self._post_ui(self._on_export_cancelled, str(e))
+                else:
+                    self._post_ui(self._on_export_error, e)
+            else:
+                def done() -> None:
+                    self._set_exporting(False)
+                    self._set_status(note)
+                    detail = note
+                    if want_pdf and out_path is not None:
+                        detail = f"{detail}\n\nPDF：{out_path}"
+                    messagebox.showinfo("完成", detail)
+
+                self._post_ui(done)
+
+        threading.Thread(target=worker, daemon=True, name="ocr-import-txt").start()
+
+
     def create_shortcut(self) -> None:
         try:
             lnk = create_desktop_shortcut(PROJECT_DIR)
@@ -2154,6 +2425,10 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             self._export_btn.configure(state=state)
         if self._translate_export_btn is not None:
             self._translate_export_btn.configure(state=state)
+        if self._ocr_export_btn is not None:
+            self._ocr_export_btn.configure(state=state)
+        if self._ocr_import_btn is not None:
+            self._ocr_import_btn.configure(state=state)
         if self._cancel_btn is not None:
             self._cancel_btn.configure(
                 state=tk.NORMAL if running else tk.DISABLED

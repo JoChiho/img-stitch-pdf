@@ -13,6 +13,8 @@ Offline-first translation for screenshot / comic panels:
     Nearby-box merge remains an optional fallback (``merge_nearby=True``).
     Does NOT paint over original text boxes (overlay helpers remain for tests
     only and are not used by the default pipeline).
+  - OCR text export/import: UTF-8 .txt with machine-stable
+    ``===PAGE NNN===`` keys for external translation workflows.
 
 Heavy deps are optional at import time so unit tests for helpers can run
 without paddle / torch / argos / a running Ollama server.
@@ -21,6 +23,7 @@ without paddle / torch / argos / a running Ollama server.
 from __future__ import annotations
 
 import json
+import re
 import logging
 import os
 import subprocess
@@ -1437,6 +1440,311 @@ def mt_status() -> str:
         f"MT backend={_mt_backend or 'none'}; callable_ready={ready}"
         f"{model}{detail}"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# OCR text export / import (machine-stable ===PAGE NNN=== keys)
+# ---------------------------------------------------------------------------
+
+PAGE_MARKER_RE = re.compile(r"^===PAGE\s+(\d+)\s*===\s*$", re.MULTILINE)
+_IMAGE_SUFFIXES_FOR_OCR = {
+    ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp",
+}
+
+
+@dataclass(frozen=True)
+class OcrPageBlock:
+    """One page block from an OCR / translation .txt export."""
+
+    page: int  # 1-based page index
+    path: str  # relative or basename (informational)
+    text: str  # English (export) or Chinese (import)
+
+
+def format_page_marker(page: int) -> str:
+    """Return machine-stable page key, e.g. ``===PAGE 001===``."""
+    n = int(page)
+    if n < 1:
+        raise ValueError(f"page must be >= 1, got {page!r}")
+    width = 3 if n < 1000 else len(str(n))
+    return f"===PAGE {n:0{width}d}==="
+
+
+def page_path_label(path: Path, *, root: Optional[Path] = None) -> str:
+    """Prefer POSIX path relative to ``root``; else basename."""
+    path = Path(path)
+    if root is not None:
+        try:
+            return path.resolve().relative_to(Path(root).resolve()).as_posix()
+        except (ValueError, OSError):
+            pass
+    return path.name
+
+
+def filter_paths_for_ocr(
+    paths: Sequence[Path],
+    *,
+    skip_non_images: bool = True,
+) -> Tuple[List[Path], List[Path], List[str]]:
+    """Same image filter as translation: skip PDF / GIF / already-translated.
+
+    Returns ``(image_paths, skipped_pdfs, warnings)``.
+    """
+    image_paths: List[Path] = []
+    skipped_pdfs: List[Path] = []
+    warnings: List[str] = []
+    for p in paths:
+        p = Path(p)
+        suf = p.suffix.lower()
+        if suf == ".pdf":
+            skipped_pdfs.append(p)
+            continue
+        if suf == ".gif":
+            warnings.append(f"已跳过 GIF: {p.name}")
+            continue
+        if is_already_translated_name(p):
+            warnings.append(f"已跳过译图/已有后缀: {p.name}")
+            continue
+        if suf not in _IMAGE_SUFFIXES_FOR_OCR:
+            if skip_non_images:
+                warnings.append(f"已跳过非图片: {p.name}")
+                continue
+        image_paths.append(p)
+    return image_paths, skipped_pdfs, warnings
+
+
+def build_ocr_export_text(
+    pages: Sequence[Tuple[int, str, str]],
+) -> str:
+    """Build UTF-8 OCR export text from ``(page, path_label, english)`` tuples.
+
+    Format per page::
+
+        ===PAGE 001===
+        path: relative/or/basename.jpg
+
+        english text...
+
+    Pages are separated by a blank line. Text uses ``\\n`` newlines.
+    """
+    chunks: List[str] = []
+    for page, path_label, text in pages:
+        marker = format_page_marker(page)
+        body = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        path_line = f"path: {(path_label or '').strip()}"
+        block = f"{marker}\n{path_line}\n\n"
+        if body:
+            block += body + "\n"
+        chunks.append(block)
+    if not chunks:
+        return ""
+    return "\n".join(chunks)
+
+
+def parse_ocr_export_text(content: str) -> List[OcrPageBlock]:
+    """Parse ``===PAGE NNN===`` blocks; mapping key is the page index.
+
+    Accepts optional ``path:`` line immediately after the marker.
+    Body is everything after the path line (or after marker if no path line)
+    until the next marker. Blank lines around body are trimmed.
+    """
+    raw = (content or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not raw.strip():
+        return []
+    matches = list(PAGE_MARKER_RE.finditer(raw))
+    if not matches:
+        raise ValueError(
+            "未找到 ===PAGE NNN=== 标记。请使用导出的 OCR 文本格式（保留页标记）。"
+        )
+    blocks: List[OcrPageBlock] = []
+    seen: set = set()
+    for i, m in enumerate(matches):
+        page = int(m.group(1))
+        if page in seen:
+            raise ValueError(f"重复的页标记：===PAGE {page:03d}===")
+        seen.add(page)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        section = raw[start:end]
+        if section.startswith("\n"):
+            section = section[1:]
+        path_label = ""
+        lines = section.split("\n")
+        idx = 0
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx < len(lines) and lines[idx].lower().startswith("path:"):
+            path_label = lines[idx].split(":", 1)[1].strip()
+            body = "\n".join(lines[idx + 1 :])
+        else:
+            body = section
+        text = body.strip("\n")
+        if text.startswith("\n"):
+            text = text[1:]
+        text = text.strip("\n")
+        blocks.append(OcrPageBlock(page=page, path=path_label, text=text))
+    blocks.sort(key=lambda b: b.page)
+    return blocks
+
+
+def ocr_image_to_english(
+    path: Path,
+    *,
+    min_confidence: float = 0.3,
+    merge_nearby: bool = False,
+    engine: Optional[str] = None,
+) -> str:
+    """OCR one image and join all English into one reading-order paragraph."""
+    boxes = ocr_image(path, min_confidence=min_confidence, engine=engine)
+    return join_english_paragraph(boxes, merge_nearby=merge_nearby)
+
+
+def export_ocr_text_for_paths(
+    paths: Sequence[Path],
+    *,
+    root: Optional[Path] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_check: Optional[CancelCheck] = None,
+    min_confidence: float = 0.3,
+    merge_nearby: bool = False,
+) -> Tuple[str, List[Path], List[str]]:
+    """OCR listed images in order → one UTF-8 export string.
+
+    Returns ``(text, image_paths, warnings)``. Page indices are 1-based in
+    image-list order (PDF/GIF skipped). ``cancel_check`` returning True aborts
+    with :class:`CancelledError`.
+    """
+    image_paths, skipped_pdfs, warnings = filter_paths_for_ocr(paths)
+    if skipped_pdfs:
+        warnings.append(
+            f"OCR 导出跳过 {len(skipped_pdfs)} 个 PDF（仅处理图片）。"
+        )
+    pages: List[Tuple[int, str, str]] = []
+    n = len(image_paths)
+    for i, src in enumerate(image_paths, start=1):
+        if cancel_check is not None and cancel_check():
+            raise CancelledError("已取消 OCR 导出")
+        if progress_callback is not None:
+            progress_callback(i, n, f"OCR {src.name}")
+        label = page_path_label(src, root=root)
+        try:
+            english = ocr_image_to_english(
+                src, min_confidence=min_confidence, merge_nearby=merge_nearby
+            )
+        except CancelledError:
+            raise
+        except Exception as e:
+            warnings.append(f"{src.name}: {e}")
+            logger.exception("OCR failed for %s", src)
+            english = ""
+        pages.append((i, label, english))
+    return build_ocr_export_text(pages), image_paths, warnings
+
+
+def render_image_with_caption(
+    src: Path,
+    caption: str,
+    *,
+    dst: Optional[Path] = None,
+    font_path: Optional[Path] = None,
+) -> Path:
+    """Append Chinese (or other) caption band below ``src`` → translated_zh/."""
+    src = Path(src)
+    if not src.is_file():
+        raise FileNotFoundError(src)
+    out = Path(dst) if dst is not None else translated_output_path(src)
+    if out.resolve() == src.resolve():
+        out = (
+            src.parent
+            / TRANSLATED_SUBDIR
+            / f"{src.stem}_zh_out{src.suffix.lower()}"
+        )
+    with Image.open(src) as im:
+        im.load()
+        original = im.convert("RGB")
+        canvas = append_caption_band(
+            original, caption or "", font_path=font_path
+        )
+        out.parent.mkdir(parents=True, exist_ok=True)
+        suf = out.suffix.lower()
+        save_kw: dict = {}
+        fmt = None
+        if suf in (".jpg", ".jpeg"):
+            fmt = "JPEG"
+            save_kw["quality"] = 95
+            if canvas.mode != "RGB":
+                canvas = canvas.convert("RGB")
+        elif suf == ".png":
+            fmt = "PNG"
+        elif suf == ".webp":
+            fmt = "WEBP"
+            save_kw["quality"] = 95
+        elif suf in (".tif", ".tiff"):
+            fmt = "TIFF"
+        elif suf == ".bmp":
+            fmt = "BMP"
+        canvas.save(out, format=fmt, **save_kw)
+    return out
+
+
+def apply_translated_captions(
+    paths: Sequence[Path],
+    blocks: Sequence[OcrPageBlock],
+    *,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_check: Optional[CancelCheck] = None,
+    font_path: Optional[Path] = None,
+) -> Tuple[List[Path], List[str]]:
+    """Map ``===PAGE N===`` by page index onto filtered image list; write captions.
+
+    Page ``N`` (1-based) maps to the N-th OCR-eligible image in ``paths`` order.
+    Returns ``(output_paths, warnings)``.
+    """
+    image_paths, skipped_pdfs, warnings = filter_paths_for_ocr(paths)
+    if skipped_pdfs:
+        warnings.append(
+            f"导入译文跳过 {len(skipped_pdfs)} 个 PDF（仅处理图片）。"
+        )
+    by_page = {b.page: b for b in blocks}
+    if not by_page:
+        warnings.append("译文文件没有有效页块。")
+        return [], warnings
+    max_page = max(by_page)
+    if max_page > len(image_paths):
+        warnings.append(
+            f"译文最多到 PAGE {max_page:03d}，但列表仅有 {len(image_paths)} 张可处理图片；"
+            "超出部分将忽略。"
+        )
+    missing = [p for p in range(1, len(image_paths) + 1) if p not in by_page]
+    if missing:
+        preview = ", ".join(f"{n:03d}" for n in missing[:8])
+        more = f" 等{len(missing)}页" if len(missing) > 8 else ""
+        warnings.append(f"缺少页标记：{preview}{more}（对应图片将跳过）。")
+
+    outputs: List[Path] = []
+    n = len(image_paths)
+    for i, src in enumerate(image_paths, start=1):
+        if cancel_check is not None and cancel_check():
+            raise CancelledError("已取消导入译文")
+        block = by_page.get(i)
+        if block is None:
+            continue
+        caption = (block.text or "").strip()
+        if progress_callback is not None:
+            progress_callback(i, n, f"写译文条 {src.name}")
+        try:
+            out = render_image_with_caption(
+                src, caption, font_path=font_path
+            )
+            outputs.append(out)
+        except CancelledError:
+            raise
+        except Exception as e:
+            warnings.append(f"{src.name}: {e}")
+            logger.exception("Caption render failed for %s", src)
+    return outputs, warnings
+
 
 
 # ---------------------------------------------------------------------------
