@@ -861,6 +861,74 @@ def test_build_and_parse_ocr_export_roundtrip():
     assert blocks[2].text == ""
 
 
+
+
+def test_translate_ocr_export_text_preserves_keys(monkeypatch):
+    """Local TXT translate keeps ===PAGE NNN=== / path; empty pages skip MT."""
+    pages = [
+        (1, "a/foo.jpg", "Hello world"),
+        (2, "bar.png", ""),
+        (3, "baz.webp", "Second page"),
+    ]
+    en = tl.build_ocr_export_text(pages)
+    calls = []
+
+    def fake_tr(text, cancel_check=None):
+        calls.append(text)
+        return f"ZH:{text}"
+
+    monkeypatch.setattr(tl, "translate_en_to_zh", fake_tr)
+    zh_text, zh_blocks, warnings = tl.translate_ocr_export_text(en)
+    assert warnings == []
+    assert [b.page for b in zh_blocks] == [1, 2, 3]
+    assert zh_blocks[0].path == "a/foo.jpg"
+    assert zh_blocks[0].text == "ZH:Hello world"
+    assert zh_blocks[1].text == ""
+    assert zh_blocks[2].text == "ZH:Second page"
+    assert calls == ["Hello world", "Second page"]  # empty skipped
+    assert "===PAGE 001===" in zh_text
+    assert "path: a/foo.jpg" in zh_text
+    assert "===PAGE 002===" in zh_text
+    assert "===PAGE 003===" in zh_text
+    # Round-trip parse of ZH output
+    again = tl.parse_ocr_export_text(zh_text)
+    assert [b.text for b in again] == ["ZH:Hello world", "", "ZH:Second page"]
+
+
+def test_translate_ocr_export_file_and_cancel(tmp_path: Path, monkeypatch):
+    src = tmp_path / "ocr_en.txt"
+    dst = tmp_path / "ocr_zh.txt"
+    src.write_text(
+        tl.build_ocr_export_text([(1, "x.jpg", "One"), (2, "y.jpg", "Two")]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        tl, "translate_en_to_zh", lambda text, cancel_check=None: f"ZH:{text}"
+    )
+    out, blocks, warnings = tl.translate_ocr_export_file(src, dst)
+    assert out == dst
+    assert dst.is_file()
+    assert [b.text for b in blocks] == ["ZH:One", "ZH:Two"]
+    parsed = tl.parse_ocr_export_text(dst.read_text(encoding="utf-8"))
+    assert parsed[0].page == 1 and parsed[0].path == "x.jpg"
+
+    # cancel mid-way
+    n = {"i": 0}
+
+    def cancel_after_one():
+        n["i"] += 1
+        return n["i"] > 1
+
+    monkeypatch.setattr(
+        tl, "translate_en_to_zh", lambda text, cancel_check=None: text
+    )
+    with pytest.raises(tl.CancelledError):
+        tl.translate_ocr_export_text(
+            src.read_text(encoding="utf-8"),
+            cancel_check=cancel_after_one,
+        )
+
+
 def test_parse_ocr_export_maps_by_page_index_not_path_order():
     # Out-of-order markers still sort by page index
     raw = (

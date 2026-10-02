@@ -16,7 +16,8 @@ Offline-first translation for screenshot / comic panels:
     Does NOT paint over original text boxes (overlay helpers remain for tests
     only and are not used by the default pipeline).
   - OCR text export/import: UTF-8 .txt with machine-stable
-    ``===PAGE NNN===`` keys for external translation workflows.
+    ``===PAGE NNN===`` keys for external or in-app Ollama translation
+    (``translate_ocr_export_text`` / ``translate_ocr_export_file``).
 
 Heavy deps are optional at import time so unit tests for helpers can run
 without paddle / torch / argos / a running Ollama server.
@@ -1777,6 +1778,90 @@ def apply_translated_captions(
             logger.exception("Caption render failed for %s", src)
     return outputs, warnings
 
+
+
+
+def translate_ocr_page_blocks(
+    blocks: Sequence[OcrPageBlock],
+    *,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_check: Optional[CancelCheck] = None,
+) -> Tuple[List[OcrPageBlock], List[str]]:
+    """Translate each page block EN→ZH; preserve page index and path label.
+
+    Empty page bodies stay empty (no MT call). Returns ``(zh_blocks, warnings)``.
+    """
+    warnings: List[str] = []
+    out: List[OcrPageBlock] = []
+    n = len(blocks)
+    for i, block in enumerate(blocks, start=1):
+        if cancel_check is not None and cancel_check():
+            raise CancelledError("已取消 OCR 文本翻译")
+        page = int(block.page)
+        path_label = block.path or ""
+        english = block.text or ""
+        if progress_callback is not None:
+            progress_callback(i, n, f"翻译 PAGE {page:03d}")
+        if not english.strip():
+            out.append(OcrPageBlock(page=page, path=path_label, text=""))
+            continue
+        try:
+            zh = translate_en_to_zh(english, cancel_check=cancel_check)
+        except CancelledError:
+            raise
+        except Exception as e:
+            warnings.append(f"PAGE {page:03d}: {e}")
+            logger.exception("OCR TXT translate failed for page %s", page)
+            zh = english
+        out.append(OcrPageBlock(page=page, path=path_label, text=zh or ""))
+    return out, warnings
+
+
+def translate_ocr_export_text(
+    content: str,
+    *,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_check: Optional[CancelCheck] = None,
+) -> Tuple[str, List[OcrPageBlock], List[str]]:
+    """Parse keyed EN OCR TXT → translate page-by-page → rebuild same key format.
+
+    Page markers (``===PAGE NNN===``), order, and ``path:`` lines are preserved
+    exactly via :func:`build_ocr_export_text`. Returns
+    ``(zh_text, zh_blocks, warnings)``.
+    """
+    blocks = parse_ocr_export_text(content)
+    if not blocks:
+        return "", [], ["输入文件没有有效页块。"]
+    zh_blocks, warnings = translate_ocr_page_blocks(
+        blocks,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+    )
+    pages = [(b.page, b.path, b.text) for b in zh_blocks]
+    return build_ocr_export_text(pages), zh_blocks, warnings
+
+
+def translate_ocr_export_file(
+    src: Path,
+    dst: Path,
+    *,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_check: Optional[CancelCheck] = None,
+) -> Tuple[Path, List[OcrPageBlock], List[str]]:
+    """Read UTF-8 EN OCR export, translate, write UTF-8 ZH TXT for import."""
+    src = Path(src)
+    dst = Path(dst)
+    if not src.is_file():
+        raise FileNotFoundError(src)
+    content = src.read_text(encoding="utf-8")
+    zh_text, zh_blocks, warnings = translate_ocr_export_text(
+        content,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+    )
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(zh_text, encoding="utf-8")
+    return dst, zh_blocks, warnings
 
 
 # ---------------------------------------------------------------------------

@@ -980,6 +980,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._translate_export_btn: Optional[ttk.Button] = None
         self._ocr_export_btn: Optional[ttk.Button] = None
         self._ocr_import_btn: Optional[ttk.Button] = None
+        self._ocr_translate_btn: Optional[ttk.Button] = None
+        self._last_ocr_en_txt: Optional[Path] = None
         self.output_dir: Path = ensure_default_output_dir()
         self.direct_export_var: Optional[tk.BooleanVar] = None
         self.translate_then_export_var: Optional[tk.BooleanVar] = None
@@ -1443,6 +1445,12 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             command=self.export_ocr_english_txt,
         )
         self._ocr_export_btn.pack(side=tk.LEFT, padx=4, pady=2)
+        self._ocr_translate_btn = ttk.Button(
+            export_fr,
+            text="本地翻译OCR文本",
+            command=self.translate_ocr_english_txt,
+        )
+        self._ocr_translate_btn.pack(side=tk.LEFT, padx=4, pady=2)
         self._ocr_import_btn = ttk.Button(
             export_fr,
             text="导入译文并生成图/PDF",
@@ -1464,7 +1472,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             hint,
             text="多页 PDF：列表顺序 = 页序。图片各占一页（JPEG 尽量原样嵌入）；"
             "PDF 直接合并页。翻译后写入 translated_zh/（不覆盖原图），跳过 PDF/GIF。"
-            "也可「导出英文OCR文本」→ 外部翻译 →「导入译文并生成图/PDF」（===PAGE NNN===）。",
+            "也可「导出英文OCR文本」→「本地翻译OCR文本」（或外部翻译）→「导入译文并生成图/PDF」（===PAGE NNN===）。",
             style="Hint.TLabel",
             wraplength=980,
             justify=tk.LEFT,
@@ -2604,17 +2612,176 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             else:
                 def done() -> None:
                     self._set_exporting(False)
+                    self._last_ocr_en_txt = out_path
                     self._set_status(f"OCR 文本已保存：{out_path} — {note}")
                     messagebox.showinfo(
                         "完成",
                         f"已导出英文 OCR 文本：\n{out_path}\n\n{note}\n\n"
-                        "请保留 ===PAGE NNN=== 与 path: 行，将英文译为中文后"
-                        "使用「导入译文并生成图/PDF」。",
+                        "可点「本地翻译OCR文本」用 Ollama 翻成中文 TXT，"
+                        "或自行翻译后使用「导入译文并生成图/PDF」。"
+                        "请保留 ===PAGE NNN=== 与 path: 行。",
                     )
 
                 self._post_ui(done)
 
         threading.Thread(target=worker, daemon=True, name="ocr-export-txt").start()
+
+    def translate_ocr_english_txt(self) -> None:
+        """Pick EN OCR TXT (===PAGE NNN===) → Ollama EN→ZH → save ZH TXT for import."""
+        if self._exporting:
+            return
+        try:
+            tl = _ensure_translate_local()
+        except ImportError:
+            messagebox.showerror(
+                "缺少模块",
+                "未找到 translate_local.py。请确认项目文件完整。",
+            )
+            return
+
+        initial = self._export_initial_dir()
+        if self._last_ocr_en_txt is not None and self._last_ocr_en_txt.is_file():
+            use_last = messagebox.askyesno(
+                "本地翻译 OCR 文本",
+                f"使用最近导出的英文 OCR 文本？\n{self._last_ocr_en_txt}\n\n"
+                "选「否」可重新选择文件。",
+            )
+            if use_last:
+                src_path = self._last_ocr_en_txt
+            else:
+                src = filedialog.askopenfilename(
+                    title="选择英文 OCR 文本（含 ===PAGE NNN===）",
+                    filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+                    initialdir=str(self._last_ocr_en_txt.parent),
+                )
+                if not src:
+                    self._set_status("已取消本地翻译。")
+                    return
+                src_path = Path(src)
+        else:
+            src = filedialog.askopenfilename(
+                title="选择英文 OCR 文本（含 ===PAGE NNN===）",
+                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+                initialdir=initial,
+            )
+            if not src:
+                self._set_status("已取消本地翻译。")
+                return
+            src_path = Path(src)
+
+        try:
+            preview = src_path.read_text(encoding="utf-8")
+            blocks = tl.parse_ocr_export_text(preview)
+        except Exception as e:
+            messagebox.showerror("解析失败", f"无法解析 OCR 文本：\n{e}")
+            self._set_status(f"解析 OCR 文本失败：{e}")
+            return
+        if not blocks:
+            messagebox.showwarning("提示", "文件没有有效页块。")
+            return
+
+        default_name = src_path.stem
+        if default_name.endswith("_ocr_en"):
+            default_name = default_name[: -len("_ocr_en")] + "_ocr_zh"
+        elif default_name.endswith("_en"):
+            default_name = default_name[: -len("_en")] + "_zh"
+        else:
+            default_name = default_name + "_zh"
+        default_name = default_name + ".txt"
+        out = filedialog.asksaveasfilename(
+            title="保存中文 OCR 译文文本",
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            initialfile=default_name,
+            initialdir=str(src_path.parent),
+        )
+        if not out:
+            self._set_status("已取消保存译文。")
+            return
+        out_path = Path(out)
+
+        model_choice = (
+            (self.ollama_model_var.get() or "").strip()
+            if self.ollama_model_var is not None
+            else ""
+        )
+        page_n = len(blocks)
+        self._set_exporting(True)
+        self._status_base = f"本地翻译 OCR 文本：0/{page_n}"
+        self._set_status(self._status_base)
+
+        def worker() -> None:
+            note = ""
+            try:
+                tl = _ensure_translate_local()
+
+                def on_dep(msg: str) -> None:
+                    self._set_status_threadsafe(msg)
+
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                if model_choice:
+                    set_ollama_model_config(model_choice)
+                else:
+                    apply_ollama_model_to_runtime()
+                # TXT→TXT needs MT only (Ollama preferred).
+                tl.ensure_deps(progress_callback=on_dep)
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                _get = getattr(tl, "_get_translator", None)
+                if callable(_get):
+                    _get()
+                backend = getattr(tl, "_mt_backend", None) or "unknown"
+                if getattr(tl, "_translate_fn", None) is None:
+                    raise RuntimeError(
+                        f"翻译器未就绪（backend={backend}）。"
+                        "请确认 Ollama 正在运行（ollama serve）且已 pull 所选模型，"
+                        "或已安装 Argos en→zh 语言包。"
+                    )
+
+                def on_tr(i: int, n: int, msg: str) -> None:
+                    self._set_status_threadsafe(f"本地翻译 {i}/{n}：{msg}")
+
+                dst, zh_blocks, warnings = tl.translate_ocr_export_file(
+                    src_path,
+                    out_path,
+                    progress_callback=on_tr,
+                    cancel_check=self._cancelled,
+                )
+                if self._cancelled():
+                    raise tl.CancelledError("已取消")
+                note_parts = [
+                    f"已写入 {len(zh_blocks)} 页中文 TXT（UTF-8，===PAGE NNN===）：{dst}"
+                ]
+                if warnings:
+                    note_parts.append("；".join(warnings[:5]))
+                note = " · ".join(note_parts)
+            except Exception as e:
+                traceback.print_exc()
+                is_cancel = type(e).__name__ == "CancelledError" or (
+                    self._cancelled()
+                )
+                if is_cancel:
+                    self._post_ui(self._on_export_cancelled, str(e))
+                else:
+                    self._post_ui(self._on_export_error, e)
+            else:
+                def done() -> None:
+                    self._set_exporting(False)
+                    self._last_ocr_en_txt = src_path
+                    self._set_status(note)
+                    messagebox.showinfo(
+                        "完成",
+                        f"{note}\n\n"
+                        "下一步：点「导入译文并生成图/PDF」选择该中文 TXT"
+                        "（列表顺序须与导出时一致）。",
+                    )
+
+                self._post_ui(done)
+
+        threading.Thread(
+            target=worker, daemon=True, name="ocr-translate-txt"
+        ).start()
 
     def import_translated_txt(self) -> None:
         """Import translated .txt with ===PAGE NNN=== → caption images; optional PDF."""
@@ -2990,6 +3157,8 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             self._ocr_export_btn.configure(state=state)
         if self._ocr_import_btn is not None:
             self._ocr_import_btn.configure(state=state)
+        if self._ocr_translate_btn is not None:
+            self._ocr_translate_btn.configure(state=state)
         if self._cancel_btn is not None:
             self._cancel_btn.configure(
                 state=tk.NORMAL if running else tk.DISABLED

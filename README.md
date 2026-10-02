@@ -19,7 +19,7 @@
 - **创建桌面快捷方式**（Windows `.lnk`：`pythonw.exe` + `main.py`，工作目录=项目目录）
 - 导出在**后台线程**进行，界面可继续操作；状态栏显示进度（如 `3/98`）；导出中禁用「生成 PDF」按钮
 - **本地翻译后导出**：勾选或点「本地翻译后导出」→ 对列表中的图片做 **EN→ZH**（PaddleOCR（默认）/ EasyOCR 回退 + Ollama / Argos）。每张图：OCR 阅读顺序后把**全部英文拼成一段**，**只翻译一次**，在原图**下方追加**那一条中文译文条带（自动换行、CJK 字体）；写入 `translated_zh/*_zh`（**不覆盖原图**），再导出多页 PDF（跳过 PDF / GIF）。界面提供 **Ollama 模型下拉框**（`ollama list`），选择写入 `config.json` 的 `ollama_model`。
-- **OCR 文本导出 / 译文导入**：点「导出英文OCR文本」对列表图片做 OCR，生成带机器稳定键 `===PAGE NNN===` 的 UTF-8 `.txt`（含 `path:` 行）；外部译成中文后点「导入译文并生成图/PDF」，按页序号映射回列表，在原图下方追加中文译文条写入 `translated_zh/`，可选再导出 PDF。Ollama 本地翻译路径保持不变。
+- **OCR 文本导出 / 本地翻译 / 译文导入**：点「导出英文OCR文本」对列表图片做 OCR，生成带机器稳定键 `===PAGE NNN===` 的 UTF-8 `.txt`（含 `path:` 行）；可点「本地翻译OCR文本」（Ollama 按页）或外部译成中文后点「导入译文并生成图/PDF」，按页序号映射回列表，在原图下方追加中文译文条写入 `translated_zh/`，可选再导出 PDF。Ollama 本地翻译路径保持不变。
 - 底部状态栏提示进度与结果
 
 ## 环境要求
@@ -113,9 +113,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\create_desktop_shortcut.ps
 
 
 
-### 导出英文 OCR / 导入译文
+### 导出英文 OCR / 本地翻译 / 导入译文
 
-适合用外部翻译（人工、其它 MT）而仍要 `translated_zh/` 图或 PDF 的流程：
+适合用本地 Ollama 或外部翻译（人工、其它 MT）而仍要 `translated_zh/` 图或 PDF 的流程：
 
 1. 列表顺序与最终页序一致后，点 **「导出英文OCR文本」**，保存 UTF-8 `.txt`
 2. 文本格式（请保留标记；只改英文正文为中文）：
@@ -132,8 +132,9 @@ path: another.png
 more english...
 ```
 
-3. 将每页正文译为中文后，点 **「导入译文并生成图/PDF」** 选择该文件
-4. 按 `===PAGE NNN===` 的页序号映射到当前列表中第 N 张可处理图片，写入 `translated_zh/`；可选择是否再导出多页 PDF
+3. 可选：点 **「本地翻译OCR文本」**（使用当前 Ollama 模型，按页翻译并保留 ===PAGE NNN=== 键）保存中文 TXT；也可外部翻译。
+4. 点 **「导入译文并生成图/PDF」** 选择中文 TXT
+5. 按 `===PAGE NNN===` 的页序号映射到当前列表中第 N 张可处理图片，写入 `translated_zh/`；可选择是否再导出多页 PDF
 
 映射键是**页序号**（不是文件名）。导出与导入时列表顺序须一致。
 
