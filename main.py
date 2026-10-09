@@ -1004,6 +1004,26 @@ def set_video_cookies_browser_config(value: Optional[str]) -> str:
     return norm
 
 
+def get_video_cookies_file_config() -> Optional[str]:
+    """Return persisted ``video_cookies_file`` (cookies.txt path for ``--cookies``) or None."""
+    raw = load_config().get("video_cookies_file")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def set_video_cookies_file_config(path: Optional[Union[str, Path]]) -> Optional[str]:
+    """Persist ``video_cookies_file``; empty / None removes it. Returns the stored value."""
+    val = str(Path(str(path).strip()).expanduser()) if path and str(path).strip() else None
+    data = load_config()
+    if val:
+        data["video_cookies_file"] = val
+    else:
+        data.pop("video_cookies_file", None)
+    save_config(data)
+    return val
+
+
 def get_video_no_playlist_config() -> bool:
     """Return persisted ``video_no_playlist`` (default True)."""
     raw = load_config().get("video_no_playlist")
@@ -1071,11 +1091,15 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         self.out_dir_var = tk.StringVar(value=str(get_video_download_dir_config()))
         self.no_playlist_var = tk.BooleanVar(value=get_video_no_playlist_config())
         self.cookies_var = tk.StringVar(value=get_video_cookies_browser_config())
+        self.cookies_file_var = tk.StringVar(value=get_video_cookies_file_config() or "")
+        self.cookies_hint_var = tk.StringVar(value="")
+        self._cookies_combo = None
         self.tool_var = tk.StringVar(value="正在检测 yt-dlp / ffmpeg…")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="")
 
         self._build()
+        self._update_cookies_hint()
         self._prefill_from_clipboard()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_job = self.after(self.POLL_MS, self._poll_events)
@@ -1128,10 +1152,24 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
             state="readonly",
         )
         combo.pack(side=tk.LEFT)
+        self._cookies_combo = combo
         combo.bind(
             "<<ComboboxSelected>>",
             lambda e: set_video_cookies_browser_config(self.cookies_var.get()),
         )
+        rowc = ttk.Frame(opt_fr, style="Card.TFrame")
+        rowc.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(rowc, text="Cookies 文件：", style="Card.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(rowc, textvariable=self.cookies_file_var, state="readonly").pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        )
+        ttk.Button(rowc, text="选择…", command=self._choose_cookies_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(rowc, text="清除", command=self._clear_cookies_file).pack(side=tk.LEFT, padx=2)
+        rowh = ttk.Frame(opt_fr, style="Card.TFrame")
+        rowh.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(
+            rowh, textvariable=self.cookies_hint_var, style="Muted.TLabel", wraplength=760, justify=tk.LEFT
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
         row3 = ttk.Frame(opt_fr, style="Card.TFrame")
         row3.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(row3, textvariable=self.tool_var, style="Muted.TLabel").pack(
@@ -1242,6 +1280,46 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         out = set_video_download_dir_config(chosen)
         self.out_dir_var.set(str(out))
 
+    def _update_cookies_hint(self) -> None:
+        has_file = bool((self.cookies_file_var.get() or "").strip())
+        if has_file:
+            self.cookies_hint_var.set(
+                "已选 Cookies 文件（--cookies），优先于「浏览器 Cookies」（不会同时使用）；"
+                "下载前自动整理为标准 Netscape 格式的临时副本。"
+            )
+        else:
+            self.cookies_hint_var.set(
+                "需要登录才能看的视频（如部分 X/Twitter 推文）：选浏览器扩展导出的 cookies.txt，"
+                "或选「浏览器 Cookies」（Chrome/Edge 需先完全关闭浏览器）。"
+            )
+        if self._cookies_combo is not None:
+            try:
+                self._cookies_combo.configure(state="disabled" if has_file else "readonly")
+            except tk.TclError:
+                pass
+
+    def _choose_cookies_file(self) -> None:
+        cur = (self.cookies_file_var.get() or "").strip()
+        init = Path(cur).parent if cur else self._vd.default_download_dir()
+        chosen = filedialog.askopenfilename(
+            title="选择 Cookies 文件（Netscape 格式 cookies.txt）",
+            initialdir=str(init) if init.is_dir() else str(Path.home()),
+            filetypes=[("Cookies 文件", "*.txt"), ("所有文件", "*.*")],
+            parent=self,
+        )
+        if not chosen:
+            return
+        val = set_video_cookies_file_config(chosen)
+        self.cookies_file_var.set(val or "")
+        self._update_cookies_hint()
+        self._log(f"Cookies 文件：{val}（将优先于浏览器 Cookies）")
+
+    def _clear_cookies_file(self) -> None:
+        set_video_cookies_file_config(None)
+        self.cookies_file_var.set("")
+        self._update_cookies_hint()
+        self._log("已清除 Cookies 文件。")
+
     def _open_dir(self) -> None:
         d = self._current_out_dir()
         try:
@@ -1349,6 +1427,14 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         set_video_download_dir_config(out_dir)
         set_video_no_playlist_config(bool(self.no_playlist_var.get()))
         cookies = set_video_cookies_browser_config(self.cookies_var.get())
+        cookies_file = (self.cookies_file_var.get() or "").strip() or None
+        if cookies_file and not Path(cookies_file).is_file():
+            messagebox.showerror(
+                "找不到 Cookies 文件",
+                f"Cookies 文件不存在：\n{cookies_file}\n\n请重新「选择…」或「清除」。",
+                parent=self,
+            )
+            return
 
         self._runner = vd.DownloadRunner(
             self._ytdlp_base,
@@ -1357,6 +1443,7 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
             no_playlist=bool(self.no_playlist_var.get()),
             cookies_browser=cookies,
             ffmpeg_location=vd.ffmpeg_location_arg(self._ffmpeg),
+            cookies_file=cookies_file,
             on_event=self._emit,
         )
         self._last_file = None

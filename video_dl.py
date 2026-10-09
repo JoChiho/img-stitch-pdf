@@ -4,7 +4,7 @@
 等价命令::
 
     yt-dlp -f "bv*+ba/b" -P "%USERPROFILE%\\Downloads" --newline [--no-playlist]
-           [--cookies-from-browser X] "<URL>"
+           [--cookies-from-browser X | --cookies <规范化副本>] "<URL>"
 
 GUI（main.py 的「下载视频」对话框）只通过 :class:`DownloadRunner` 的事件
 回调（放入 queue，由 Tk 主线程 ``after()`` 轮询）获取进度，后台线程绝不触碰 Tk。
@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -28,6 +29,20 @@ COOKIE_BROWSER_NONE = "无"
 COOKIE_BROWSERS = (COOKIE_BROWSER_NONE, "chrome", "edge", "firefox")
 FFMPEG_INSTALL_HINT = "winget install Gyan.FFmpeg"
 YTDLP_PIP_PACKAGE = "yt-dlp"
+NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
+HTTPONLY_PREFIX = "#HttpOnly_"
+COOKIES_NEED_LOGIN_TIP = (
+    "提示：这条推文/视频可能需要登录才能看到。请在「Cookies 文件」点「选择…」，"
+    "选用浏览器扩展导出的 cookies.txt（Netscape 格式）后重试。"
+)
+CHROME_COOKIE_DB_TIP = (
+    "提示：无法复制 Chrome/Edge 的 Cookie 数据库（浏览器运行中会锁定该文件）。"
+    "请完全关闭浏览器（含后台进程）后重试，或改用「Cookies 文件」（浏览器扩展导出 cookies.txt）。"
+)
+BROWSER_DECRYPT_TIP = (
+    "提示：无法解密浏览器 Cookies（新版 Chrome/Edge 常见）。建议改用「Cookies 文件」"
+    "（浏览器扩展导出 cookies.txt）。"
+)
 
 _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 _PROGRESS_RE = re.compile(
@@ -178,6 +193,124 @@ def ffmpeg_location_arg(ffmpeg_path: Optional[str], which=shutil.which) -> Optio
     return str(Path(ffmpeg_path).parent)
 
 
+# ---------------------------------------------------------------- cookies.txt
+
+
+class CookiesFileError(Exception):
+    """Cookies 文件不可读 / 无有效条目（消息为中文，不含 cookie 值）。"""
+
+
+def _decode_cookies_bytes(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
+def normalize_cookies_text(text: str) -> Tuple[str, int]:
+    """Normalize a (browser-extension exported) cookies.txt to strict Netscape format.
+
+    Python's ``http.cookiejar.MozillaCookieJar`` (used by yt-dlp) asserts that the
+    2nd field (include-subdomains flag) equals ``domain.startswith('.')`` and
+    rejects the whole file otherwise (``invalid Netscape format cookies file``).
+
+    - writes the ``# Netscape HTTP Cookie File`` header
+    - keeps only 7-field tab-separated lines (``#HttpOnly_`` lines kept; the domain
+      after the prefix decides the flag); other comments / junk are dropped
+    - field 2 → ``TRUE`` iff the domain starts with ``.``, else ``FALSE``
+    - secure flag upper-cased; expiry coerced to an integer (empty/invalid → 0)
+    - BOM (utf-8-sig) and CRLF handled; output uses ``\n``
+
+    Returns ``(text, kept_count)``. Cookie values are copied verbatim, never logged.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    out = [NETSCAPE_HEADER, ""]
+    kept = 0
+    for line in text.splitlines():
+        line = line.rstrip("\r\n")
+        if not line.strip():
+            continue
+        prefix = ""
+        body = line
+        if body.startswith(HTTPONLY_PREFIX):
+            prefix, body = HTTPONLY_PREFIX, body[len(HTTPONLY_PREFIX):]
+        elif body.lstrip().startswith("#"):
+            continue
+        fields = body.split("\t")
+        if len(fields) != 7:
+            continue
+        domain, _flag, path, secure, expires, name, value = fields
+        domain = domain.strip()
+        if not domain:
+            continue
+        flag = "TRUE" if domain.startswith(".") else "FALSE"
+        secure = "TRUE" if secure.strip().upper() == "TRUE" else "FALSE"
+        exp = expires.strip()
+        try:
+            exp = str(max(0, int(float(exp)))) if exp else "0"
+        except (ValueError, OverflowError):
+            exp = "0"
+        path = path.strip() or "/"
+        out.append("\t".join([prefix + domain, flag, path, secure, exp, name, value]))
+        kept += 1
+    return "\n".join(out) + "\n", kept
+
+
+def write_normalized_cookies(src, dest_dir=None) -> Tuple[Path, int]:
+    """Write a normalized temp copy of cookies file *src*; returns ``(tmp_path, kept)``.
+
+    The copy goes to *dest_dir* (default: ``%TEMP%``); the caller deletes it after
+    the run (yt-dlp also writes cookies back to it, so the user's file stays untouched).
+    """
+    p = Path(src)
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        raise CookiesFileError(f"无法读取 Cookies 文件：{p}（{e.strerror or e}）") from None
+    text, kept = normalize_cookies_text(_decode_cookies_bytes(data))
+    if kept == 0:
+        raise CookiesFileError(
+            f"Cookies 文件里没有有效条目：{p}\n需要 Netscape 格式（每行 7 列、Tab 分隔，浏览器扩展导出的 cookies.txt）。"
+        )
+    try:
+        if dest_dir is not None:
+            Path(dest_dir).mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix="img-stitch-pdf_cookies_", suffix=".txt",
+            dir=str(dest_dir) if dest_dir is not None else None,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    except OSError as e:
+        raise CookiesFileError(f"无法写入临时 Cookies 文件：{e}") from None
+    return Path(tmp), kept
+
+
+def remove_file_quietly(path) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+
+
+def output_hint(line: str, *, has_cookies: bool) -> Optional[str]:
+    """Chinese hint for well-known yt-dlp failures in an output *line*, else None."""
+    if not line:
+        return None
+    if "Could not copy Chrome cookie database" in line:
+        return CHROME_COOKIE_DB_TIP
+    if "Failed to decrypt with DPAPI" in line:
+        return BROWSER_DECRYPT_TIP
+    if "No video could be found" in line and not has_cookies:
+        return COOKIES_NEED_LOGIN_TIP
+    return None
+
+
 # ---------------------------------------------------------------- commands
 
 
@@ -190,15 +323,22 @@ def build_command(
     cookies_browser: Optional[str] = None,
     ffmpeg_location: Optional[str] = None,
     fmt: str = DEFAULT_FORMAT,
+    cookies_file=None,
 ) -> List[str]:
-    """Build ``yt-dlp -f bv*+ba/b -P <dir> --newline [--no-playlist] [--cookies-from-browser X] URL``."""
+    """Build ``yt-dlp -f bv*+ba/b -P <dir> --newline [--no-playlist] [cookies] URL``.
+
+    *cookies_file* (``--cookies``) takes priority over *cookies_browser*
+    (``--cookies-from-browser``); the two are never passed together.
+    """
     if not base:
         raise ValueError("yt-dlp command is empty")
     cmd = list(base) + ["-f", fmt, "-P", str(out_dir), "--newline"]
     if no_playlist:
         cmd.append("--no-playlist")
     browser = normalize_cookies_browser(cookies_browser)
-    if browser:
+    if cookies_file:
+        cmd += ["--cookies", str(cookies_file)]
+    elif browser:
         cmd += ["--cookies-from-browser", browser]
     if ffmpeg_location:
         cmd += ["--ffmpeg-location", str(ffmpeg_location)]
@@ -364,6 +504,8 @@ class DownloadRunner:
         no_playlist: bool = True,
         cookies_browser: Optional[str] = None,
         ffmpeg_location: Optional[str] = None,
+        cookies_file=None,
+        cookies_tmp_dir=None,
         on_event: EventCallback,
     ) -> None:
         self.base = list(base)
@@ -372,10 +514,13 @@ class DownloadRunner:
         self.no_playlist = no_playlist
         self.cookies_browser = cookies_browser
         self.ffmpeg_location = ffmpeg_location
+        self.cookies_file = str(cookies_file) if cookies_file else None
+        self.cookies_tmp_dir = cookies_tmp_dir
         self.on_event = on_event
         self._cancel = threading.Event()
         self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
+        self._has_cookies = False
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -396,25 +541,45 @@ class DownloadRunner:
             self.on_event(("log", f"无法创建输出目录：{e}"))
             self.on_event(("finished", 0, n, False))
             return 0, n, False
-        for idx, url in enumerate(self.urls, start=1):
-            if self.cancelled:
-                break
-            cmd = build_command(
-                self.base,
-                url,
-                self.out_dir,
-                no_playlist=self.no_playlist,
-                cookies_browser=self.cookies_browser,
-                ffmpeg_location=self.ffmpeg_location,
+        tmp_cookies: Optional[Path] = None
+        browser = normalize_cookies_browser(self.cookies_browser)
+        if self.cookies_file:
+            try:
+                tmp_cookies, kept = write_normalized_cookies(self.cookies_file, self.cookies_tmp_dir)
+            except CookiesFileError as e:
+                self.on_event(("log", str(e)))
+                self.on_event(("finished", 0, n, False))
+                return 0, n, False
+            self.on_event(
+                ("log", f"Cookies 文件：已整理为标准 Netscape 格式临时副本（{kept} 条），运行结束后自动删除。")
             )
-            self.on_event(("start", idx, n, url))
-            self.on_event(("log", "> " + subprocess.list2cmdline(cmd)))
-            rc = self._run_one(cmd, idx, n)
-            self.on_event(("item_done", idx, n, url, rc))
-            if rc == 0 and not self.cancelled:
-                ok += 1
-            else:
-                failed += 1
+            if browser:
+                self.on_event(("log", "已选择 Cookies 文件，忽略「浏览器 Cookies」设置（两者不同时使用）。"))
+                browser = None
+        self._has_cookies = bool(tmp_cookies or browser)
+        try:
+            for idx, url in enumerate(self.urls, start=1):
+                if self.cancelled:
+                    break
+                cmd = build_command(
+                    self.base,
+                    url,
+                    self.out_dir,
+                    no_playlist=self.no_playlist,
+                    cookies_browser=browser,
+                    ffmpeg_location=self.ffmpeg_location,
+                    cookies_file=tmp_cookies,
+                )
+                self.on_event(("start", idx, n, url))
+                self.on_event(("log", "> " + subprocess.list2cmdline(cmd)))
+                rc = self._run_one(cmd, idx, n)
+                self.on_event(("item_done", idx, n, url, rc))
+                if rc == 0 and not self.cancelled:
+                    ok += 1
+                else:
+                    failed += 1
+        finally:
+            remove_file_quietly(tmp_cookies)
         cancelled = self.cancelled
         if cancelled:
             failed = n - ok  # include URLs never started
@@ -431,6 +596,7 @@ class DownloadRunner:
             self._proc = proc
         if self.cancelled:  # cancel raced with start
             kill_process_tree(proc)
+        hints_shown = set()
         try:
             assert proc.stdout is not None
             for raw in proc.stdout:
@@ -445,6 +611,10 @@ class DownloadRunner:
                 if dest:
                     self.on_event(("file", idx, n, dest))
                 self.on_event(("log", line))
+                hint = output_hint(line, has_cookies=self._has_cookies)
+                if hint and hint not in hints_shown:
+                    hints_shown.add(hint)
+                    self.on_event(("log", hint))
         finally:
             try:
                 rc = proc.wait()

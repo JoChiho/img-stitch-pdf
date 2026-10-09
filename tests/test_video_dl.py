@@ -316,3 +316,184 @@ def test_video_config_roundtrip(tmp_path, monkeypatch):
     data = main.load_config()
     assert data["video_download_dir"] == str(out)
     assert data["video_no_playlist"] is False
+
+
+# ------------------------------------------------------------------ cookies.txt
+
+
+_EXT_COOKIES = (
+    "\ufeff# Exported by a browser extension\r\n"
+    ".x.com\tFALSE\t/\tTRUE\t1790000000\tauth_token\tSECRET1\r\n"
+    "x.com\tTRUE\t/\tfalse\t1790000000.5\tlang\ten\r\n"
+    "#HttpOnly_.x.com\tFALSE\t/\tTRUE\t1790000000\tkdt\tSECRET2\r\n"
+    "#HttpOnly_api.x.com\tTRUE\t/\tTRUE\t\tsess\tSECRET3\r\n"
+    "\r\n"
+    "garbage line without tabs\r\n"
+    "too\tfew\tfields\r\n"
+)
+
+
+def _cookie_rows(text):
+    return [ln.split("\t") for ln in text.splitlines() if "\t" in ln]
+
+
+def test_normalize_cookies_header_and_flags():
+    text, kept = video_dl.normalize_cookies_text(_EXT_COOKIES)
+    assert kept == 4
+    lines = text.splitlines()
+    assert lines[0] == "# Netscape HTTP Cookie File"
+    assert "\r" not in text and "\ufeff" not in text
+    assert "Exported by" not in text and "garbage" not in text
+    rows = _cookie_rows(text)
+    assert [r[0] for r in rows] == [".x.com", "x.com", "#HttpOnly_.x.com", "#HttpOnly_api.x.com"]
+    # FALSE -> TRUE when domain starts with '.', TRUE -> FALSE otherwise
+    assert [r[1] for r in rows] == ["TRUE", "FALSE", "TRUE", "FALSE"]
+    assert [r[3] for r in rows] == ["TRUE", "FALSE", "TRUE", "TRUE"]
+    assert [r[4] for r in rows] == ["1790000000", "1790000000", "1790000000", "0"]
+    assert [r[6] for r in rows] == ["SECRET1", "en", "SECRET2", "SECRET3"]
+
+
+def test_normalize_cookies_loads_in_mozilla_cookiejar(tmp_path):
+    import http.cookiejar
+
+    text, _ = video_dl.normalize_cookies_text(_EXT_COOKIES)
+    f = tmp_path / "c.txt"
+    f.write_text(text, encoding="utf-8")
+    jar = http.cookiejar.MozillaCookieJar(str(f))
+    jar.load(ignore_discard=True, ignore_expires=True)  # raised LoadError before the fix
+    names = sorted(c.name for c in jar)
+    assert names == ["auth_token", "kdt", "lang", "sess"]
+    raw = tmp_path / "raw.txt"
+    raw.write_text(_EXT_COOKIES.replace("\ufeff", ""), encoding="utf-8")
+    with pytest.raises(http.cookiejar.LoadError):
+        http.cookiejar.MozillaCookieJar(str(raw)).load(ignore_discard=True, ignore_expires=True)
+
+
+def test_normalize_cookies_already_valid_is_stable():
+    once, kept = video_dl.normalize_cookies_text(_EXT_COOKIES)
+    twice, kept2 = video_dl.normalize_cookies_text(once)
+    assert once == twice and kept == kept2 == 4
+
+
+def test_write_normalized_cookies_temp_copy(tmp_path):
+    src = tmp_path / "cookies_x.com.txt"
+    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    out, kept = video_dl.write_normalized_cookies(src, tmp_path / "tmp")
+    assert kept == 4 and out.parent == tmp_path / "tmp" and out != src
+    assert out.read_text(encoding="utf-8").startswith("# Netscape HTTP Cookie File\n")
+    assert src.read_bytes() == _EXT_COOKIES.encode("utf-8")  # original untouched
+    video_dl.remove_file_quietly(out)
+    assert not out.exists()
+
+
+def test_write_normalized_cookies_errors_do_not_leak_values(tmp_path):
+    with pytest.raises(video_dl.CookiesFileError):
+        video_dl.write_normalized_cookies(tmp_path / "missing.txt", tmp_path)
+    bad = tmp_path / "bad.txt"
+    bad.write_text("# only comments\nname=SECRETVALUE\n", encoding="utf-8")
+    with pytest.raises(video_dl.CookiesFileError) as ei:
+        video_dl.write_normalized_cookies(bad, tmp_path)
+    assert "SECRETVALUE" not in str(ei.value)
+
+
+def test_build_command_cookies_file_has_priority(tmp_path):
+    cmd = video_dl.build_command(
+        ["yt-dlp"], "https://x.com/s/1", tmp_path, cookies_browser="chrome", cookies_file="C:/t/c.txt"
+    )
+    i = cmd.index("--cookies")
+    assert cmd[i + 1] == "C:/t/c.txt"
+    assert "--cookies-from-browser" not in cmd
+    assert cmd[-1] == "https://x.com/s/1"
+    cmd2 = video_dl.build_command(["yt-dlp"], "https://x.com/s/1", tmp_path, cookies_browser="chrome")
+    assert "--cookies" not in cmd2 and "--cookies-from-browser" in cmd2
+
+
+def test_output_hints():
+    nv = "ERROR: [twitter] 1: No video could be found in this tweet"
+    assert video_dl.output_hint(nv, has_cookies=False) == video_dl.COOKIES_NEED_LOGIN_TIP
+    assert "Cookies 文件" in video_dl.COOKIES_NEED_LOGIN_TIP
+    assert video_dl.output_hint(nv, has_cookies=True) is None
+    chrome = "ERROR: Could not copy Chrome cookie database. See  https://github.com/yt-dlp/yt-dlp/issues/7271"
+    tip = video_dl.output_hint(chrome, has_cookies=True)
+    assert tip == video_dl.CHROME_COOKIE_DB_TIP and "关闭浏览器" in tip and "Cookies 文件" in tip
+    assert video_dl.output_hint("[info] ok", has_cookies=False) is None
+
+
+_COOKIE_ECHO_SCRIPT = (
+    "import sys\n"
+    "args = sys.argv[1:]\n"
+    "if '--cookies' in args:\n"
+    "    p = args[args.index('--cookies') + 1]\n"
+    "    first = open(p, encoding='utf-8').readline().strip()\n"
+    "    print('COOKIES ' + first, flush=True)\n"
+    "    print('BROWSER ' + str('--cookies-from-browser' in args), flush=True)\n"
+    "    sys.exit(0)\n"
+    "print('ERROR: [twitter] 1: No video could be found in this tweet', flush=True)\n"
+    "sys.exit(1)\n"
+)
+
+
+def test_download_runner_uses_normalized_temp_cookies(tmp_path):
+    base = _fake_ytdlp_base(tmp_path, _COOKIE_ECHO_SCRIPT)
+    src = tmp_path / "cookies_x.com.txt"
+    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    tmpdir = tmp_path / "cookie_tmp"
+    events = []
+    runner = video_dl.DownloadRunner(
+        base,
+        ["https://x.com/a/status/1"],
+        tmp_path / "out",
+        cookies_browser="chrome",
+        cookies_file=src,
+        cookies_tmp_dir=tmpdir,
+        on_event=events.append,
+    )
+    assert runner.run() == (1, 0, False)
+    logs = [e[1] for e in events if e[0] == "log"]
+    assert "COOKIES # Netscape HTTP Cookie File" in logs
+    assert "BROWSER False" in logs
+    assert any("忽略「浏览器 Cookies」" in s for s in logs)
+    assert list(tmpdir.iterdir()) == []  # temp copy deleted after run
+    joined = "\n".join(logs)
+    for secret in ("SECRET1", "SECRET2", "SECRET3"):
+        assert secret not in joined
+    assert video_dl.COOKIES_NEED_LOGIN_TIP not in logs
+
+
+def test_download_runner_no_video_hint_without_cookies(tmp_path):
+    base = _fake_ytdlp_base(tmp_path, _COOKIE_ECHO_SCRIPT)
+    events = []
+    runner = video_dl.DownloadRunner(
+        base, ["https://x.com/a/status/1"], tmp_path / "out", on_event=events.append
+    )
+    assert runner.run() == (0, 1, False)
+    logs = [e[1] for e in events if e[0] == "log"]
+    assert logs.count(video_dl.COOKIES_NEED_LOGIN_TIP) == 1
+
+
+def test_download_runner_bad_cookies_file_fails_cleanly(tmp_path):
+    base = _fake_ytdlp_base(tmp_path, _COOKIE_ECHO_SCRIPT)
+    events = []
+    runner = video_dl.DownloadRunner(
+        base,
+        ["https://x.com/a/status/1", "https://x.com/a/status/2"],
+        tmp_path / "out",
+        cookies_file=tmp_path / "nope.txt",
+        on_event=events.append,
+    )
+    assert runner.run() == (0, 2, False)
+    assert not any(e[0] == "start" for e in events)
+    assert events[-1] == ("finished", 0, 2, False)
+
+
+def test_video_cookies_file_config_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "config_dir", lambda: tmp_path / "cfg")
+    assert main.get_video_cookies_file_config() is None
+    f = tmp_path / "cookies.txt"
+    stored = main.set_video_cookies_file_config(f)
+    assert stored == str(f)
+    assert main.get_video_cookies_file_config() == str(f)
+    assert main.load_config()["video_cookies_file"] == str(f)
+    assert main.set_video_cookies_file_config(None) is None
+    assert main.get_video_cookies_file_config() is None
+    assert "video_cookies_file" not in main.load_config()
