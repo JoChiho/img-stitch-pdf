@@ -8,6 +8,8 @@
 
 可选：本地 EN→ZH 图片翻译（EasyOCR + Ollama / Argos），将中文绘制到
 原图目录下新建子文件夹 ``translated_zh/``（不与原图同级混放，便于清理），再走同一套多页 PDF 导出。
+
+另附「下载视频」窗口：粘贴链接 → yt-dlp 下载（逻辑见 ``video_dl.py``）。
 """
 
 from __future__ import annotations
@@ -958,6 +960,518 @@ def apply_ocr_downscale_to_runtime(enabled=None, max_long_side=None):
     return set_ocr_downscale_config(flag, side)
 
 
+# ---------------------------------------------------------------- video download (yt-dlp)
+
+
+def get_video_download_dir_config() -> Path:
+    """Return persisted ``video_download_dir`` (default %USERPROFILE%\\Downloads)."""
+    import video_dl
+
+    raw = load_config().get("video_download_dir")
+    if raw:
+        try:
+            return Path(str(raw)).expanduser()
+        except (TypeError, ValueError):
+            pass
+    return video_dl.default_download_dir()
+
+
+def set_video_download_dir_config(path: Union[str, Path]) -> Path:
+    """Persist ``video_download_dir`` in config.json."""
+    out = Path(path).expanduser().resolve()
+    data = load_config()
+    data["video_download_dir"] = str(out)
+    save_config(data)
+    return out
+
+
+def get_video_cookies_browser_config() -> str:
+    """Return persisted ``video_cookies_browser`` (无/chrome/edge/firefox; default 无)."""
+    import video_dl
+
+    raw = load_config().get("video_cookies_browser")
+    norm = video_dl.normalize_cookies_browser(raw if isinstance(raw, str) else None)
+    return norm or video_dl.COOKIE_BROWSER_NONE
+
+
+def set_video_cookies_browser_config(value: Optional[str]) -> str:
+    import video_dl
+
+    norm = video_dl.normalize_cookies_browser(value) or video_dl.COOKIE_BROWSER_NONE
+    data = load_config()
+    data["video_cookies_browser"] = norm
+    save_config(data)
+    return norm
+
+
+def get_video_no_playlist_config() -> bool:
+    """Return persisted ``video_no_playlist`` (default True)."""
+    raw = load_config().get("video_no_playlist")
+    if raw is None:
+        return True
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(raw)
+
+
+def set_video_no_playlist_config(value: bool) -> bool:
+    flag = bool(value)
+    data = load_config()
+    data["video_no_playlist"] = flag
+    save_config(data)
+    return flag
+
+
+def open_folder_in_explorer(path: Path) -> None:
+    """Open *path* in the OS file browser (Explorer / Finder / xdg-open)."""
+    p = Path(path)
+    if sys.platform == "win32":
+        os.startfile(str(p))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(p)])
+    else:
+        subprocess.Popen(["xdg-open", str(p)])
+
+
+class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: ignore[misc]
+    """「下载视频」窗口：粘贴链接 → yt-dlp 顺序下载。
+
+    后台线程只往 ``self._events`` 放元组；Tk 只在主线程经 ``after()`` 轮询处理
+    （Tk 不可重入，worker 里碰 Tk 会导致闪退）。
+    """
+
+    POLL_MS = 100
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app)
+        import video_dl
+
+        self._vd = video_dl
+        self.app = app
+        self.title("下载视频（yt-dlp）")
+        self.geometry("820x600")
+        self.minsize(640, 460)
+        self.transient(app)
+        try:
+            self.configure(background=app.UI_BG)
+        except tk.TclError:
+            pass
+
+        self._events: "queue.Queue[tuple]" = queue.Queue()
+        self._runner = None
+        self._busy = False  # download / pip in progress
+        self._pip_cancel = threading.Event()
+        self._ytdlp_base: Optional[List[str]] = None
+        self._ffmpeg: Optional[str] = None
+        self._ffmpeg_warned = False
+        self._asked_install = False
+        self._poll_job: Optional[str] = None
+        self._last_file: Optional[str] = None
+
+        self.out_dir_var = tk.StringVar(value=str(get_video_download_dir_config()))
+        self.no_playlist_var = tk.BooleanVar(value=get_video_no_playlist_config())
+        self.cookies_var = tk.StringVar(value=get_video_cookies_browser_config())
+        self.tool_var = tk.StringVar(value="正在检测 yt-dlp / ffmpeg…")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="")
+
+        self._build()
+        self._prefill_from_clipboard()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._poll_job = self.after(self.POLL_MS, self._poll_events)
+        self._probe_tools_async()
+
+    # ------------------------------------------------------------ UI
+    def _build(self) -> None:
+        app = self.app
+        pad = {"padx": 8, "pady": 4}
+        root = ttk.Frame(self)
+        root.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        url_outer, url_fr = app._make_section(root, "视频链接（每行一个，按顺序下载）")
+        url_outer.pack(fill=tk.X, **pad)
+        txt_fr = ttk.Frame(url_fr, style="Card.TFrame")
+        txt_fr.pack(fill=tk.X)
+        self.url_text = tk.Text(txt_fr, height=5, wrap=tk.NONE, undo=True)
+        self.url_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        url_btns = ttk.Frame(txt_fr, style="Card.TFrame")
+        url_btns.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0))
+        ttk.Button(url_btns, text="粘贴", command=self._paste).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(url_btns, text="清空", command=self._clear_urls).pack(fill=tk.X)
+
+        opt_outer, opt_fr = app._make_section(root, "选项")
+        opt_outer.pack(fill=tk.X, **pad)
+        row1 = ttk.Frame(opt_fr, style="Card.TFrame")
+        row1.pack(fill=tk.X)
+        ttk.Label(row1, text="保存到：", style="Card.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(row1, textvariable=self.out_dir_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        )
+        ttk.Button(row1, text="选择文件夹…", command=self._choose_dir).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="打开文件夹", command=self._open_dir).pack(side=tk.LEFT, padx=2)
+        row2 = ttk.Frame(opt_fr, style="Card.TFrame")
+        row2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Checkbutton(
+            row2,
+            text="只下载单个视频（--no-playlist）",
+            variable=self.no_playlist_var,
+            command=lambda: set_video_no_playlist_config(bool(self.no_playlist_var.get())),
+        ).pack(side=tk.LEFT)
+        ttk.Label(row2, text="浏览器 Cookies：", style="Card.TLabel").pack(
+            side=tk.LEFT, padx=(16, 0)
+        )
+        combo = ttk.Combobox(
+            row2,
+            textvariable=self.cookies_var,
+            values=list(self._vd.COOKIE_BROWSERS),
+            width=10,
+            state="readonly",
+        )
+        combo.pack(side=tk.LEFT)
+        combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: set_video_cookies_browser_config(self.cookies_var.get()),
+        )
+        row3 = ttk.Frame(opt_fr, style="Card.TFrame")
+        row3.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(row3, textvariable=self.tool_var, style="Muted.TLabel").pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        self._install_btn = ttk.Button(
+            row3, text="安装 yt-dlp", command=lambda: self._pip_ytdlp(upgrade=False)
+        )
+        self._update_btn = ttk.Button(
+            row3, text="更新 yt-dlp", command=lambda: self._pip_ytdlp(upgrade=True)
+        )
+        self._update_btn.pack(side=tk.RIGHT, padx=2)
+
+        run_outer, run_fr = app._make_section(root, "下载", export=True)
+        run_outer.pack(fill=tk.BOTH, expand=True, **pad)
+        prow = ttk.Frame(run_fr, style="Card.TFrame")
+        prow.pack(fill=tk.X)
+        ttk.Progressbar(
+            prow, variable=self.progress_var, maximum=100.0, mode="determinate"
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(prow, textvariable=self.progress_text_var, style="Card.TLabel", width=46).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        log_fr = ttk.Frame(run_fr, style="Card.TFrame")
+        log_fr.pack(fill=tk.BOTH, expand=True, pady=(6, 4))
+        self.log_text = tk.Text(log_fr, height=10, wrap=tk.WORD, state=tk.DISABLED)
+        log_scroll = ttk.Scrollbar(log_fr, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        brow = ttk.Frame(run_fr, style="Card.TFrame")
+        brow.pack(fill=tk.X)
+        self._download_btn = ttk.Button(
+            brow, text="下载", command=self._start_download
+        )
+        self._download_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._cancel_btn = ttk.Button(
+            brow, text="取消", command=self._cancel, state=tk.DISABLED
+        )
+        self._cancel_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Button(brow, text="关闭", command=self._on_close).pack(side=tk.RIGHT)
+
+    # ------------------------------------------------------------ helpers
+    def _log(self, msg: str) -> None:
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, msg + "\n")
+        # keep the widget light on long downloads
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > 2000:
+            self.log_text.delete("1.0", f"{lines - 2000}.0")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _emit(self, event: tuple) -> None:
+        """Thread-safe: worker threads only enqueue."""
+        self._events.put(event)
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._download_btn.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self._cancel_btn.configure(state=tk.NORMAL if busy else tk.DISABLED)
+        st = tk.DISABLED if busy else tk.NORMAL
+        self._update_btn.configure(state=st)
+        self._install_btn.configure(state=st)
+
+    def _read_clipboard(self) -> str:
+        try:
+            return self.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    def _prefill_from_clipboard(self) -> None:
+        clip = self._read_clipboard()
+        urls = self._vd.split_urls(clip)
+        if urls:
+            self.url_text.insert("1.0", "\n".join(urls) + "\n")
+
+    def _paste(self) -> None:
+        clip = self._read_clipboard()
+        urls = self._vd.split_urls(clip)
+        if not urls:
+            messagebox.showinfo("提示", "剪贴板里没有 http(s) 链接。", parent=self)
+            return
+        existing = self._vd.split_urls(self.url_text.get("1.0", tk.END))
+        new = [u for u in urls if u not in existing]
+        cur = self.url_text.get("1.0", "end-1c")
+        prefix = "\n" if cur.strip() and not cur.endswith("\n") else ""
+        if new:
+            self.url_text.insert(tk.END, prefix + "\n".join(new) + "\n")
+        self.url_text.see(tk.END)
+
+    def _clear_urls(self) -> None:
+        self.url_text.delete("1.0", tk.END)
+
+    def _current_out_dir(self) -> Path:
+        raw = (self.out_dir_var.get() or "").strip()
+        return Path(raw).expanduser() if raw else self._vd.default_download_dir()
+
+    def _choose_dir(self) -> None:
+        cur = self._current_out_dir()
+        chosen = filedialog.askdirectory(
+            title="选择视频保存文件夹",
+            initialdir=str(cur) if cur.is_dir() else str(Path.home()),
+            parent=self,
+        )
+        if not chosen:
+            return
+        out = set_video_download_dir_config(chosen)
+        self.out_dir_var.set(str(out))
+
+    def _open_dir(self) -> None:
+        d = self._current_out_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            open_folder_in_explorer(d)
+        except Exception as e:
+            messagebox.showerror("打开失败", str(e), parent=self)
+
+    # ------------------------------------------------------------ tools
+    def _probe_tools_async(self) -> None:
+        vd = self._vd
+
+        def worker() -> None:
+            try:
+                info = vd.probe_tools()
+            except Exception as e:  # pragma: no cover - defensive
+                info = {"ytdlp": None, "ytdlp_version": None, "ffmpeg": None, "error": str(e)}
+            self._emit(("tools", info))
+
+        threading.Thread(target=worker, daemon=True, name="ytdlp-probe").start()
+
+    def _apply_tools(self, info: dict) -> None:
+        vd = self._vd
+        self._ytdlp_base = info.get("ytdlp")  # type: ignore[assignment]
+        self._ffmpeg = info.get("ffmpeg")  # type: ignore[assignment]
+        if self._ytdlp_base:
+            how = (
+                "PATH"
+                if len(self._ytdlp_base) == 1
+                else "python -m yt_dlp"
+            )
+            ver = info.get("ytdlp_version") or "版本未知"
+            ytxt = f"yt-dlp {ver}（{how}）"
+            self._install_btn.pack_forget()
+        else:
+            ytxt = "未找到 yt-dlp"
+            if not self._install_btn.winfo_manager():
+                self._install_btn.pack(side=tk.RIGHT, padx=2)
+        ftxt = "ffmpeg ✓" if self._ffmpeg else f"ffmpeg 未找到（{vd.FFMPEG_INSTALL_HINT}）"
+        self.tool_var.set(f"{ytxt} · {ftxt}")
+        if not self._ytdlp_base:
+            self._log("未找到 yt-dlp。点「安装 yt-dlp」可一键 pip install yt-dlp。")
+            if not self._busy and not self._asked_install:
+                self._asked_install = True
+                if messagebox.askyesno(
+                    "未找到 yt-dlp",
+                    "没有找到 yt-dlp。\n现在用 pip 安装吗？（pip install yt-dlp）",
+                    parent=self,
+                ):
+                    self._pip_ytdlp(upgrade=False)
+        if not self._ffmpeg:
+            self._log(vd.ffmpeg_missing_message())
+
+    def _pip_ytdlp(self, upgrade: bool) -> None:
+        if self._busy:
+            return
+        vd = self._vd
+        cmd = vd.pip_install_command(upgrade=upgrade)
+        self._set_busy(True)
+        self._pip_cancel.clear()
+        self.progress_text_var.set("正在更新 yt-dlp…" if upgrade else "正在安装 yt-dlp…")
+        self._log("> " + subprocess.list2cmdline(cmd))
+
+        def worker() -> None:
+            try:
+                rc = vd.stream_command(
+                    cmd, lambda line: self._emit(("log", line)), self._pip_cancel
+                )
+            except Exception as e:
+                self._emit(("log", f"pip 失败：{e}"))
+                rc = -1
+            self._emit(("pip_done", rc, upgrade))
+
+        threading.Thread(target=worker, daemon=True, name="ytdlp-pip").start()
+
+    # ------------------------------------------------------------ download
+    def _start_download(self) -> None:
+        if self._busy:
+            return
+        vd = self._vd
+        urls = vd.split_urls(self.url_text.get("1.0", tk.END))
+        if not urls:
+            messagebox.showwarning("提示", "请先粘贴视频链接（http/https，每行一个）。", parent=self)
+            return
+        if not self._ytdlp_base:
+            if messagebox.askyesno(
+                "未找到 yt-dlp", "没有找到 yt-dlp，现在用 pip 安装吗？", parent=self
+            ):
+                self._pip_ytdlp(upgrade=False)
+            return
+        if not self._ffmpeg and not self._ffmpeg_warned:
+            self._ffmpeg_warned = True
+            if not messagebox.askyesno(
+                "未找到 ffmpeg",
+                vd.ffmpeg_missing_message() + "\n\n仍然继续下载吗？",
+                parent=self,
+            ):
+                return
+        out_dir = self._current_out_dir()
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("目录错误", f"无法创建保存目录：{e}", parent=self)
+            return
+        set_video_download_dir_config(out_dir)
+        set_video_no_playlist_config(bool(self.no_playlist_var.get()))
+        cookies = set_video_cookies_browser_config(self.cookies_var.get())
+
+        self._runner = vd.DownloadRunner(
+            self._ytdlp_base,
+            urls,
+            out_dir,
+            no_playlist=bool(self.no_playlist_var.get()),
+            cookies_browser=cookies,
+            ffmpeg_location=vd.ffmpeg_location_arg(self._ffmpeg),
+            on_event=self._emit,
+        )
+        self._last_file = None
+        self.progress_var.set(0.0)
+        self.progress_text_var.set(f"准备下载 {len(urls)} 个链接…")
+        self._set_busy(True)
+        self._log(f"开始下载 {len(urls)} 个链接 → {out_dir}")
+        runner = self._runner
+
+        def worker() -> None:
+            try:
+                runner.run()
+            except Exception as e:
+                self._emit(("log", f"下载出错：{e}"))
+                self._emit(("finished", 0, len(urls), runner.cancelled))
+
+        threading.Thread(target=worker, daemon=True, name="ytdlp-download").start()
+        self.app._set_status(f"视频下载中（{len(urls)} 个链接）…")
+
+    def _cancel(self) -> None:
+        if not self._busy:
+            return
+        self.progress_text_var.set("正在取消…")
+        self._pip_cancel.set()
+        runner = self._runner
+        if runner is not None:
+            # taskkill may block briefly; never block Tk
+            threading.Thread(target=runner.cancel, daemon=True, name="ytdlp-cancel").start()
+
+    # ------------------------------------------------------------ events (main thread)
+    def _poll_events(self) -> None:
+        try:
+            for _ in range(500):
+                ev = self._events.get_nowait()
+                try:
+                    self._handle_event(ev)
+                except Exception:
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        try:
+            self._poll_job = self.after(self.POLL_MS, self._poll_events)
+        except tk.TclError:
+            self._poll_job = None
+
+    def _handle_event(self, ev: tuple) -> None:
+        kind = ev[0]
+        if kind == "log":
+            self._log(str(ev[1]))
+        elif kind == "tools":
+            self._apply_tools(ev[1])
+        elif kind == "start":
+            _, idx, n, url = ev
+            self.progress_var.set(0.0)
+            self.progress_text_var.set(f"[{idx}/{n}] 正在解析…")
+            self._log(f"—— [{idx}/{n}] {url}")
+        elif kind == "progress":
+            _, idx, n, info = ev
+            self.progress_var.set(float(info["percent"]))
+            self.progress_text_var.set(f"[{idx}/{n}] {self._vd.format_progress(info)}")
+        elif kind == "file":
+            self._last_file = str(ev[3])
+        elif kind == "item_done":
+            _, idx, n, url, rc = ev
+            if rc == 0:
+                self.progress_var.set(100.0)
+                self._log(f"✓ [{idx}/{n}] 完成")
+            elif self._runner is not None and self._runner.cancelled:
+                self._log(f"✗ [{idx}/{n}] 已取消")
+            else:
+                self._log(f"✗ [{idx}/{n}] 失败（退出码 {rc}）")
+        elif kind == "finished":
+            _, ok, failed, cancelled = ev
+            self._runner = None
+            self._set_busy(False)
+            if cancelled:
+                msg = f"已取消。成功 {ok} 个，未完成 {failed} 个。"
+            else:
+                msg = f"下载结束：成功 {ok} 个，失败 {failed} 个。"
+            self.progress_text_var.set(msg)
+            self._log(msg)
+            self.app._set_status(f"视频{msg}")
+        elif kind == "pip_done":
+            _, rc, upgrade = ev
+            self._set_busy(False)
+            what = "更新" if upgrade else "安装"
+            if rc == 0:
+                self.progress_text_var.set(f"yt-dlp {what}完成")
+                self._log(f"yt-dlp {what}完成，重新检测…")
+            else:
+                self.progress_text_var.set(f"yt-dlp {what}失败（{rc}）")
+                self._log(f"yt-dlp {what}失败（退出码 {rc}）")
+            self.tool_var.set("正在检测 yt-dlp / ffmpeg…")
+            self._probe_tools_async()
+
+    def _on_close(self) -> None:
+        if self._busy:
+            if not messagebox.askyesno(
+                "正在下载", "仍有任务在运行，取消并关闭窗口吗？", parent=self
+            ):
+                return
+            self._pip_cancel.set()
+            runner = self._runner
+            if runner is not None:
+                threading.Thread(target=runner.cancel, daemon=True, name="ytdlp-cancel").start()
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except tk.TclError:
+                pass
+            self._poll_job = None
+        self.app._video_dialog = None
+        self.destroy()
+
+
 class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     """桌面 GUI：分区操作、列表/缩略图视图、多页 PDF 导出与本地翻译。"""
 
@@ -982,6 +1496,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._ocr_import_btn: Optional[ttk.Button] = None
         self._ocr_translate_btn: Optional[ttk.Button] = None
         self._last_ocr_en_txt: Optional[Path] = None
+        self._video_dialog: Optional["VideoDownloadDialog"] = None
         self.output_dir: Path = ensure_default_output_dir()
         self.direct_export_var: Optional[tk.BooleanVar] = None
         self.translate_then_export_var: Optional[tk.BooleanVar] = None
@@ -1334,6 +1849,9 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             settings_fr,
             text="设定默认导出文件夹…",
             command=self.set_default_output_folder,
+        ).pack(side=tk.LEFT, padx=4, pady=2)
+        ttk.Button(
+            settings_fr, text="下载视频…", command=self.open_video_download
         ).pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Button(
             settings_fr, text="创建桌面快捷方式", command=self.create_shortcut
@@ -2907,6 +3425,25 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
 
         threading.Thread(target=worker, daemon=True, name="ocr-import-txt").start()
 
+
+    def open_video_download(self) -> None:
+        """打开「下载视频」窗口（yt-dlp：粘贴链接 → 下载）；已打开则置前。"""
+        dlg = self._video_dialog
+        if dlg is not None:
+            try:
+                if dlg.winfo_exists():
+                    dlg.deiconify()
+                    dlg.lift()
+                    dlg.focus_set()
+                    return
+            except tk.TclError:
+                pass
+        try:
+            self._video_dialog = VideoDownloadDialog(self)
+        except Exception as e:
+            traceback.print_exc()
+            self._video_dialog = None
+            messagebox.showerror("打开失败", f"无法打开下载视频窗口：{e}")
 
     def create_shortcut(self) -> None:
         try:

@@ -20,6 +20,7 @@
 - 导出在**后台线程**进行，界面可继续操作；状态栏显示进度（如 `3/98`）；导出中禁用「生成 PDF」按钮
 - **本地翻译后导出**：勾选或点「本地翻译后导出」→ 对列表中的图片做 **EN→ZH**（PaddleOCR（默认）/ EasyOCR 回退 + Ollama / Argos）。每张图：OCR 阅读顺序后把**全部英文拼成一段**，**只翻译一次**，在原图**下方追加**那一条中文译文条带（自动换行、CJK 字体）；写入 `translated_zh/*_zh`（**不覆盖原图**），再导出多页 PDF（跳过 PDF / GIF）。界面提供 **Ollama 模型下拉框**（`ollama list`），选择写入 `config.json` 的 `ollama_model`。
 - **OCR 文本导出 / 本地翻译 / 译文导入**：点「导出英文OCR文本」对列表图片做 OCR，生成带机器稳定键 `===PAGE NNN===` 的 UTF-8 `.txt`（含 `path:` 行）；可点「本地翻译OCR文本」（Ollama 按页）或外部译成中文后点「导入译文并生成图/PDF」，按页序号映射回列表，在原图下方追加中文译文条写入 `translated_zh/`，可选再导出 PDF。Ollama 本地翻译路径保持不变。
+- **下载视频（yt-dlp）**：「设定」区点「下载视频…」，粘贴链接（可多行，按顺序排队）→ 下载；等价于 `yt-dlp -f "bv*+ba/b" -P "%USERPROFILE%\Downloads" "<URL>"`，带进度条、实时日志与取消
 - 底部状态栏提示进度与结果
 
 ## 环境要求
@@ -145,6 +146,26 @@ python translate_local.py path\to\image.jpg
 ```
 
 
+## 下载视频（yt-dlp）
+
+主窗口「设定」区点 **下载视频…** 打开窗口（与 PDF 功能互不影响，可同时使用）：
+
+1. 打开时若剪贴板里是 http(s) 链接会自动填入；也可点 **粘贴**。可一次粘贴多个链接（每行一个），会按顺序逐个下载
+2. **保存到**：默认 `%USERPROFILE%\Downloads`；**选择文件夹…** 修改后写入 `config.json` 的 `video_download_dir`；**打开文件夹** 用资源管理器打开
+3. **只下载单个视频（--no-playlist）** 默认勾选；**浏览器 Cookies**（无 / chrome / edge / firefox）用于需要登录的网站（`--cookies-from-browser`）
+4. 点 **下载**：进度条与日志实时显示（解析 `yt-dlp --newline` 输出的百分比、速度、剩余时间）；**取消** 会结束 yt-dlp 及其子进程（如 ffmpeg）
+
+实际执行的命令（每个链接一条，日志里会打印）：
+
+```text
+yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies-from-browser X] <URL>
+```
+
+- **yt-dlp 定位**：优先 PATH 上的 `yt-dlp`，否则用当前 Python 的 `python -m yt_dlp`；都没有时提示一键 `pip install yt-dlp`。窗口里的 **更新 yt-dlp** 执行 `pip install -U yt-dlp`（网站改版导致下载失败时先更新）
+- **ffmpeg**：`bv*+ba` 需要 ffmpeg 合并音视频。未找到时窗口会中文提示，安装：`winget install Gyan.FFmpeg`（装好后重开程序；刚装完 PATH 未刷新时也会自动在 WinGet 目录里找到并传 `--ffmpeg-location`）
+- 下载在后台线程 + 子进程（Windows 无黑框）运行，界面不卡；后台线程只通过队列把进度交给 Tk 主线程（`after()` 轮询），不直接操作界面
+- 逻辑在 `video_dl.py`（无 Tk 依赖，有单元测试）；请只下载你有权保存的内容
+
 ## 本地 MT（Ollama）
 
 推荐使用 [Ollama](https://ollama.com) 作为本地 EN→ZH 引擎（质量通常优于 Argos）：
@@ -189,13 +210,17 @@ python translate_local.py path\to\image.jpg
   "ocr_engine": "paddle",
   "include_subfolders": true,
   "ocr_downscale": false,
-  "ocr_downscale_max_long_side": 1600
+  "ocr_downscale_max_long_side": 1600,
+  "video_download_dir": "C:\Users\你\Downloads",
+  "video_no_playlist": true,
+  "video_cookies_browser": "无"
 }
 ```
 
 其中 `ollama_model` 由 GUI 模型下拉框写入；未配置时若本机已安装则默认优先 `qwen2.5:14b`。
 `include_subfolders`（布尔，默认 `true`）控制「添加文件夹…」是否递归子目录，与界面勾选「包含子文件夹」同步。
 `ocr_downscale`（布尔，默认 `false`）与 `ocr_downscale_max_long_side`（整数，默认 `1600`）：GUI「OCR降采样」勾选写入；开启后 OCR 文本导出与本地翻译在调用 Paddle/EasyOCR 前将图片最长边缩小到该值（检测框坐标会映射回原图尺寸）。
+`video_download_dir` / `video_no_playlist` / `video_cookies_browser`：「下载视频」窗口的保存目录（默认 `%USERPROFILE%\Downloads`）、是否 `--no-playlist`（默认 `true`）、`--cookies-from-browser` 浏览器（`无` / `chrome` / `edge` / `firefox`）。
 
 首次启动若尚未配置导出目录，会自动创建 `文档/PDF导出`（或 `~/Documents/PDF导出`）并写入该文件。
 
@@ -205,6 +230,7 @@ python translate_local.py path\to\image.jpg
 img-stitch-pdf/
 ├── main.py                      # GUI 与导出逻辑
 ├── translate_local.py           # 本地 EN→ZH（OCR / MT / 下方译文条带）
+├── video_dl.py                  # 下载视频：yt-dlp 命令构建 / 进度解析 / 队列与取消
 ├── ocr_backend.py               # PaddleOCR / EasyOCR 引擎与自动安装
 ├── create_desktop_shortcut.ps1  # 创建桌面快捷方式
 ├── requirements.txt             # 运行依赖（含可选翻译栈）
