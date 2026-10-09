@@ -289,6 +289,152 @@ def write_normalized_cookies(src, dest_dir=None) -> Tuple[Path, int]:
     return Path(tmp), kept
 
 
+# ---------------------------------------------------------------- stored cookies (tool folder)
+
+COOKIES_DIRNAME = "cookies"
+STORED_COOKIES_NAME = "cookies.txt"
+LEGACY_COOKIES_NAME = "cookies_x.com.txt"
+STORED_COOKIES_NOTE = "已移入工具文件夹；更新时重新选择新导出的文件即可"
+
+
+def tool_cookies_dir() -> Path:
+    """``<工具文件夹>\\cookies``（与 main.py / video_dl.py 同级；已在 .gitignore 中排除）。"""
+    return Path(__file__).resolve().parent / COOKIES_DIRNAME
+
+
+def stored_cookies_path(store_dir=None) -> Path:
+    return Path(store_dir if store_dir is not None else tool_cookies_dir()) / STORED_COOKIES_NAME
+
+
+def _same_file(a, b) -> bool:
+    try:
+        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
+    except OSError:
+        return False
+
+
+def is_in_cookies_dir(path, store_dir=None) -> bool:
+    """True if *path* lives directly inside the tool's cookies folder."""
+    if not path:
+        return False
+    d = Path(store_dir) if store_dir is not None else tool_cookies_dir()
+    return _same_file(Path(path).parent, d)
+
+
+def validate_cookies_file(src) -> int:
+    """Return the number of valid cookie lines in *src*; raise :class:`CookiesFileError` if none."""
+    p = Path(src)
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        raise CookiesFileError(f"无法读取 Cookies 文件：{p}（{e.strerror or e}）") from None
+    _text, kept = normalize_cookies_text(_decode_cookies_bytes(data))
+    if kept == 0:
+        raise CookiesFileError(
+            f"Cookies 文件里没有有效条目：{p}\n需要 Netscape 格式（每行 7 列、Tab 分隔，浏览器扩展导出的 cookies.txt）。"
+        )
+    return kept
+
+
+def _remove_other_stored(store_dir: Path, keep: Optional[Path]) -> List[Path]:
+    """Delete stored cookies files in *store_dir* except *keep*; returns removed paths."""
+    removed: List[Path] = []
+    if not store_dir.is_dir():
+        return removed
+    for f in store_dir.iterdir():
+        if not f.is_file():
+            continue
+        if keep is not None and _same_file(f, keep):
+            continue
+        try:
+            f.unlink()
+            removed.append(f)
+        except OSError:
+            pass
+    return removed
+
+
+class CookiesImportResult:
+    """Outcome of :func:`import_cookies_file`（不含 cookie 值）。"""
+
+    def __init__(self, stored: Path, kept: int, *, moved: bool, source_deleted: bool,
+                 warning: Optional[str] = None, removed_old: Sequence[Path] = ()) -> None:
+        self.stored = stored
+        self.kept = kept
+        self.moved = moved  # False = source already was the stored file (no-op)
+        self.source_deleted = source_deleted
+        self.warning = warning
+        self.removed_old = list(removed_old)
+
+
+def import_cookies_file(src, store_dir=None) -> CookiesImportResult:
+    """Move cookies file *src* into the tool's cookies folder (fixed name ``cookies.txt``).
+
+    1. validate (至少一行有效 cookie，用 :func:`normalize_cookies_text` 判断)
+    2. write the original bytes atomically (temp file in the folder → ``os.replace``)
+    3. delete any other previously stored files in that folder
+    4. delete *src* (move semantics); if that fails (locked) keep the stored copy
+       and return a Chinese ``warning``
+
+    If *src* already is the stored file this is a no-op (only validated).
+    Raises :class:`CookiesFileError`; messages never contain cookie values.
+    """
+    sp = Path(src).expanduser()
+    d = Path(store_dir) if store_dir is not None else tool_cookies_dir()
+    dest = d / STORED_COOKIES_NAME
+    if dest.exists() and _same_file(sp, dest):
+        kept = validate_cookies_file(dest)
+        return CookiesImportResult(dest, kept, moved=False, source_deleted=False)
+    try:
+        data = sp.read_bytes()
+    except OSError as e:
+        raise CookiesFileError(f"无法读取 Cookies 文件：{sp}（{e.strerror or e}）") from None
+    _text, kept = normalize_cookies_text(_decode_cookies_bytes(data))
+    if kept == 0:
+        raise CookiesFileError(
+            f"Cookies 文件里没有有效条目：{sp}\n需要 Netscape 格式（每行 7 列、Tab 分隔，浏览器扩展导出的 cookies.txt）。"
+        )
+    tmp: Optional[str] = None
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".import_", suffix=".tmp", dir=str(d))
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, dest)
+        tmp = None
+    except OSError as e:
+        raise CookiesFileError(f"无法保存 Cookies 文件到工具文件夹：{d}（{e.strerror or e}）") from None
+    finally:
+        if tmp:
+            remove_file_quietly(tmp)
+    removed = _remove_other_stored(d, keep=dest)
+    removed = [r for r in removed if not _same_file(r, sp)]
+    warning = None
+    deleted = not sp.exists()
+    if not deleted:
+        try:
+            sp.unlink()
+            deleted = True
+        except OSError as e:
+            warning = (
+                f"警告：已保存到工具文件夹，但无法删除原 Cookies 文件：{sp}（{e.strerror or e}）。"
+                "可能被其他程序占用，请稍后手动删除（其中含登录凭据）。"
+            )
+    return CookiesImportResult(dest, kept, moved=True, source_deleted=deleted,
+                               warning=warning, removed_old=removed)
+
+
+def clear_stored_cookies(store_dir=None) -> List[Path]:
+    """Delete every stored cookies file in the tool's cookies folder; returns removed paths."""
+    d = Path(store_dir) if store_dir is not None else tool_cookies_dir()
+    return _remove_other_stored(d, keep=None)
+
+
 def remove_file_quietly(path) -> None:
     if not path:
         return

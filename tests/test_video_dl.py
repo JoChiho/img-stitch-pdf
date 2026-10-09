@@ -497,3 +497,131 @@ def test_video_cookies_file_config_roundtrip(tmp_path, monkeypatch):
     assert main.set_video_cookies_file_config(None) is None
     assert main.get_video_cookies_file_config() is None
     assert "video_cookies_file" not in main.load_config()
+
+
+# ------------------------------------------------------------------ stored cookies (tool folder)
+
+
+def test_tool_cookies_dir_next_to_module():
+    assert video_dl.tool_cookies_dir() == Path(video_dl.__file__).resolve().parent / "cookies"
+    assert video_dl.stored_cookies_path().name == "cookies.txt"
+
+
+def test_import_cookies_moves_and_deletes_source(tmp_path):
+    store = tmp_path / "tool" / "cookies"
+    src = tmp_path / "Downloads" / "cookies_x.com.txt"
+    src.parent.mkdir()
+    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    res = video_dl.import_cookies_file(src, store)
+    assert res.stored == store / "cookies.txt" and res.kept == 4
+    assert res.moved and res.source_deleted and res.warning is None
+    assert not src.exists()
+    assert res.stored.read_bytes() == _EXT_COOKIES.encode("utf-8")
+    assert sorted(p.name for p in store.iterdir()) == ["cookies.txt"]  # no temp leftovers
+    assert video_dl.is_in_cookies_dir(res.stored, store)
+    # per-run normalized temp copy still works from the stored file
+    out, kept = video_dl.write_normalized_cookies(res.stored, tmp_path / "tmp")
+    assert kept == 4 and res.stored.exists()
+    video_dl.remove_file_quietly(out)
+
+
+def test_import_cookies_replaces_old_stored(tmp_path):
+    store = tmp_path / "cookies"
+    store.mkdir()
+    (store / "cookies.txt").write_text(".old.com\tTRUE\t/\tTRUE\t0\ta\tOLD\n", encoding="utf-8")
+    (store / "cookies_legacy.txt").write_text("stale", encoding="utf-8")
+    src = tmp_path / "new_cookies.txt"
+    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    res = video_dl.import_cookies_file(src, store)
+    assert sorted(p.name for p in store.iterdir()) == ["cookies.txt"]
+    assert b"OLD" not in res.stored.read_bytes() and b"SECRET1" in res.stored.read_bytes()
+    assert not src.exists()
+
+
+def test_import_cookies_noop_when_same_file(tmp_path):
+    store = tmp_path / "cookies"
+    store.mkdir()
+    stored = store / "cookies.txt"
+    stored.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    mtime = stored.stat().st_mtime_ns
+    res = video_dl.import_cookies_file(stored, store)
+    assert not res.moved and not res.source_deleted and res.kept == 4
+    assert stored.exists() and stored.stat().st_mtime_ns == mtime
+
+
+def test_import_cookies_invalid_keeps_everything(tmp_path):
+    store = tmp_path / "cookies"
+    store.mkdir()
+    (store / "cookies.txt").write_bytes(_EXT_COOKIES.encode("utf-8"))
+    bad = tmp_path / "bad.txt"
+    bad.write_text("# only comments\nname=SECRETVALUE\n", encoding="utf-8")
+    with pytest.raises(video_dl.CookiesFileError) as ei:
+        video_dl.import_cookies_file(bad, store)
+    assert "SECRETVALUE" not in str(ei.value)
+    assert bad.exists() and (store / "cookies.txt").exists()
+
+
+def test_import_cookies_source_delete_failure_warns(tmp_path, monkeypatch):
+    store = tmp_path / "cookies"
+    src = tmp_path / "locked_cookies.txt"
+    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    real_unlink = Path.unlink
+
+    def fake_unlink(self, *a, **k):
+        if self == src:
+            raise PermissionError(13, "被占用")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", fake_unlink)
+    res = video_dl.import_cookies_file(src, store)
+    assert res.stored.exists() and src.exists()
+    assert not res.source_deleted and res.warning and "警告" in res.warning
+    assert "SECRET" not in res.warning
+
+
+def test_clear_stored_cookies_deletes(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "config_dir", lambda: tmp_path / "cfg")
+    store = tmp_path / "cookies"
+    src = tmp_path / "c.txt"
+    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    res = main.import_video_cookies_file(src, store)
+    assert main.get_video_cookies_file_config() == str(res.stored)
+    removed = main.clear_video_cookies_file(store)
+    assert removed and not res.stored.exists()
+    assert main.get_video_cookies_file_config() is None
+    assert "video_cookies_file" not in main.load_config()
+
+
+def test_migrate_config_pointing_outside(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "config_dir", lambda: tmp_path / "cfg")
+    store = tmp_path / "cookies"
+    dl = tmp_path / "Downloads"
+    dl.mkdir()
+    src = dl / "cookies_x.com.txt"
+    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    main.set_video_cookies_file_config(src)
+    msgs = main.migrate_video_cookies_file(store, dl)
+    assert msgs and not src.exists()
+    assert main.get_video_cookies_file_config() == str(store / "cookies.txt")
+    assert (store / "cookies.txt").exists()
+    assert all("SECRET" not in m for m in msgs)
+    assert main.migrate_video_cookies_file(store, dl) == []  # idempotent
+
+
+def test_migrate_downloads_file_without_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "config_dir", lambda: tmp_path / "cfg")
+    store = tmp_path / "cookies"
+    dl = tmp_path / "Downloads"
+    dl.mkdir()
+    assert main.migrate_video_cookies_file(store, dl) == []
+    src = dl / "cookies_x.com.txt"
+    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    msgs = main.migrate_video_cookies_file(store, dl)
+    assert msgs and not src.exists()
+    assert main.get_video_cookies_file_config() == str(store / "cookies.txt")
+
+
+def test_gitignore_excludes_cookies():
+    gi = (Path(main.__file__).resolve().parent / ".gitignore").read_text(encoding="utf-8")
+    lines = {ln.strip() for ln in gi.splitlines()}
+    assert "cookies/" in lines and "*cookies*.txt" in lines

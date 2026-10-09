@@ -153,8 +153,10 @@ python translate_local.py path\to\image.jpg
 1. 打开时若剪贴板里是 http(s) 链接会自动填入；也可点 **粘贴**。可一次粘贴多个链接（每行一个），会按顺序逐个下载
 2. **保存到**：默认 `%USERPROFILE%\Downloads`；**选择文件夹…** 修改后写入 `config.json` 的 `video_download_dir`；**打开文件夹** 用资源管理器打开
 3. **只下载单个视频（--no-playlist）** 默认勾选；**浏览器 Cookies**（无 / chrome / edge / firefox）用于需要登录的网站（`--cookies-from-browser`）
-   - **Cookies 文件**：点 **选择…** 选浏览器扩展导出的 `cookies.txt`（Netscape 格式），**清除** 取消；路径记在 `config.json` 的 `video_cookies_file`。设置后传 `--cookies`，**优先于浏览器 Cookies**（两者不会同时传）
-   - 扩展导出的文件常有格式问题（如 `.x.com\tFALSE\t/…`：域名以 `.` 开头但第 2 列是 `FALSE`），yt-dlp 会报 `invalid Netscape format cookies file`。程序每次下载前会在 `%TEMP%` 写一份**整理后的临时副本**（补 `# Netscape HTTP Cookie File` 头；只保留 7 列 Tab 分隔的行，含 `#HttpOnly_` 行；第 2 列按域名是否以 `.` 开头改为 `TRUE`/`FALSE`；兼容 UTF-8 BOM 与 CRLF），传给 yt-dlp，运行结束即删除；原文件不改动，日志不打印 cookie 值
+   - **Cookies 文件**：点 **选择…** 选浏览器扩展导出的 `cookies.txt`（Netscape 格式）。校验至少有一行有效 cookie 后，文件会被**移入工具文件夹** `<程序目录>\cookies\cookies.txt`（先写临时文件再 `os.replace` 原子替换；删除该文件夹里旧的 cookies 文件；再删除原文件，即“移动”）。原文件被占用删不掉时保留已存副本并在日志里给出中文警告。界面显示存放路径并提示“已移入工具文件夹；更新时重新选择新导出的文件即可”。**清除** 删除已存的 cookies 文件并清空配置。路径记在 `config.json` 的 `video_cookies_file`。设置后传 `--cookies`，**优先于浏览器 Cookies**（两者不会同时传）
+   - `cookies/` 与 `*cookies*.txt` 已写入 `.gitignore`，cookies（=登录凭据）**永远不会被提交**
+   - 迁移：打开「下载视频」时，若配置仍指向工具文件夹外的 cookies 文件（如 `%USERPROFILE%\Downloads\cookies_x.com.txt`），会自动按上述方式移入 `cookies\`；若未配置可用的 cookies 文件但 `Downloads\cookies_x.com.txt` 存在，也会导入并写入配置
+   - 扩展导出的文件常有格式问题（如 `.x.com\tFALSE\t/…`：域名以 `.` 开头但第 2 列是 `FALSE`），yt-dlp 会报 `invalid Netscape format cookies file`。程序每次下载前会在 `%TEMP%` 写一份**整理后的临时副本**（补 `# Netscape HTTP Cookie File` 头；只保留 7 列 Tab 分隔的行，含 `#HttpOnly_` 行；第 2 列按域名是否以 `.` 开头改为 `TRUE`/`FALSE`；兼容 UTF-8 BOM 与 CRLF），传给 yt-dlp，运行结束即删除；已存的 cookies 文件不改动，日志不打印 cookie 值
    - 日志出现 `No video could be found`（且未设置 Cookies）时会提示：该推文可能需要登录，请选择 Cookies 文件；Chrome/Edge 的 `--cookies-from-browser` 报 `Could not copy Chrome cookie database` 时会提示先完全关闭浏览器，或改用 Cookies 文件
 4. 点 **下载**：进度条与日志实时显示（解析 `yt-dlp --newline` 输出的百分比、速度、剩余时间）；**取消** 会结束 yt-dlp 及其子进程（如 ffmpeg）
 
@@ -217,7 +219,7 @@ yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整�
   "video_download_dir": "C:\Users\你\Downloads",
   "video_no_playlist": true,
   "video_cookies_browser": "无",
-  "video_cookies_file": "C:\Users\你\Downloads\cookies.txt"
+  "video_cookies_file": "D:\…\img-stitch-pdf\cookies\cookies.txt"
 }
 ```
 
@@ -225,7 +227,7 @@ yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整�
 `include_subfolders`（布尔，默认 `true`）控制「添加文件夹…」是否递归子目录，与界面勾选「包含子文件夹」同步。
 `ocr_downscale`（布尔，默认 `false`）与 `ocr_downscale_max_long_side`（整数，默认 `1600`）：GUI「OCR降采样」勾选写入；开启后 OCR 文本导出与本地翻译在调用 Paddle/EasyOCR 前将图片最长边缩小到该值（检测框坐标会映射回原图尺寸）。
 `video_download_dir` / `video_no_playlist` / `video_cookies_browser`：「下载视频」窗口的保存目录（默认 `%USERPROFILE%\Downloads`）、是否 `--no-playlist`（默认 `true`）、`--cookies-from-browser` 浏览器（`无` / `chrome` / `edge` / `firefox`）。
-`video_cookies_file`：「Cookies 文件」路径（`--cookies`，优先于 `video_cookies_browser`；点「清除」后从配置中移除）。
+`video_cookies_file`：「Cookies 文件」已存路径（`<程序目录>\cookies\cookies.txt`；`--cookies`，优先于 `video_cookies_browser`；点「清除」后删除该文件并从配置中移除）。
 
 首次启动若尚未配置导出目录，会自动创建 `文档/PDF导出`（或 `~/Documents/PDF导出`）并写入该文件。
 

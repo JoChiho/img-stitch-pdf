@@ -30,3 +30,7 @@ tmp/
 # OCR / MT caches (user machine; do not commit)
 .EasyOCR/
 argos-translate/
+
+# Cookies = login credentials: NEVER commit (「下载视频」stores them in cookies/)
+cookies/
+*cookies*.txt

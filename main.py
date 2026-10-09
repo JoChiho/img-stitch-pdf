@@ -1024,6 +1024,64 @@ def set_video_cookies_file_config(path: Optional[Union[str, Path]]) -> Optional[
     return val
 
 
+def import_video_cookies_file(src: Union[str, Path], store_dir=None):
+    """Move *src* into ``<工具文件夹>\\cookies\\cookies.txt`` and persist that path.
+
+    Returns ``video_dl.CookiesImportResult``; raises ``video_dl.CookiesFileError``.
+    """
+    import video_dl
+
+    res = video_dl.import_cookies_file(src, store_dir)
+    set_video_cookies_file_config(res.stored)
+    return res
+
+
+def clear_video_cookies_file(store_dir=None) -> List[Path]:
+    """Delete the stored cookies file(s) and drop ``video_cookies_file`` from config."""
+    import video_dl
+
+    removed = video_dl.clear_stored_cookies(store_dir)
+    # only files inside the tool's cookies folder are deleted; config is always cleared
+    set_video_cookies_file_config(None)
+    return removed
+
+
+def migrate_video_cookies_file(store_dir=None, downloads_dir=None) -> List[str]:
+    """Move a cookies file that still lives outside the tool folder into ``cookies\\``.
+
+    - config points to an existing file outside ``cookies\\`` → import it (move)
+    - otherwise, if no usable stored file is configured and
+      ``<Downloads>\\cookies_x.com.txt`` exists → import it and set config
+
+    Returns Chinese log lines (never cookie values). Errors are reported, not raised.
+    """
+    import video_dl
+
+    msgs: List[str] = []
+    cur = get_video_cookies_file_config()
+    src: Optional[Path] = None
+    if cur and Path(cur).is_file() and not video_dl.is_in_cookies_dir(cur, store_dir):
+        src = Path(cur)
+    elif not (cur and Path(cur).is_file()):
+        dl = Path(downloads_dir) if downloads_dir is not None else video_dl.default_download_dir()
+        cand = dl / video_dl.LEGACY_COOKIES_NAME
+        if cand.is_file():
+            src = cand
+    if src is None:
+        return msgs
+    try:
+        res = import_video_cookies_file(src, store_dir)
+    except video_dl.CookiesFileError as e:
+        msgs.append(f"迁移 Cookies 文件失败：{e}")
+        return msgs
+    msgs.append(
+        f"已把 Cookies 文件移入工具文件夹：{src} → {res.stored}（{res.kept} 条）"
+    )
+    if res.warning:
+        msgs.append(res.warning)
+    return msgs
+
+
 def get_video_no_playlist_config() -> bool:
     """Return persisted ``video_no_playlist`` (default True)."""
     raw = load_config().get("video_no_playlist")
@@ -1091,6 +1149,10 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         self.out_dir_var = tk.StringVar(value=str(get_video_download_dir_config()))
         self.no_playlist_var = tk.BooleanVar(value=get_video_no_playlist_config())
         self.cookies_var = tk.StringVar(value=get_video_cookies_browser_config())
+        try:
+            self._cookies_migrate_msgs = migrate_video_cookies_file()
+        except Exception as e:  # never block the dialog
+            self._cookies_migrate_msgs = [f"迁移 Cookies 文件失败：{e}"]
         self.cookies_file_var = tk.StringVar(value=get_video_cookies_file_config() or "")
         self.cookies_hint_var = tk.StringVar(value="")
         self._cookies_combo = None
@@ -1100,6 +1162,8 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
 
         self._build()
         self._update_cookies_hint()
+        for m in self._cookies_migrate_msgs:
+            self._log(m)
         self._prefill_from_clipboard()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_job = self.after(self.POLL_MS, self._poll_events)
@@ -1284,6 +1348,7 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         has_file = bool((self.cookies_file_var.get() or "").strip())
         if has_file:
             self.cookies_hint_var.set(
+                f"{self._vd.STORED_COOKIES_NOTE}（{self._vd.tool_cookies_dir()}）。"
                 "已选 Cookies 文件（--cookies），优先于「浏览器 Cookies」（不会同时使用）；"
                 "下载前自动整理为标准 Netscape 格式的临时副本。"
             )
@@ -1300,7 +1365,10 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
 
     def _choose_cookies_file(self) -> None:
         cur = (self.cookies_file_var.get() or "").strip()
-        init = Path(cur).parent if cur else self._vd.default_download_dir()
+        if cur and not self._vd.is_in_cookies_dir(cur):
+            init = Path(cur).parent
+        else:
+            init = self._vd.default_download_dir()
         chosen = filedialog.askopenfilename(
             title="选择 Cookies 文件（Netscape 格式 cookies.txt）",
             initialdir=str(init) if init.is_dir() else str(Path.home()),
@@ -1309,16 +1377,34 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         )
         if not chosen:
             return
-        val = set_video_cookies_file_config(chosen)
-        self.cookies_file_var.set(val or "")
+        try:
+            res = import_video_cookies_file(chosen)
+        except self._vd.CookiesFileError as e:
+            messagebox.showerror("Cookies 文件无效", str(e), parent=self)
+            self._log(str(e))
+            return
+        self.cookies_file_var.set(str(res.stored))
         self._update_cookies_hint()
-        self._log(f"Cookies 文件：{val}（将优先于浏览器 Cookies）")
+        if res.moved:
+            self._log(
+                f"Cookies 文件已移入工具文件夹：{res.stored}（{res.kept} 条，将优先于浏览器 Cookies）。"
+                f"{self._vd.STORED_COOKIES_NOTE}。"
+            )
+            if res.removed_old:
+                self._log(f"已删除旧的 Cookies 文件 {len(res.removed_old)} 个。")
+        else:
+            self._log(f"Cookies 文件：{res.stored}（已在工具文件夹中，未改动）")
+        if res.warning:
+            self._log(res.warning)
 
     def _clear_cookies_file(self) -> None:
-        set_video_cookies_file_config(None)
+        removed = clear_video_cookies_file()
         self.cookies_file_var.set("")
         self._update_cookies_hint()
-        self._log("已清除 Cookies 文件。")
+        if removed:
+            self._log(f"已清除 Cookies 文件（已删除工具文件夹中的 {len(removed)} 个文件）。")
+        else:
+            self._log("已清除 Cookies 文件。")
 
     def _open_dir(self) -> None:
         d = self._current_out_dir()
