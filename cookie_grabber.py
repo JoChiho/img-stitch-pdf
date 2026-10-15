@@ -1,10 +1,11 @@
-"""内置「获取 Cookies」：用工具自己的浏览器配置文件登录网站，经 CDP 导出 Netscape cookies.txt。
+"""内置「获取 Cookies」：用工具自己的 Edge 配置文件登录网站，经 CDP 导出 Netscape cookies.txt。
 
-为什么不直接读 Chrome/Edge 的 Cookie 数据库：浏览器运行时数据库被锁，且 v127 起使用
-App-Bound 加密（yt-dlp 报 ``Could not copy Chrome cookie database`` / DPAPI 错误）；
+为什么不直接读浏览器 Cookie 数据库：运行时数据库被锁，且 v127 起使用 App-Bound
+加密（yt-dlp 报 ``Could not copy Chrome cookie database`` / DPAPI 错误）；
 Chrome 136+ 也禁止在**默认**用户数据目录上开 ``--remote-debugging-port``。
+Google 登录在工具启动的 Chrome 窗口中会被拒绝，因此本工具**始终使用 Microsoft Edge**。
 
-做法：以 ``--user-data-dir=<工具文件夹>\\browser_profile`` 单独启动已安装的 Chrome/Edge
+做法：以 ``--user-data-dir=<工具文件夹>\\browser_profile_edge`` 单独启动已安装的 Edge
 （与用户平时的浏览器配置完全隔离，不碰、不关闭用户的浏览器窗口），用户首次在该窗口登录；
 之后通过 DevTools 协议（标准库实现的最小 WebSocket 客户端）调用 ``Storage.getCookies``，
 按网站域名过滤，写成 ``cookies\\<网站>.txt``（原子写入），再 ``Browser.close`` 关闭该浏览器。
@@ -27,7 +28,7 @@ from urllib.parse import urlsplit
 
 import video_dl
 
-PROFILE_DIRNAME = "browser_profile"
+PROFILE_DIRNAME = "browser_profile_edge"
 DEVTOOLS_PORT_FILE = "DevToolsActivePort"
 
 
@@ -142,50 +143,52 @@ def cookies_to_netscape(cookies: Iterable[Mapping]) -> Tuple[str, int]:
     return "\n".join(lines) + "\n", n
 
 
-# ---------------------------------------------------------------- browser detection
+# ---------------------------------------------------------------- browser detection (Edge only)
 def browser_candidates(env: Optional[Mapping[str, str]] = None) -> List[Tuple[str, Path]]:
+    """Candidate paths for Microsoft Edge only (never Chrome)."""
     e = os.environ if env is None else env
     out: List[Tuple[str, Path]] = []
     if sys.platform == "win32" or env is not None:
-        roots = [e.get("PROGRAMFILES"), e.get("PROGRAMFILES(X86)"), e.get("LOCALAPPDATA")]
-        for name, rel in (("chrome", r"Google\Chrome\Application\chrome.exe"),
-                          ("edge", r"Microsoft\Edge\Application\msedge.exe")):
-            for r in roots:
-                if r:
-                    out.append((name, Path(r) / rel))
+        roots = [e.get("PROGRAMFILES(X86)"), e.get("PROGRAMFILES"), e.get("LOCALAPPDATA")]
+        rel = r"Microsoft\Edge\Application\msedge.exe"
+        for r in roots:
+            if r:
+                out.append(("edge", Path(r) / rel))
     if sys.platform == "darwin" and env is None:
-        out += [("chrome", Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")),
-                ("edge", Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"))]
+        out += [("edge", Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"))]
     elif sys.platform.startswith("linux") and env is None:
-        out += [("chrome", Path("/usr/bin/google-chrome")), ("chrome", Path("/usr/bin/chromium")),
-                ("edge", Path("/usr/bin/microsoft-edge"))]
+        out += [("edge", Path("/usr/bin/microsoft-edge")),
+                ("edge", Path("/usr/bin/microsoft-edge-stable"))]
     return out
 
 
 def find_browsers(env: Optional[Mapping[str, str]] = None,
                   exists: Callable[[Path], bool] = lambda p: p.is_file()) -> List[Tuple[str, Path]]:
-    """Installed Chrome/Edge, Chrome first; one entry per browser name."""
+    """Installed Edge only; at most one entry."""
     found: Dict[str, Path] = {}
     for name, p in browser_candidates(env):
         if name not in found and exists(p):
             found[name] = p
-    return [(n, found[n]) for n in ("chrome", "edge") if n in found]
+    return [("edge", found["edge"])] if "edge" in found else []
 
 
 def pick_browser(preferred: Optional[str] = None, env=None, exists=None) -> Tuple[str, Path]:
+    """Always return Edge. ``preferred`` may be None or ``"edge"``; anything else is an error."""
+    if preferred is not None and preferred != "edge":
+        raise CookieGrabError(
+            f"获取 Cookies 仅支持 Microsoft Edge（收到：{preferred!r}）。请安装 Edge 后重试。"
+        )
     kw = {} if exists is None else {"exists": exists}
     found = find_browsers(env, **kw)
     if not found:
-        raise CookieGrabError("没有找到 Chrome 或 Edge。请安装其中之一后重试。")
-    if preferred:
-        for n, p in found:
-            if n == preferred:
-                return n, p
+        raise CookieGrabError(
+            "没有找到 Microsoft Edge（msedge.exe）。请安装 Edge 后重试；本工具不再使用 Chrome。"
+        )
     return found[0]
 
 
 def tool_profile_dir() -> Path:
-    """``<工具文件夹>\\browser_profile``（工具专用浏览器配置；已在 .gitignore 中排除）。"""
+    """``<工具文件夹>\\browser_profile_edge``（工具专用 Edge 配置；已在 .gitignore 中排除）。"""
     return Path(__file__).resolve().parent / PROFILE_DIRNAME
 
 
@@ -344,12 +347,12 @@ def save_site_cookies(spec: SiteSpec, cookies: Iterable[Mapping], store_dir=None
     if not allow_anonymous and sel and is_logged_in(sel, spec) is False:
         raise CookieGrabError(
             f"专用浏览器里还没有登录 {spec.label}（未找到登录 Cookie），未保存，已有文件保持不变。"
-            "请点「登录并获取 Cookies…」在打开的窗口中登录后再导出。"
+            "请点「登录并获取 Cookies…」在打开的独立 Edge 窗口中登录后再导出。"
         )
     text, n = cookies_to_netscape(sel)
     if n == 0:
         raise CookieGrabError(
-            f"专用浏览器里没有 {spec.label} 的 Cookies。请先在打开的窗口中访问并登录该网站，再导出。"
+            f"专用浏览器里没有 {spec.label} 的 Cookies。请先在打开的独立 Edge 窗口中访问并登录该网站，再导出。"
         )
     dest = video_dl.stored_cookies_path_for_site(spec.key, store_dir)
     try:
@@ -360,7 +363,7 @@ def save_site_cookies(spec: SiteSpec, cookies: Iterable[Mapping], store_dir=None
 
 
 class BrowserSession:
-    """One tool-owned browser process on ``browser_profile`` with CDP enabled."""
+    """One tool-owned Edge process on ``browser_profile_edge`` with CDP enabled."""
 
     def __init__(self, profile: Optional[Path] = None, browser: Optional[str] = None,
                  log: Callable[[str], None] = lambda m: None) -> None:
@@ -392,7 +395,7 @@ class BrowserSession:
         kw: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
         if sys.platform == "win32":
             kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) if headless else 0
-        self.log(f"启动 {'Chrome' if name == 'chrome' else 'Edge'}（专用配置：{self.profile}"
+        self.log(f"启动 Edge（专用配置：{self.profile}"
                  f"{'，无界面' if headless else ''}）…")
         self.proc = subprocess.Popen(build_launch_args(exe, self.profile, url, headless=headless), **kw)
         deadline = time.monotonic() + timeout
@@ -419,7 +422,7 @@ class BrowserSession:
 
     def get_cookies(self) -> List[dict]:
         if not self.ws_url and not self.attach_existing():
-            raise CookieGrabError("专用浏览器没有在运行。请先点「登录并获取 Cookies…」。")
+            raise CookieGrabError("专用浏览器没有在运行。请先点「登录并获取 Cookies…」打开独立 Edge 窗口。")
         try:
             c = CDPConnection(self.ws_url)  # type: ignore[arg-type]
         except OSError as e:

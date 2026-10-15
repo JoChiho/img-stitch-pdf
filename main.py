@@ -1334,12 +1334,12 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         sites = "、".join(it.site for it in items) if items else "（暂无）"
         self.cookies_hint_var.set(
             f"{vd.COOKIES_AUTO_HINT}（已存：{sites}；位置 {vd.tool_cookies_dir()}，按网站分别保存）。"
-            "「登录并获取 Cookies…」用工具专用浏览器登录后导出（推荐，无需扩展；之后可「直接刷新」）；"
+            "「登录并获取 Cookies…」将打开独立的 Edge 窗口登录后导出（推荐，无需扩展；之后可「直接刷新」）；"
             "「导入…」选浏览器扩展导出的 cookies.txt，自动识别网站并移入工具文件夹（同网站覆盖旧文件）。"
             "没有对应网站的文件时使用「浏览器 Cookies」设置（Chrome/Edge 需先完全关闭浏览器）。"
         )
 
-    # ------------------------------------------------------------ 内置获取 Cookies（专用浏览器配置 + CDP）
+    # ------------------------------------------------------------ 内置获取 Cookies（专用 Edge 配置 + CDP）
     def _grab_spec(self):
         import cookie_grabber as cg
 
@@ -1385,7 +1385,8 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
             self._grab_session = s
             s.start(spec.login_url)
             log(
-                f"已打开专用浏览器窗口（独立配置，不影响你平时的浏览器）：请在其中登录 {spec.label}"
+                f"已打开独立的 Edge 窗口（专用配置 browser_profile_edge，不影响你平时的浏览器）："
+                f"请在其中登录 {spec.label}"
                 "（首次需要；YouTube 如提示年龄验证请完成），然后回到这里点「完成，导出 Cookies」。"
             )
 
@@ -1399,13 +1400,13 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
                 res = s.export(spec)
             finally:
                 self._grab_session = None
-            log(res.summary() + "（专用浏览器已关闭）")
+            log(res.summary() + "（专用 Edge 窗口已关闭）")
 
         self._grab_run("cookie-export", fn)
 
     def _grab_refresh(self) -> None:
         def fn(cg, spec, log):
-            log(f"直接刷新 {spec.label} 的 Cookies（无界面启动专用浏览器）…")
+            log(f"直接刷新 {spec.label} 的 Cookies（无界面启动专用 Edge）…")
             res = cg.refresh_headless(spec, log=log)
             log(res.summary())
 

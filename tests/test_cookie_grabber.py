@@ -68,21 +68,41 @@ def test_logged_in():
 
 def test_find_browsers_mocked():
     env = {"PROGRAMFILES": r"C:\PF", "PROGRAMFILES(X86)": r"C:\PF86", "LOCALAPPDATA": r"C:\L"}
-    present = {str(Path(r"C:\PF86") / r"Microsoft\Edge\Application\msedge.exe"),
-               str(Path(r"C:\L") / r"Google\Chrome\Application\chrome.exe")}
+    edge = str(Path(r"C:\PF86") / r"Microsoft\Edge\Application\msedge.exe")
+    chrome = str(Path(r"C:\L") / r"Google\Chrome\Application\chrome.exe")
+    present = {edge, chrome}
     found = cg.find_browsers(env, exists=lambda p: str(p) in present)
-    assert [n for n, _ in found] == ["chrome", "edge"]
-    assert str(found[0][1]).endswith("chrome.exe")
+    assert [n for n, _ in found] == ["edge"]
+    assert str(found[0][1]).endswith("msedge.exe")
+    # Chrome paths must never be returned even if present
+    assert all(n == "edge" for n, _ in found)
     assert cg.find_browsers(env, exists=lambda p: False) == []
-    with pytest.raises(cg.CookieGrabError):
+    with pytest.raises(cg.CookieGrabError, match="Edge"):
         cg.pick_browser(env=env, exists=lambda p: False)
     assert cg.pick_browser("edge", env=env, exists=lambda p: str(p) in present)[0] == "edge"
+    assert cg.pick_browser(None, env=env, exists=lambda p: str(p) in present)[0] == "edge"
+    with pytest.raises(cg.CookieGrabError, match="Edge"):
+        cg.pick_browser("chrome", env=env, exists=lambda p: str(p) in present)
+    # Prefer Program Files (x86) when both Edge paths exist
+    both_edge = {
+        str(Path(r"C:\PF86") / r"Microsoft\Edge\Application\msedge.exe"),
+        str(Path(r"C:\PF") / r"Microsoft\Edge\Application\msedge.exe"),
+    }
+    found2 = cg.find_browsers(env, exists=lambda p: str(p) in both_edge)
+    assert len(found2) == 1 and "PF86" in str(found2[0][1])
+
+
+def test_tool_profile_dir_is_edge():
+    assert cg.PROFILE_DIRNAME == "browser_profile_edge"
+    assert cg.tool_profile_dir().name == "browser_profile_edge"
 
 
 def test_launch_args(tmp_path):
-    a = cg.build_launch_args(Path("chrome.exe"), tmp_path, "https://x.com/login", headless=True)
+    a = cg.build_launch_args(Path("msedge.exe"), tmp_path, "https://x.com/login", headless=True)
+    assert a[0] == "msedge.exe"
     assert f"--user-data-dir={tmp_path}" in a and "--headless=new" in a and a[-1] == "https://x.com/login"
     assert "--remote-debugging-port=0" in a
+    assert "--no-first-run" in a and "--no-default-browser-check" in a
 
 
 def test_devtools_port_file(tmp_path):

@@ -35,5 +35,6 @@ argos-translate/
 cookies/
 *cookies*.txt
 
-# Tool-owned browser profile for 获取 Cookies (contains logins: NEVER commit)
+# Tool-owned Edge profile for 获取 Cookies (contains logins: NEVER commit)
 browser_profile/
+browser_profile_edge/

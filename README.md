@@ -154,9 +154,9 @@ python translate_local.py path\to\image.jpg
 2. **保存到**：默认 `%USERPROFILE%\Downloads`；**选择文件夹…** 修改后写入 `config.json` 的 `video_download_dir`；**打开文件夹** 用资源管理器打开
 3. **只下载单个视频（--no-playlist）** 默认勾选；**浏览器 Cookies**（无 / chrome / edge / firefox）用于需要登录的网站（`--cookies-from-browser`）
    - **Cookies 文件（按网站保存）**：列表显示已存的网站、更新时间（文件修改时间）与 Cookie 条数。点 **导入…** 选浏览器扩展导出的 `cookies.txt`（Netscape 格式）：校验后按文件里的 Cookie 域名**自动识别网站**（去掉开头 `.`、`#HttpOnly_`、`www.`；别名 `twitter.com`→`x.com`，`youtu.be` / `m.youtube.com` / `music.youtube.com`→`youtube.com` 等；常见视频网站优先，所以 YouTube 导出里混入的 `google.com` 不会抢走网站名；否则取出现最多的主域名，`co.jp` / `co.uk` 等保留三段），**移入** `<程序目录>\cookies\<网站>.txt`（如 `x.com.txt`、`youtube.com.txt`；临时文件 + `os.replace` 原子写入，再删除原文件；原文件被占用时保留已存副本并给出中文警告）。同一网站再次导入只覆盖该网站的旧文件，其它网站不动。**删除所选** 只删除选中网站的文件
-   - **获取 Cookies（内置，推荐，无需浏览器扩展）**：选择网站（YouTube / X / 其他 URL，后者在输入框填网址），点 **登录并获取 Cookies…**：程序用已安装的 Chrome（没有则 Edge）以**工具专用配置** `<程序目录>\browser_profile\`（已 gitignore，与你平时的浏览器配置完全隔离，不读取、不关闭你自己的浏览器）打开该网站。**首次**在这个窗口里登录（YouTube 如提示年龄验证请在此完成）；登录状态保存在专用配置里，以后无需再登录。登录好后回到下载窗口点 **完成，导出 Cookies**：通过 DevTools 协议（`--remote-debugging-port=0` + `Storage.getCookies`，标准库实现，无额外依赖）读取全部 Cookie，按网站域名过滤（YouTube = `youtube.com` + `google.com`；X = `x.com` + `twitter.com`），写成 Netscape 格式（以 `.` 开头的域名第 2 列为 `TRUE`、HttpOnly 加 `#HttpOnly_`、会话 Cookie 过期时间 0），原子保存为 `cookies\<网站>.txt`，然后关闭专用浏览器。之后点 **直接刷新** 会无界面（`--headless=new`）启动同一配置、打开网站并重新导出（YouTube 会轮换 Cookies，下载前刷新一次即可）。未检测到登录 Cookie（YouTube `SAPISID`/`LOGIN_INFO`，X `auth_token`）时**不保存**（已有文件保持不变）并提示先登录；命令行可加 `--allow-anonymous` 强制保存。Cookie 值从不写入日志
-   - 命令行：`python get_cookies.py youtube`（打开窗口，登录后按回车导出）、`python get_cookies.py x --refresh`（无界面刷新）、`python get_cookies.py https://www.bilibili.com/`；`--browser edge` 指定 Edge
-   - 为什么不用浏览器 Cookies / 直接读数据库：Chrome/Edge 运行时数据库被锁，且 v127 起 App-Bound 加密导致 `Could not copy Chrome cookie database` / DPAPI 错误；Chrome 136+ 禁止在默认配置上开调试端口，所以使用独立的专用配置
+   - **获取 Cookies（内置，推荐，无需浏览器扩展）**：选择网站（YouTube / X / 其他 URL，后者在输入框填网址），点 **登录并获取 Cookies…**：程序**始终使用 Microsoft Edge**（不用 Chrome；Google 登录在工具启动的 Chrome 窗口会被拒绝）以**工具专用 Edge 配置** `<程序目录>\browser_profile_edge\`（已 gitignore，与你平时的浏览器配置完全隔离，不读取、不关闭你自己的浏览器）打开独立的 Edge 窗口访问该网站。**首次**在这个窗口里登录（YouTube 如提示年龄验证请在此完成）；登录状态保存在专用配置里，以后无需再登录。登录好后回到下载窗口点 **完成，导出 Cookies**：通过 DevTools 协议（`--remote-debugging-port=0` + `Storage.getCookies`，标准库实现，无额外依赖）读取全部 Cookie，按网站域名过滤（YouTube = `youtube.com` + `google.com`；X = `x.com` + `twitter.com`），写成 Netscape 格式（以 `.` 开头的域名第 2 列为 `TRUE`、HttpOnly 加 `#HttpOnly_`、会话 Cookie 过期时间 0），原子保存为 `cookies\<网站>.txt`，然后关闭专用 Edge。之后点 **直接刷新** 会无界面（`--headless=new`）启动同一 Edge 配置、打开网站并重新导出（YouTube 会轮换 Cookies，下载前刷新一次即可）。未检测到登录 Cookie（YouTube `SAPISID`/`LOGIN_INFO`，X `auth_token`）时**不保存**（已有文件保持不变）并提示先登录；命令行可加 `--allow-anonymous` 强制保存。Cookie 值从不写入日志
+   - 命令行：`python get_cookies.py youtube`（打开独立 Edge 窗口，登录后按回车导出）、`python get_cookies.py x --refresh`（无界面刷新）、`python get_cookies.py https://www.bilibili.com/`；始终使用 Edge（`--browser edge` 可写，仅接受 edge）
+   - 为什么不用浏览器 Cookies / 直接读数据库：Chrome/Edge 运行时数据库被锁，且 v127 起 App-Bound 加密导致 `Could not copy Chrome cookie database` / DPAPI 错误；Chrome 136+ 禁止在默认配置上开调试端口；且 Google 拒绝在工具启动的 Chrome 窗口登录，所以始终用独立的 Edge 专用配置（`browser_profile_edge`）
    - **下载时按链接网站自动使用对应 Cookies**：每个链接按域名（同样的别名规则）找 `cookies\<网站>.txt`，有则传 `--cookies <整理后的临时副本>`；没有则用「浏览器 Cookies」设置（若已选）；都没有则不带 Cookies。X 与 YouTube 混合的队列会逐个链接选择。日志只写用了哪个网站的 Cookies，不写 Cookie 值
    - 错误提示：文件只有文件头注释、没有任何 Cookie 行时提示「这个 Cookies 文件是空的（只有文件头，没有任何 Cookie）。请在已登录该网站的页面上重新导出。」（通常是在未登录状态下导出）；有内容但没有 7 列 Tab 分隔行时提示格式不对
    - `cookies/` 与 `*cookies*.txt` 已写入 `.gitignore`，cookies（=登录凭据）**永远不会被提交**
@@ -244,7 +244,7 @@ Cookies 文件不写入配置：按网站保存在 `<程序目录>\cookies\<网�
 img-stitch-pdf/
 ├── main.py                      # GUI 与导出逻辑
 ├── translate_local.py           # 本地 EN→ZH（OCR / MT / 下方译文条带）
-├── cookie_grabber.py            # 获取 Cookies：专用浏览器配置 + CDP 导出 Netscape cookies
+├── cookie_grabber.py            # 获取 Cookies：专用 Edge 配置 + CDP 导出 Netscape cookies
 ├── get_cookies.py               # 命令行：python get_cookies.py youtube|x|<网址> [--refresh]
 ├── video_dl.py                  # 下载视频：yt-dlp 命令构建 / 进度解析 / 队列与取消
 ├── ocr_backend.py               # PaddleOCR / EasyOCR 引擎与自动安装
