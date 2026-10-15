@@ -1,9 +1,9 @@
-"""命令行获取 Cookies：python get_cookies.py youtube|x|<网址> [--refresh] [--browser edge]
+"""命令行获取 Cookies（始终使用 Microsoft Edge，专用配置 browser_profile_edge\\）。
 
-不带 --refresh：用工具专用 Edge 配置（browser_profile_edge\\）打开网站窗口，登录后回到命令行按回车导出。
-带 --refresh：无界面启动同一配置直接导出（需要之前已登录过）。
-结果保存到 cookies\\<网站>.txt（Netscape 格式），下载视频时自动使用。不打印 Cookie 值。
-本工具始终使用 Microsoft Edge（不使用 Chrome）。
+  python get_cookies.py login  youtube|x|<网址>   # 第 1 步：打开普通 Edge 窗口，自己登录后关闭窗口
+  python get_cookies.py export youtube|x|<网址>   # 第 2 步：无界面读取该配置的 Cookies 并保存
+
+结果保存为 cookies\\<网站>.txt（Netscape 格式），下载视频时自动使用。不打印 Cookie 值。
 """
 from __future__ import annotations
 
@@ -14,22 +14,23 @@ import cookie_grabber as cg
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="用工具专用 Edge 配置导出网站 Cookies（Netscape 格式）")
-    ap.add_argument("site", help="youtube / x / 网址")
-    ap.add_argument("--refresh", action="store_true", help="无界面直接刷新（已登录过时）")
-    ap.add_argument("--browser", choices=("edge",), default="edge",
-                    help="仅支持 edge（默认；保留此选项兼容旧调用）")
-    ap.add_argument("--allow-anonymous", action="store_true", help="未登录也保存（默认不保存，避免覆盖）")
+    ap = argparse.ArgumentParser(description="用工具专用 Edge 配置登录并导出网站 Cookies（Netscape 格式）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p_login = sub.add_parser("login", help="打开普通 Edge 窗口（无调试端口），自己登录后关闭窗口")
+    p_login.add_argument("site", help="youtube / x / 网址")
+    p_exp = sub.add_parser("export", help="登录窗口关闭后，无界面读取 Cookies 并保存")
+    p_exp.add_argument("site", help="youtube / x / 网址")
+    p_exp.add_argument("--allow-anonymous", action="store_true", help="未登录也保存（默认不保存，避免覆盖）")
+    for p in (p_login, p_exp):
+        p.add_argument("--browser", choices=("edge",), default="edge", help="仅支持 edge")
     a = ap.parse_args(argv)
     try:
         spec = cg.resolve_site(a.site)
-        if a.refresh:
-            res = cg.refresh_headless(spec, browser=a.browser, log=print, allow_anonymous=a.allow_anonymous)
-        else:
-            s = cg.BrowserSession(browser=a.browser, log=print)
-            s.start(spec.login_url)
-            input(f"请在打开的独立 Edge 窗口中登录 {spec.label}（首次需要；如提示年龄验证请完成），完成后按回车导出：")
-            res = s.export(spec, allow_anonymous=a.allow_anonymous)
+        if a.cmd == "login":
+            cg.launch_login(spec, browser=a.browser, log=print)
+            print(f"完成后运行：python get_cookies.py export {a.site}")
+            return 0
+        res = cg.export_cookies(spec, browser=a.browser, log=print, allow_anonymous=a.allow_anonymous)
     except cg.CookieGrabError as e:
         print(f"失败：{e}", file=sys.stderr)
         return 1

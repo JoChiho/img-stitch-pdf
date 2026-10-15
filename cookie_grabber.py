@@ -192,6 +192,11 @@ def tool_profile_dir() -> Path:
     return Path(__file__).resolve().parent / PROFILE_DIRNAME
 
 
+def build_login_args(browser: Path, profile: Path, url: str) -> List[str]:
+    """第 1 步「打开 Edge 登录…」：普通 Edge 窗口，无调试端口 / 无 headless / 不连 CDP。"""
+    return [str(browser), f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", url]
+
+
 def build_launch_args(browser: Path, profile: Path, url: str, *, headless: bool = False) -> List[str]:
     args = [str(browser), f"--user-data-dir={profile}", "--remote-debugging-port=0",
             "--no-first-run", "--no-default-browser-check", "--disable-background-networking"]
@@ -347,12 +352,12 @@ def save_site_cookies(spec: SiteSpec, cookies: Iterable[Mapping], store_dir=None
     if not allow_anonymous and sel and is_logged_in(sel, spec) is False:
         raise CookieGrabError(
             f"专用浏览器里还没有登录 {spec.label}（未找到登录 Cookie），未保存，已有文件保持不变。"
-            "请点「登录并获取 Cookies…」在打开的独立 Edge 窗口中登录后再导出。"
+            "请先点「打开 Edge 登录…」，在弹出的 Edge 里登录并关闭该窗口后再点「导出 Cookies」。"
         )
     text, n = cookies_to_netscape(sel)
     if n == 0:
         raise CookieGrabError(
-            f"专用浏览器里没有 {spec.label} 的 Cookies。请先在打开的独立 Edge 窗口中访问并登录该网站，再导出。"
+            f"专用浏览器里没有 {spec.label} 的 Cookies。请先点「打开 Edge 登录…」登录该网站并关闭窗口，再点「导出 Cookies」。"
         )
     dest = video_dl.stored_cookies_path_for_site(spec.key, store_dir)
     try:
@@ -422,7 +427,7 @@ class BrowserSession:
 
     def get_cookies(self) -> List[dict]:
         if not self.ws_url and not self.attach_existing():
-            raise CookieGrabError("专用浏览器没有在运行。请先点「登录并获取 Cookies…」打开独立 Edge 窗口。")
+            raise CookieGrabError("专用浏览器没有在运行。")
         try:
             c = CDPConnection(self.ws_url)  # type: ignore[arg-type]
         except OSError as e:
@@ -474,16 +479,104 @@ class BrowserSession:
                 self.close()
 
 
+LOGIN_HINT = "在弹出的 Edge 里登录（需要的话完成年龄验证），然后关闭该窗口，再点「导出 Cookies」。"
+
+
+def _query_edge_processes() -> List[Tuple[int, str]]:
+    """(pid, command line) of running msedge.exe processes (Windows: Get-CimInstance Win32_Process)."""
+    if sys.platform != "win32":
+        try:
+            out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=15).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        res = []
+        for line in out.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit() and "edge" in parts[1].lower():
+                res.append((int(parts[0]), parts[1]))
+        return res
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+          "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return []
+    txt = r.stdout.decode("utf-8", "replace").strip()
+    if not txt:
+        return []
+    try:
+        data = json.loads(txt)
+    except ValueError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    return [(int(d.get("ProcessId") or 0), str(d.get("CommandLine") or "")) for d in data if isinstance(d, dict)]
+
+
+def profile_processes(profile: Optional[Path] = None,
+                      query: Callable[[], List[Tuple[int, str]]] = None) -> List[int]:
+    """PIDs of Edge processes whose command line contains the tool profile path (never other Edge)."""
+    prof = str(Path(profile) if profile else tool_profile_dir()).rstrip("\\/").lower()
+    q = query or _query_edge_processes
+    out = []
+    for pid, cmd in q():
+        c = (cmd or "").lower().replace('"', "")
+        if prof and prof in c:
+            out.append(pid)
+    return out
+
+
+def launch_login(spec: SiteSpec, profile=None, browser=None, log: Callable[[str], None] = lambda m: None,
+                 popen: Callable = None, query=None) -> int:
+    """第 1 步：以普通窗口启动 Edge（专用配置），用户自己登录后关闭窗口。返回 PID。"""
+    prof = Path(profile) if profile else tool_profile_dir()
+    if profile_processes(prof, query):
+        raise CookieGrabError("专用 Edge 窗口已经打开了：请在其中登录，完成后关闭该窗口，再点「导出 Cookies」。")
+    _, exe = pick_browser(browser)
+    prof.mkdir(parents=True, exist_ok=True)
+    kw: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
+    p = (popen or subprocess.Popen)(build_login_args(exe, prof, spec.login_url), **kw)
+    log(f"已打开 Edge（专用配置 {prof.name}，不影响你平时的浏览器）。{LOGIN_HINT}")
+    return p.pid
+
+
+def export_cookies(spec: SiteSpec, store_dir=None, profile=None, browser=None,
+                   log: Callable[[str], None] = lambda m: None, settle: float = 4.0,
+                   allow_anonymous: bool = False, query=None,
+                   session_factory: Callable = None) -> ExportResult:
+    """第 2 步「导出 Cookies」/「直接刷新」：确认登录窗口已关闭 → 无界面启动同一配置 → 导出 → 关闭。"""
+    prof = Path(profile) if profile else tool_profile_dir()
+    if profile_processes(prof, query):
+        raise CookieGrabError("专用 Edge 窗口还开着：请先关闭那个登录用的 Edge 窗口（只关它，不用关你平时的 Edge），再点「导出 Cookies」。")
+    if not prof.is_dir():
+        raise CookieGrabError("还没有登录过：请先点「打开 Edge 登录…」。")
+    s = (session_factory or BrowserSession)(prof, browser, log)
+    s.start(spec.login_url, headless=True)
+    pid = s.proc.pid if s.proc is not None else None
+    try:
+        time.sleep(settle)
+        return s.export(spec, store_dir, close=True, allow_anonymous=allow_anonymous)
+    finally:
+        s.close()
+        if pid is not None and s.proc is None:
+            _ensure_exit(pid, prof, query)
+
+
+def _ensure_exit(pid: int, prof: Path, query=None, wait: float = 10.0) -> None:
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if pid not in profile_processes(prof, query):
+            return
+        time.sleep(0.3)
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
 def refresh_headless(spec: SiteSpec, store_dir=None, profile=None, browser=None,
                      log: Callable[[str], None] = lambda m: None, settle: float = 4.0,
                      allow_anonymous: bool = False) -> ExportResult:
-    """「直接刷新」：无界面启动专用配置，打开网站让 Cookies 轮换后导出并关闭。"""
-    s = BrowserSession(profile, browser, log)
-    s.start(spec.login_url, headless=True)
-    try:
-        if s.proc is not None:
-            time.sleep(settle)
-        return s.export(spec, store_dir, close=s.proc is not None, allow_anonymous=allow_anonymous)
-    finally:
-        if s.proc is not None:
-            s.close()
+    """兼容旧调用：等同 :func:`export_cookies`。"""
+    return export_cookies(spec, store_dir, profile, browser, log, settle, allow_anonymous)

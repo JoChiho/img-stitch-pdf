@@ -166,3 +166,77 @@ def test_websocket_cdp_against_fake_server():
     t.join(5)
     srv.close()
     assert len(got) == 2000
+
+
+def test_login_args_plain_window(tmp_path):
+    a = cg.build_login_args(Path("msedge.exe"), tmp_path, "https://www.youtube.com/")
+    assert a == ["msedge.exe", f"--user-data-dir={tmp_path}", "--no-first-run",
+                 "--no-default-browser-check", "https://www.youtube.com/"]
+    assert not any("remote-debugging" in x or "headless" in x for x in a)
+
+
+def test_launch_login_no_debug_flags(tmp_path, monkeypatch):
+    monkeypatch.setattr(cg, "pick_browser", lambda pref=None: ("edge", Path("msedge.exe")))
+    seen = {}
+
+    class P:
+        pid = 4242
+
+    def popen(args, **kw):
+        seen["args"] = args
+        return P()
+
+    pid = cg.launch_login(cg.SITES["youtube"], profile=tmp_path / "prof", popen=popen, query=lambda: [])
+    assert pid == 4242
+    assert not any("remote-debugging" in x or "headless" in x for x in seen["args"])
+    assert seen["args"][-1] == "https://www.youtube.com/"
+
+
+def test_profile_processes_only_tool_profile(tmp_path):
+    prof = tmp_path / "browser_profile_edge"
+    q = lambda: [(1, r'"C:\Edge\msedge.exe" --profile-directory=Default'),
+                 (2, f'"msedge.exe" --user-data-dir="{prof}" --no-first-run'),
+                 (3, f"msedge.exe --type=renderer --user-data-dir={prof}")]
+    assert cg.profile_processes(prof, q) == [2, 3]
+
+
+def test_export_refuses_while_login_window_open(tmp_path):
+    prof = tmp_path / "p"
+    prof.mkdir()
+    with pytest.raises(cg.CookieGrabError, match="关闭"):
+        cg.export_cookies(cg.SITES["x"], tmp_path, profile=prof,
+                          query=lambda: [(9, f"msedge.exe --user-data-dir={prof}")])
+
+
+def test_export_headless_mocked(tmp_path):
+    prof = tmp_path / "p"
+    prof.mkdir()
+    calls = {}
+
+    class FakeProc:
+        pid = 77
+
+    class FakeSession:
+        def __init__(self, profile, browser, log):
+            self.proc = None
+
+        def start(self, url, headless=False):
+            calls["start"] = (url, headless)
+            self.proc = FakeProc()
+
+        def export(self, spec, store_dir, close=True, allow_anonymous=False):
+            calls["close"] = close
+            return cg.save_site_cookies(spec, [cg_c(".x.com", "auth_token")], store_dir)
+
+        def close(self):
+            calls["closed"] = True
+            self.proc = None
+
+    res = cg.export_cookies(cg.SITES["x"], tmp_path, profile=prof, settle=0, query=lambda: [],
+                            session_factory=FakeSession)
+    assert res.path == tmp_path / "x.com.txt" and res.logged_in is True
+    assert calls["start"] == ("https://x.com/login", True) and calls["closed"]
+
+
+def cg_c(domain, name):
+    return _c(domain, name)
