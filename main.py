@@ -1096,6 +1096,7 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         self._pip_cancel = threading.Event()
         self._ytdlp_base: Optional[List[str]] = None
         self._ffmpeg: Optional[str] = None
+        self._deno: Optional[str] = None
         self._ffmpeg_warned = False
         self._asked_install = False
         self._poll_job: Optional[str] = None
@@ -1390,6 +1391,7 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         vd = self._vd
         self._ytdlp_base = info.get("ytdlp")  # type: ignore[assignment]
         self._ffmpeg = info.get("ffmpeg")  # type: ignore[assignment]
+        self._deno = info.get("deno")  # type: ignore[assignment]
         if self._ytdlp_base:
             how = (
                 "PATH"
@@ -1406,17 +1408,19 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         ftxt = "ffmpeg ✓" if self._ffmpeg else f"ffmpeg 未找到（{vd.FFMPEG_INSTALL_HINT}）"
         self.tool_var.set(f"{ytxt} · {ftxt}")
         if not self._ytdlp_base:
-            self._log("未找到 yt-dlp。点「安装 yt-dlp」可一键 pip install yt-dlp。")
+            self._log("未找到 yt-dlp。点「安装 yt-dlp」可一键 pip install yt-dlp[default]。")
             if not self._busy and not self._asked_install:
                 self._asked_install = True
                 if messagebox.askyesno(
                     "未找到 yt-dlp",
-                    "没有找到 yt-dlp。\n现在用 pip 安装吗？（pip install yt-dlp）",
+                    "没有找到 yt-dlp。\n现在用 pip 安装吗？（pip install yt-dlp[default]）",
                     parent=self,
                 ):
                     self._pip_ytdlp(upgrade=False)
         if not self._ffmpeg:
             self._log(vd.ffmpeg_missing_message())
+        if not self._deno:
+            self._log(vd.DENO_MISSING_TIP)
 
     def _pip_ytdlp(self, upgrade: bool) -> None:
         if self._busy:
@@ -1481,6 +1485,7 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
             cookies_browser=cookies,
             ffmpeg_location=vd.ffmpeg_location_arg(self._ffmpeg),
             cookies_dir=vd.tool_cookies_dir(),
+            deno_path=vd.deno_runtime_arg(getattr(self, "_deno", None)),
             on_event=self._emit,
         )
         self._last_file = None

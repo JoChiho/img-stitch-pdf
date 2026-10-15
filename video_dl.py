@@ -28,7 +28,31 @@ DEFAULT_FORMAT = "bv*+ba/b"
 COOKIE_BROWSER_NONE = "无"
 COOKIE_BROWSERS = (COOKIE_BROWSER_NONE, "chrome", "edge", "firefox")
 FFMPEG_INSTALL_HINT = "winget install Gyan.FFmpeg"
-YTDLP_PIP_PACKAGE = "yt-dlp"
+YTDLP_PIP_PACKAGE = "yt-dlp[default]"  # [default] 带 yt-dlp-ejs（YouTube JS 挑战求解脚本）
+DENO_INSTALL_HINT = "winget install DenoLand.Deno"
+# YouTube 的 n/sig JS 挑战需要 deno + 求解脚本；允许 yt-dlp 从 GitHub 拉取求解脚本
+YOUTUBE_REMOTE_COMPONENTS = "ejs:github"
+YOUTUBE_SITES = ("youtube.com", "youtu.be")
+DENO_MISSING_TIP = (
+    f"提示：未找到 deno，YouTube 的 JS 挑战（n challenge）可能无法求解、格式缺失。"
+    f"请在 PowerShell 运行：{DENO_INSTALL_HINT}，然后重启本工具。"
+)
+AGE_VERIFY_TIP = (
+    "提示：该视频有年龄限制，YouTube 要求账号年龄验证。账号需在 YouTube 完成年龄验证，"
+    "或 Cookies 未登录/已失效；建议用无痕窗口登录后导出并关闭窗口（YouTube 会轮换已打开标签页的 Cookies）。"
+)
+N_CHALLENGE_TIP = (
+    "提示：YouTube JS 挑战（n challenge）求解失败。请先点「更新 yt-dlp」，并确认已安装 deno"
+    f"（{DENO_INSTALL_HINT}）；本工具已自动加 --remote-components {YOUTUBE_REMOTE_COMPONENTS}。"
+)
+PO_TOKEN_TIP = (
+    "提示：部分 YouTube 客户端格式需要 PO Token，已被跳过（通常仍能下载其它格式）；"
+    "若全部失败，请更新 yt-dlp 并重新导出 YouTube Cookies。"
+)
+BOT_CHECK_TIP = (
+    "提示：YouTube 要求“登录以确认不是机器人”。请用无痕窗口登录 YouTube，导出 cookies.txt 后关闭窗口，"
+    "再在「Cookies 文件」导入 youtube.com 的 Cookies。"
+)
 NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
 HTTPONLY_PREFIX = "#HttpOnly_"
 COOKIES_NEED_LOGIN_TIP = (
@@ -629,6 +653,52 @@ def output_hint(line: str, *, has_cookies: bool) -> Optional[str]:
         return BROWSER_DECRYPT_TIP
     if "No video could be found" in line and not has_cookies:
         return COOKIES_NEED_LOGIN_TIP
+    if "age-restricted" in line and "age-verification" in line:
+        return AGE_VERIFY_TIP
+    if "n challenge solving failed" in line:
+        return N_CHALLENGE_TIP
+    if "PO Token" in line and ("WARNING" in line or "ERROR" in line):
+        return PO_TOKEN_TIP
+    if "Sign in to confirm you" in line and "not a bot" in line:
+        return BOT_CHECK_TIP
+    return None
+
+
+def is_youtube_url(url: Optional[str]) -> bool:
+    return site_for_url(url) in YOUTUBE_SITES
+
+
+def _winget_deno_candidates() -> List[str]:
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return []
+    pats = [
+        os.path.join(local, "Microsoft", "WinGet", "Packages", "DenoLand.Deno*", "deno.exe"),
+        os.path.join(local, "Microsoft", "WinGet", "Links", "deno.exe"),
+    ]
+    out: List[str] = []
+    for pat in pats:
+        out += sorted(glob.glob(pat))
+    home = os.path.expanduser("~")
+    out.append(os.path.join(home, ".deno", "bin", "deno.exe"))
+    return out
+
+
+def deno_runtime_arg(deno: Optional[str], which=shutil.which) -> Optional[str]:
+    """Path for ``--js-runtimes deno:<path>`` only when deno is found but not on PATH."""
+    if not deno or which("deno"):
+        return None
+    return deno
+
+
+def find_deno(which: Callable[[str], Optional[str]] = shutil.which) -> Optional[str]:
+    """Locate deno (JS runtime yt-dlp uses for YouTube challenges)."""
+    p = which("deno")
+    if p:
+        return p
+    for c in _winget_deno_candidates():
+        if os.path.isfile(c):
+            return c
     return None
 
 
@@ -645,6 +715,7 @@ def build_command(
     ffmpeg_location: Optional[str] = None,
     fmt: str = DEFAULT_FORMAT,
     cookies_file=None,
+    deno_path: Optional[str] = None,
 ) -> List[str]:
     """Build ``yt-dlp -f bv*+ba/b -P <dir> --newline [--no-playlist] [cookies] URL``.
 
@@ -663,6 +734,10 @@ def build_command(
         cmd += ["--cookies-from-browser", browser]
     if ffmpeg_location:
         cmd += ["--ffmpeg-location", str(ffmpeg_location)]
+    if is_youtube_url(url):
+        cmd += ["--remote-components", YOUTUBE_REMOTE_COMPONENTS]
+        if deno_path:
+            cmd += ["--js-runtimes", f"deno:{deno_path}"]
     cmd.append(url)
     return cmd
 
@@ -800,7 +875,7 @@ def probe_tools() -> Dict[str, object]:
         elif rc == 127:  # executable vanished / not runnable
             base = None
     ffmpeg = find_ffmpeg()
-    return {"ytdlp": base, "ytdlp_version": version, "ffmpeg": ffmpeg}
+    return {"ytdlp": base, "ytdlp_version": version, "ffmpeg": ffmpeg, "deno": find_deno()}
 
 
 class DownloadRunner:
@@ -828,8 +903,10 @@ class DownloadRunner:
         cookies_file=None,
         cookies_tmp_dir=None,
         cookies_dir=None,
+        deno_path: Optional[str] = None,
         on_event: EventCallback,
     ) -> None:
+        self.deno_path = deno_path
         self.base = list(base)
         self.urls = list(urls)
         self.out_dir = Path(out_dir)
@@ -894,6 +971,7 @@ class DownloadRunner:
                     cookies_browser=cbrowser,
                     ffmpeg_location=self.ffmpeg_location,
                     cookies_file=cfile,
+                    deno_path=self.deno_path,
                 )
                 self.on_event(("start", idx, n, url))
                 self.on_event(("log", "> " + subprocess.list2cmdline(cmd)))

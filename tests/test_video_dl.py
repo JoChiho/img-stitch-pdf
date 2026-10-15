@@ -107,9 +107,9 @@ def test_build_command_rejects_empty_base(tmp_path: Path):
 
 def test_pip_install_command():
     up = video_dl.pip_install_command(upgrade=True)
-    assert up[1:] == ["-m", "pip", "install", "-U", "yt-dlp"]
+    assert up[1:] == ["-m", "pip", "install", "-U", "yt-dlp[default]"]
     fresh = video_dl.pip_install_command(upgrade=False)
-    assert "-U" not in fresh and fresh[-1] == "yt-dlp"
+    assert "-U" not in fresh and fresh[-1] == "yt-dlp[default]"
 
 
 def test_version_command():
@@ -740,3 +740,56 @@ def test_gitignore_excludes_cookies():
     gi = (Path(main.__file__).resolve().parent / ".gitignore").read_text(encoding="utf-8")
     lines = {ln.strip() for ln in gi.splitlines()}
     assert "cookies/" in lines and "*cookies*.txt" in lines
+
+
+# ------------------------------------------------------------------ YouTube JS challenges
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+    "https://m.youtube.com/watch?v=1",
+    "https://youtu.be/jNQXAC9IVRw",
+    "https://music.youtube.com/watch?v=1",
+])
+def test_build_command_youtube_adds_remote_components(tmp_path, url):
+    cmd = video_dl.build_command(["yt-dlp"], url, tmp_path)
+    i = cmd.index("--remote-components")
+    assert cmd[i + 1] == video_dl.YOUTUBE_REMOTE_COMPONENTS == "ejs:github"
+    assert cmd[-1] == url
+    assert "--js-runtimes" not in cmd
+
+
+def test_build_command_non_youtube_has_no_remote_components(tmp_path):
+    cmd = video_dl.build_command(["yt-dlp"], "https://x.com/a/status/1", tmp_path)
+    assert "--remote-components" not in cmd
+
+
+def test_build_command_youtube_deno_path(tmp_path):
+    cmd = video_dl.build_command(["yt-dlp"], "https://youtu.be/x", tmp_path, deno_path=r"C:\d\deno.exe")
+    i = cmd.index("--js-runtimes")
+    assert cmd[i + 1] == r"deno:C:\d\deno.exe"
+    cmd2 = video_dl.build_command(["yt-dlp"], "https://x.com/a", tmp_path, deno_path=r"C:\d\deno.exe")
+    assert "--js-runtimes" not in cmd2
+
+
+def test_deno_runtime_arg_and_find_deno():
+    assert video_dl.deno_runtime_arg(r"C:\d\deno.exe", which=lambda n: None) == r"C:\d\deno.exe"
+    assert video_dl.deno_runtime_arg(r"C:\d\deno.exe", which=lambda n: "deno.exe") is None
+    assert video_dl.deno_runtime_arg(None, which=lambda n: None) is None
+    assert video_dl.find_deno(which=lambda n: r"C:\x\deno.exe") == r"C:\x\deno.exe"
+
+
+def test_youtube_output_hints():
+    h = video_dl.output_hint
+    age = "[youtube] A8J2vHug9U0: This video is age-restricted and YouTube is requiring account age-verification; some formats may be missing"
+    assert h(age, has_cookies=True) == video_dl.AGE_VERIFY_TIP
+    assert "无痕窗口" in video_dl.AGE_VERIFY_TIP and "年龄验证" in video_dl.AGE_VERIFY_TIP
+    n = "WARNING: [youtube] X: n challenge solving failed: Some formats may be missing."
+    assert h(n, has_cookies=True) == video_dl.N_CHALLENGE_TIP
+    po = "WARNING: [youtube] X: web_creator client https formats require a GVS PO Token which was not provided."
+    assert h(po, has_cookies=True) == video_dl.PO_TOKEN_TIP
+    for q in ("\u2019", "'"):
+        bot = f"ERROR: [youtube] X: Sign in to confirm you{q}re not a bot."
+        assert h(bot, has_cookies=False) == video_dl.BOT_CHECK_TIP
+    assert h("ERROR: [youtube] X: Sorry, this content is age-restricted", has_cookies=True) is None
+    assert "DenoLand.Deno" in video_dl.DENO_MISSING_TIP

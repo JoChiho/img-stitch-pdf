@@ -160,15 +160,18 @@ python translate_local.py path\to\image.jpg
    - 迁移：旧版的单个 `cookies\cookies.txt` 会在打开「下载视频」时按内容识别网站并改名为 `cookies\<网站>.txt`，并从 `config.json` 删除旧的 `video_cookies_file`。不再自动从 `Downloads` 导入文件
    - 扩展导出的文件常有格式问题（如 `.x.com\tFALSE\t/…`：域名以 `.` 开头但第 2 列是 `FALSE`），yt-dlp 会报 `invalid Netscape format cookies file`。程序每次下载前会在 `%TEMP%` 写一份**整理后的临时副本**（补 `# Netscape HTTP Cookie File` 头；只保留 7 列 Tab 分隔的行，含 `#HttpOnly_` 行；第 2 列按域名是否以 `.` 开头改为 `TRUE`/`FALSE`；兼容 UTF-8 BOM 与 CRLF），传给 yt-dlp，运行结束即删除；已存的 cookies 文件不改动，日志不打印 cookie 值
    - 日志出现 `No video could be found`（且未设置 Cookies）时会提示：该推文可能需要登录，请「导入…」该网站的 Cookies 文件；Chrome/Edge 的 `--cookies-from-browser` 报 `Could not copy Chrome cookie database` 时会提示先完全关闭浏览器，或改用 Cookies 文件
+   - **YouTube JS 挑战**：YouTube 要求用 JS 运行时求解 n/sig 挑战。YouTube 链接自动加 `--remote-components ejs:github`（常量 `YOUTUBE_REMOTE_COMPONENTS`），允许 yt-dlp 拉取求解脚本；需要安装 **deno**（`winget install DenoLand.Deno`）。启动时检测 deno（PATH 或 WinGet 安装目录），不在 PATH 时自动传 `--js-runtimes deno:<路径>`，找不到则在日志提示安装命令
+   - YouTube 日志提示：`age-restricted` + `age-verification` → 账号需在 YouTube 完成年龄验证，或 Cookies 未登录/已失效，建议用无痕窗口登录后导出并关闭窗口（YouTube 会轮换打开中标签页的 Cookies）；`n challenge solving failed` → 更新 yt-dlp / 安装 deno；`PO Token` → 部分格式被跳过；`Sign in to confirm you’re not a bot` → 重新导出 YouTube Cookies
+   - 年龄限制视频：账号未完成 YouTube 年龄验证时，yt-dlp 无法绕过，通常只能拿到少量格式（如 360p 的 18 号格式）或直接报 `Sorry, this content is age-restricted`
 4. 点 **下载**：进度条与日志实时显示（解析 `yt-dlp --newline` 输出的百分比、速度、剩余时间）；**取消** 会结束 yt-dlp 及其子进程（如 ffmpeg）
 
 实际执行的命令（每个链接一条，日志里会打印）：
 
 ```text
-yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整理后的临时副本> | --cookies-from-browser X] <URL>
+yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整理后的临时副本> | --cookies-from-browser X] [--remote-components ejs:github [--js-runtimes deno:<路径>]（仅 YouTube）] <URL>
 ```
 
-- **yt-dlp 定位**：优先 PATH 上的 `yt-dlp`，否则用当前 Python 的 `python -m yt_dlp`；都没有时提示一键 `pip install yt-dlp`。窗口里的 **更新 yt-dlp** 执行 `pip install -U yt-dlp`（网站改版导致下载失败时先更新）
+- **yt-dlp 定位**：优先 PATH 上的 `yt-dlp`，否则用当前 Python 的 `python -m yt_dlp`；都没有时提示一键 `pip install yt-dlp`。窗口里的 **更新 yt-dlp** 执行 `pip install -U "yt-dlp[default]"`（含 yt-dlp-ejs 求解脚本）（网站改版导致下载失败时先更新）
 - **ffmpeg**：`bv*+ba` 需要 ffmpeg 合并音视频。未找到时窗口会中文提示，安装：`winget install Gyan.FFmpeg`（装好后重开程序；刚装完 PATH 未刷新时也会自动在 WinGet 目录里找到并传 `--ffmpeg-location`）
 - 下载在后台线程 + 子进程（Windows 无黑框）运行，界面不卡；后台线程只通过队列把进度交给 Tk 主线程（`after()` 轮询），不直接操作界面
 - 逻辑在 `video_dl.py`（无 Tk 依赖，有单元测试）；请只下载你有权保存的内容
