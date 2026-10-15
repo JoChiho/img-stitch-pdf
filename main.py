@@ -1195,6 +1195,18 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         cbtns.pack(side=tk.LEFT, anchor=tk.N)
         ttk.Button(cbtns, text="导入…", command=self._choose_cookies_file).pack(fill=tk.X, pady=(0, 4))
         ttk.Button(cbtns, text="删除所选", command=self._delete_selected_cookies).pack(fill=tk.X)
+        rowg = ttk.Frame(opt_fr, style="Card.TFrame")
+        rowg.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(rowg, text="获取 Cookies：", style="Card.TLabel").pack(side=tk.LEFT)
+        self.grab_site_var = tk.StringVar(value="YouTube")
+        ttk.Combobox(
+            rowg, textvariable=self.grab_site_var, values=("YouTube", "X", "其他 URL"), state="readonly", width=9
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        self.grab_url_var = tk.StringVar(value="")
+        ttk.Entry(rowg, textvariable=self.grab_url_var, width=26).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(rowg, text="登录并获取 Cookies…", command=self._grab_login).pack(side=tk.LEFT, padx=2)
+        ttk.Button(rowg, text="完成，导出 Cookies", command=self._grab_export).pack(side=tk.LEFT, padx=2)
+        ttk.Button(rowg, text="直接刷新", command=self._grab_refresh).pack(side=tk.LEFT, padx=2)
         rowh = ttk.Frame(opt_fr, style="Card.TFrame")
         rowh.pack(fill=tk.X, pady=(2, 0))
         ttk.Label(
@@ -1322,9 +1334,82 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         sites = "、".join(it.site for it in items) if items else "（暂无）"
         self.cookies_hint_var.set(
             f"{vd.COOKIES_AUTO_HINT}（已存：{sites}；位置 {vd.tool_cookies_dir()}，按网站分别保存）。"
+            "「登录并获取 Cookies…」用工具专用浏览器登录后导出（推荐，无需扩展；之后可「直接刷新」）；"
             "「导入…」选浏览器扩展导出的 cookies.txt，自动识别网站并移入工具文件夹（同网站覆盖旧文件）。"
             "没有对应网站的文件时使用「浏览器 Cookies」设置（Chrome/Edge 需先完全关闭浏览器）。"
         )
+
+    # ------------------------------------------------------------ 内置获取 Cookies（专用浏览器配置 + CDP）
+    def _grab_spec(self):
+        import cookie_grabber as cg
+
+        choice = self.grab_site_var.get()
+        target = {"YouTube": "youtube", "X": "x"}.get(choice) or (self.grab_url_var.get() or "").strip()
+        if not target:
+            raise cg.CookieGrabError("选择「其他 URL」时，请在右侧输入框填写网站网址。")
+        return cg.resolve_site(target)
+
+    def _grab_run(self, name: str, fn) -> None:
+        import cookie_grabber as cg
+
+        if getattr(self, "_grab_busy", False):
+            self._log("获取 Cookies 正在进行中，请稍候…")
+            return
+        try:
+            spec = self._grab_spec()
+        except cg.CookieGrabError as e:
+            messagebox.showerror("获取 Cookies", str(e), parent=self)
+            return
+        self._grab_busy = True
+
+        def log(m: str) -> None:
+            self._emit(("log", m))
+
+        def work() -> None:
+            try:
+                fn(cg, spec, log)
+            except cg.CookieGrabError as e:
+                log(f"获取 Cookies 失败：{e}")
+            except Exception as e:  # noqa: BLE001
+                log(f"获取 Cookies 出错：{type(e).__name__}: {e}")
+            finally:
+                self._grab_busy = False
+                self._emit(("cookies_refresh",))
+
+        threading.Thread(target=work, daemon=True, name=name).start()
+
+    def _grab_login(self) -> None:
+        def fn(cg, spec, log):
+            s = getattr(self, "_grab_session", None) or cg.BrowserSession(log=log)
+            s.log = log
+            self._grab_session = s
+            s.start(spec.login_url)
+            log(
+                f"已打开专用浏览器窗口（独立配置，不影响你平时的浏览器）：请在其中登录 {spec.label}"
+                "（首次需要；YouTube 如提示年龄验证请完成），然后回到这里点「完成，导出 Cookies」。"
+            )
+
+        self._grab_run("cookie-login", fn)
+
+    def _grab_export(self) -> None:
+        def fn(cg, spec, log):
+            s = getattr(self, "_grab_session", None) or cg.BrowserSession(log=log)
+            s.log = log
+            try:
+                res = s.export(spec)
+            finally:
+                self._grab_session = None
+            log(res.summary() + "（专用浏览器已关闭）")
+
+        self._grab_run("cookie-export", fn)
+
+    def _grab_refresh(self) -> None:
+        def fn(cg, spec, log):
+            log(f"直接刷新 {spec.label} 的 Cookies（无界面启动专用浏览器）…")
+            res = cg.refresh_headless(spec, log=log)
+            log(res.summary())
+
+        self._grab_run("cookie-refresh", fn)
 
     def _choose_cookies_file(self) -> None:
         init = self._vd.default_download_dir()
@@ -1535,6 +1620,8 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         kind = ev[0]
         if kind == "log":
             self._log(str(ev[1]))
+        elif kind == "cookies_refresh":
+            self._refresh_cookies_list()
         elif kind == "tools":
             self._apply_tools(ev[1])
         elif kind == "start":

@@ -34,3 +34,6 @@ argos-translate/
 # Cookies = login credentials: NEVER commit (「下载视频」stores them in cookies/)
 cookies/
 *cookies*.txt
+
+# Tool-owned browser profile for 获取 Cookies (contains logins: NEVER commit)
+browser_profile/
