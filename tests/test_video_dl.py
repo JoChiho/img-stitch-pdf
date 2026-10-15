@@ -486,79 +486,130 @@ def test_download_runner_bad_cookies_file_fails_cleanly(tmp_path):
     assert events[-1] == ("finished", 0, 2, False)
 
 
-def test_video_cookies_file_config_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, "config_dir", lambda: tmp_path / "cfg")
-    assert main.get_video_cookies_file_config() is None
-    f = tmp_path / "cookies.txt"
-    stored = main.set_video_cookies_file_config(f)
-    assert stored == str(f)
-    assert main.get_video_cookies_file_config() == str(f)
-    assert main.load_config()["video_cookies_file"] == str(f)
-    assert main.set_video_cookies_file_config(None) is None
-    assert main.get_video_cookies_file_config() is None
-    assert "video_cookies_file" not in main.load_config()
+# ------------------------------------------------------------------ per-site stored cookies
+
+_YT_COOKIES = (
+    "# Netscape HTTP Cookie File\n"
+    "# https://curl.haxx.se/rfc/cookie_spec.html\n"
+    "# This is a generated file! Do not edit.\n\n"
+    ".youtube.com\tTRUE\t/\tTRUE\t1790000000\tSID\tYTSECRET1\n"
+    "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1790000000\tHSID\tYTSECRET2\n"
+    "www.youtube.com\tFALSE\t/\tTRUE\t1790000000\tPREF\tYTSECRET3\n"
+    ".google.com\tTRUE\t/\tTRUE\t1790000000\tNID\tG1\n"
+    ".google.com\tTRUE\t/\tTRUE\t1790000000\tSID\tG2\n"
+    ".google.com\tTRUE\t/\tTRUE\t1790000000\tAPISID\tG3\n"
+    ".google.com\tTRUE\t/\tTRUE\t1790000000\tSAPISID\tG4\n"
+)
+_EMPTY_EXPORT = (
+    "# Netscape HTTP Cookie File\n"
+    "# https://curl.haxx.se/rfc/cookie_spec.html\n"
+    "# This is a generated file! Do not edit.\n\n"
+)
 
 
-# ------------------------------------------------------------------ stored cookies (tool folder)
+@pytest.mark.parametrize(
+    "host,key",
+    [
+        (".x.com", "x.com"),
+        ("#HttpOnly_.x.com", "x.com"),
+        ("twitter.com", "x.com"),
+        ("mobile.twitter.com", "x.com"),
+        ("www.youtube.com", "youtube.com"),
+        ("m.youtube.com", "youtube.com"),
+        ("music.youtube.com", "youtube.com"),
+        ("youtu.be", "youtube.com"),
+        (".bilibili.com", "bilibili.com"),
+        ("b23.tv", "bilibili.com"),
+        ("www.nicovideo.jp", "nicovideo.jp"),
+        ("news.yahoo.co.jp", "yahoo.co.jp"),
+        ("www.bbc.co.uk", "bbc.co.uk"),
+        ("", None),
+    ],
+)
+def test_site_key_for_host_aliases(host, key):
+    assert video_dl.site_key_for_host(host) == key
 
 
-def test_tool_cookies_dir_next_to_module():
-    assert video_dl.tool_cookies_dir() == Path(video_dl.__file__).resolve().parent / "cookies"
-    assert video_dl.stored_cookies_path().name == "cookies.txt"
+def test_detect_site_youtube_ignores_google_noise():
+    info = video_dl.analyze_cookies_text(_YT_COOKIES)
+    assert info.kept == 7
+    assert info.site == "youtube.com"  # google.com (4 lines) does not hijack
 
 
-def test_import_cookies_moves_and_deletes_source(tmp_path):
-    store = tmp_path / "tool" / "cookies"
-    src = tmp_path / "Downloads" / "cookies_x.com.txt"
-    src.parent.mkdir()
-    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
-    res = video_dl.import_cookies_file(src, store)
-    assert res.stored == store / "cookies.txt" and res.kept == 4
-    assert res.moved and res.source_deleted and res.warning is None
-    assert not src.exists()
-    assert res.stored.read_bytes() == _EXT_COOKIES.encode("utf-8")
-    assert sorted(p.name for p in store.iterdir()) == ["cookies.txt"]  # no temp leftovers
-    assert video_dl.is_in_cookies_dir(res.stored, store)
-    # per-run normalized temp copy still works from the stored file
-    out, kept = video_dl.write_normalized_cookies(res.stored, tmp_path / "tmp")
-    assert kept == 4 and res.stored.exists()
-    video_dl.remove_file_quietly(out)
+def test_detect_site_x_and_fallback_most_frequent():
+    assert video_dl.analyze_cookies_text(_EXT_COOKIES).site == "x.com"
+    assert video_dl.detect_cookies_site([".a.example.org", "b.example.org", "c.other.net"]) == "example.org"
+    assert video_dl.detect_cookies_site([".twitter.com", ".google.com", ".google.com"]) == "x.com"
+    assert video_dl.detect_cookies_site([]) is None
 
 
-def test_import_cookies_replaces_old_stored(tmp_path):
-    store = tmp_path / "cookies"
-    store.mkdir()
-    (store / "cookies.txt").write_text(".old.com\tTRUE\t/\tTRUE\t0\ta\tOLD\n", encoding="utf-8")
-    (store / "cookies_legacy.txt").write_text("stale", encoding="utf-8")
-    src = tmp_path / "new_cookies.txt"
-    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
-    res = video_dl.import_cookies_file(src, store)
-    assert sorted(p.name for p in store.iterdir()) == ["cookies.txt"]
-    assert b"OLD" not in res.stored.read_bytes() and b"SECRET1" in res.stored.read_bytes()
-    assert not src.exists()
+@pytest.mark.parametrize(
+    "url,key",
+    [
+        ("https://x.com/MicWhyss/status/2106320134461919264", "x.com"),
+        ("https://twitter.com/a/status/1", "x.com"),
+        ("https://www.youtube.com/watch?v=abc", "youtube.com"),
+        ("https://youtu.be/abc", "youtube.com"),
+        ("https://m.youtube.com/shorts/abc", "youtube.com"),
+        ("https://music.youtube.com/watch?v=1", "youtube.com"),
+        ("https://www.bilibili.com/video/BV1", "bilibili.com"),
+        ("https://b23.tv/xyz", "bilibili.com"),
+        ("not a url", None),
+    ],
+)
+def test_site_for_url(url, key):
+    assert video_dl.site_for_url(url) == key
 
 
-def test_import_cookies_noop_when_same_file(tmp_path):
-    store = tmp_path / "cookies"
-    store.mkdir()
-    stored = store / "cookies.txt"
-    stored.write_bytes(_EXT_COOKIES.encode("utf-8"))
-    mtime = stored.stat().st_mtime_ns
-    res = video_dl.import_cookies_file(stored, store)
-    assert not res.moved and not res.source_deleted and res.kept == 4
-    assert stored.exists() and stored.stat().st_mtime_ns == mtime
-
-
-def test_import_cookies_invalid_keeps_everything(tmp_path):
-    store = tmp_path / "cookies"
-    store.mkdir()
-    (store / "cookies.txt").write_bytes(_EXT_COOKIES.encode("utf-8"))
-    bad = tmp_path / "bad.txt"
-    bad.write_text("# only comments\nname=SECRETVALUE\n", encoding="utf-8")
+def test_empty_file_message_vs_wrong_format(tmp_path):
+    empty = tmp_path / "cookies_www.youtube.com.txt"
+    empty.write_text(_EMPTY_EXPORT, encoding="utf-8")
     with pytest.raises(video_dl.CookiesFileError) as ei:
-        video_dl.import_cookies_file(bad, store)
-    assert "SECRETVALUE" not in str(ei.value)
-    assert bad.exists() and (store / "cookies.txt").exists()
+        video_dl.import_cookies_file(empty, tmp_path / "store")
+    msg = str(ei.value)
+    assert "这个 Cookies 文件是空的（只有文件头，没有任何 Cookie）。请在已登录该网站的页面上重新导出。" in msg
+    assert empty.exists() and not (tmp_path / "store").exists()  # untouched
+    bad = tmp_path / "bad.txt"
+    bad.write_text("# header\nx.com TRUE / TRUE 0 a SECRETVALUE\n", encoding="utf-8")
+    with pytest.raises(video_dl.CookiesFileError) as ei2:
+        video_dl.validate_cookies_file(bad)
+    assert "格式不对" in str(ei2.value) and "空的" not in str(ei2.value)
+    assert "SECRETVALUE" not in str(ei2.value)
+    with pytest.raises(video_dl.CookiesFileError) as ei3:
+        video_dl.write_normalized_cookies(empty, tmp_path)
+    assert "空的" in str(ei3.value)
+
+
+def test_import_per_site_replace_and_delete(tmp_path):
+    store = tmp_path / "cookies"
+    x1 = tmp_path / "cookies_x.com.txt"
+    x1.write_bytes(_EXT_COOKIES.encode("utf-8"))
+    r1 = video_dl.import_cookies_file(x1, store)
+    assert r1.site == "x.com" and r1.stored == store / "x.com.txt" and r1.kept == 4
+    assert r1.moved and r1.source_deleted and not r1.replaced and not x1.exists()
+    yt = tmp_path / "cookies_www.youtube.com.txt"
+    yt.write_text(_YT_COOKIES, encoding="utf-8")
+    r2 = video_dl.import_cookies_file(yt, store)
+    assert r2.site == "youtube.com" and r2.stored == store / "youtube.com.txt"
+    assert sorted(p.name for p in store.iterdir()) == ["x.com.txt", "youtube.com.txt"]
+    # replace X only
+    yt_before = (store / "youtube.com.txt").read_bytes()
+    x2 = tmp_path / "new_x.txt"
+    x2.write_text(_EXT_COOKIES.replace("SECRET1", "NEWSECRET"), encoding="utf-8")
+    r3 = video_dl.import_cookies_file(x2, store)
+    assert r3.replaced and r3.site == "x.com"
+    assert b"NEWSECRET" in (store / "x.com.txt").read_bytes()
+    assert (store / "youtube.com.txt").read_bytes() == yt_before
+    assert sorted(p.name for p in store.iterdir()) == ["x.com.txt", "youtube.com.txt"]
+    listed = {s.site: s.count for s in video_dl.list_stored_cookies(store)}
+    assert listed == {"x.com": 4, "youtube.com": 7}
+    # re-import the stored file itself is a no-op
+    r4 = video_dl.import_cookies_file(store / "x.com.txt", store)
+    assert not r4.moved and (store / "x.com.txt").exists()
+    # delete only youtube
+    assert video_dl.delete_stored_cookies("youtube.com", store) is True
+    assert sorted(p.name for p in store.iterdir()) == ["x.com.txt"]
+    assert video_dl.delete_stored_cookies("youtube.com", store) is False
 
 
 def test_import_cookies_source_delete_failure_warns(tmp_path, monkeypatch):
@@ -579,49 +630,113 @@ def test_import_cookies_source_delete_failure_warns(tmp_path, monkeypatch):
     assert "SECRET" not in res.warning
 
 
-def test_clear_stored_cookies_deletes(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, "config_dir", lambda: tmp_path / "cfg")
-    store = tmp_path / "cookies"
-    src = tmp_path / "c.txt"
-    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
-    res = main.import_video_cookies_file(src, store)
-    assert main.get_video_cookies_file_config() == str(res.stored)
-    removed = main.clear_video_cookies_file(store)
-    assert removed and not res.stored.exists()
-    assert main.get_video_cookies_file_config() is None
-    assert "video_cookies_file" not in main.load_config()
+def test_tool_cookies_dir_next_to_module():
+    assert video_dl.tool_cookies_dir() == Path(video_dl.__file__).resolve().parent / "cookies"
 
 
-def test_migrate_config_pointing_outside(tmp_path, monkeypatch):
+def test_migration_legacy_to_site_and_drops_config(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "config_dir", lambda: tmp_path / "cfg")
+    data = main.load_config()
+    data["video_cookies_file"] = str(tmp_path / "cookies" / "cookies.txt")
+    main.save_config(data)
     store = tmp_path / "cookies"
-    dl = tmp_path / "Downloads"
-    dl.mkdir()
-    src = dl / "cookies_x.com.txt"
-    src.write_bytes(_EXT_COOKIES.encode("utf-8"))
-    main.set_video_cookies_file_config(src)
-    msgs = main.migrate_video_cookies_file(store, dl)
-    assert msgs and not src.exists()
-    assert main.get_video_cookies_file_config() == str(store / "cookies.txt")
-    assert (store / "cookies.txt").exists()
+    store.mkdir()
+    (store / "cookies.txt").write_bytes(_EXT_COOKIES.encode("utf-8"))
+    msgs = main.migrate_video_cookies_store(store)
+    assert msgs and "x.com.txt" in msgs[0]
     assert all("SECRET" not in m for m in msgs)
-    assert main.migrate_video_cookies_file(store, dl) == []  # idempotent
+    assert sorted(p.name for p in store.iterdir()) == ["x.com.txt"]
+    assert "video_cookies_file" not in main.load_config()
+    assert main.migrate_video_cookies_store(store) == []  # idempotent
 
 
-def test_migrate_downloads_file_without_config(tmp_path, monkeypatch):
+def test_migration_does_not_touch_downloads(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "config_dir", lambda: tmp_path / "cfg")
-    store = tmp_path / "cookies"
     dl = tmp_path / "Downloads"
     dl.mkdir()
-    assert main.migrate_video_cookies_file(store, dl) == []
     src = dl / "cookies_x.com.txt"
     src.write_bytes(_EXT_COOKIES.encode("utf-8"))
-    msgs = main.migrate_video_cookies_file(store, dl)
-    assert msgs and not src.exists()
-    assert main.get_video_cookies_file_config() == str(store / "cookies.txt")
+    monkeypatch.setattr(video_dl, "default_download_dir", lambda: dl)
+    assert main.migrate_video_cookies_store(tmp_path / "cookies") == []
+    assert src.exists()  # no auto-import any more
+
+
+def test_migration_empty_legacy_kept(tmp_path):
+    store = tmp_path / "cookies"
+    store.mkdir()
+    (store / "cookies.txt").write_text(_EMPTY_EXPORT, encoding="utf-8")
+    msgs = video_dl.migrate_legacy_cookies(store)
+    assert msgs and "空的" in msgs[0]
+    assert (store / "cookies.txt").exists()
+
+
+_SITE_ECHO_SCRIPT = (
+    "import sys\n"
+    "args = sys.argv[1:]\n"
+    "url = args[-1]\n"
+    "if '--cookies' in args:\n"
+    "    p = args[args.index('--cookies') + 1]\n"
+    "    names = [l.split('\\t')[5] for l in open(p, encoding='utf-8') if l.count('\\t') == 6]\n"
+    "    print('URL ' + url + ' FILE ' + ','.join(sorted(names)[:1]), flush=True)\n"
+    "elif '--cookies-from-browser' in args:\n"
+    "    print('URL ' + url + ' BROWSER ' + args[args.index('--cookies-from-browser') + 1], flush=True)\n"
+    "else:\n"
+    "    print('URL ' + url + ' NONE', flush=True)\n"
+    "sys.exit(0)\n"
+)
+
+
+def test_download_runner_mixed_queue_picks_cookies_per_url(tmp_path):
+    base = _fake_ytdlp_base(tmp_path, _SITE_ECHO_SCRIPT)
+    store = tmp_path / "cookies"
+    store.mkdir()
+    (store / "x.com.txt").write_bytes(_EXT_COOKIES.encode("utf-8"))
+    (store / "youtube.com.txt").write_text(_YT_COOKIES, encoding="utf-8")
+    tmpdir = tmp_path / "cookie_tmp"
+    urls = [
+        "https://x.com/a/status/1",
+        "https://www.youtube.com/watch?v=1",
+        "https://twitter.com/b/status/2",
+        "https://youtu.be/2",
+        "https://www.bilibili.com/video/BV1",
+        "https://vimeo.com/1",
+    ]
+    events = []
+    runner = video_dl.DownloadRunner(
+        base, urls, tmp_path / "out", cookies_dir=store, cookies_tmp_dir=tmpdir,
+        cookies_browser="firefox", on_event=events.append,
+    )
+    assert runner.run() == (6, 0, False)
+    logs = [e[1] for e in events if e[0] == "log"]
+    assert "URL https://x.com/a/status/1 FILE auth_token" in logs
+    assert "URL https://www.youtube.com/watch?v=1 FILE APISID" in logs
+    assert "URL https://twitter.com/b/status/2 FILE auth_token" in logs
+    assert "URL https://youtu.be/2 FILE APISID" in logs
+    assert "URL https://www.bilibili.com/video/BV1 BROWSER firefox" in logs
+    assert "URL https://vimeo.com/1 BROWSER firefox" in logs
+    joined = "\n".join(logs)
+    assert "使用 x.com 的 Cookies" in joined and "使用 youtube.com 的 Cookies" in joined
+    for secret in ("SECRET1", "SECRET2", "SECRET3", "YTSECRET1", "G1\n"):
+        assert secret not in joined
+    assert list(tmpdir.iterdir()) == []  # temp copies deleted
+
+
+def test_download_runner_no_cookies_when_nothing_matches(tmp_path):
+    base = _fake_ytdlp_base(tmp_path, _SITE_ECHO_SCRIPT)
+    store = tmp_path / "cookies"
+    store.mkdir()
+    events = []
+    runner = video_dl.DownloadRunner(
+        base, ["https://x.com/a/status/1"], tmp_path / "out", cookies_dir=store,
+        cookies_tmp_dir=tmp_path / "t", on_event=events.append,
+    )
+    assert runner.run() == (1, 0, False)
+    logs = [e[1] for e in events if e[0] == "log"]
+    assert "URL https://x.com/a/status/1 NONE" in logs
 
 
 def test_gitignore_excludes_cookies():
+
     gi = (Path(main.__file__).resolve().parent / ".gitignore").read_text(encoding="utf-8")
     lines = {ln.strip() for ln in gi.splitlines()}
     assert "cookies/" in lines and "*cookies*.txt" in lines

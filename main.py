@@ -1004,82 +1004,37 @@ def set_video_cookies_browser_config(value: Optional[str]) -> str:
     return norm
 
 
-def get_video_cookies_file_config() -> Optional[str]:
-    """Return persisted ``video_cookies_file`` (cookies.txt path for ``--cookies``) or None."""
-    raw = load_config().get("video_cookies_file")
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    return None
+def migrate_video_cookies_store(store_dir=None) -> List[str]:
+    """Old single-file layout → per-site files; drop the obsolete ``video_cookies_file`` key.
 
+    ``cookies\\cookies.txt`` is renamed to ``cookies\\<site>.txt`` (site detected from its
+    cookie domains). Returns Chinese log lines (never cookie values); does not raise.
+    """
+    import video_dl
 
-def set_video_cookies_file_config(path: Optional[Union[str, Path]]) -> Optional[str]:
-    """Persist ``video_cookies_file``; empty / None removes it. Returns the stored value."""
-    val = str(Path(str(path).strip()).expanduser()) if path and str(path).strip() else None
+    msgs = video_dl.migrate_legacy_cookies(store_dir)
     data = load_config()
-    if val:
-        data["video_cookies_file"] = val
-    else:
+    if "video_cookies_file" in data:
         data.pop("video_cookies_file", None)
-    save_config(data)
-    return val
+        save_config(data)
+    return msgs
 
 
 def import_video_cookies_file(src: Union[str, Path], store_dir=None):
-    """Move *src* into ``<工具文件夹>\\cookies\\cookies.txt`` and persist that path.
+    """Move *src* into ``<工具文件夹>\\cookies\\<site>.txt``.
 
     Returns ``video_dl.CookiesImportResult``; raises ``video_dl.CookiesFileError``.
     """
     import video_dl
 
-    res = video_dl.import_cookies_file(src, store_dir)
-    set_video_cookies_file_config(res.stored)
-    return res
+    return video_dl.import_cookies_file(src, store_dir)
 
 
-def clear_video_cookies_file(store_dir=None) -> List[Path]:
-    """Delete the stored cookies file(s) and drop ``video_cookies_file`` from config."""
+def delete_video_cookies(site: str, store_dir=None) -> bool:
+    """Delete only ``cookies\\<site>.txt``."""
     import video_dl
 
-    removed = video_dl.clear_stored_cookies(store_dir)
-    # only files inside the tool's cookies folder are deleted; config is always cleared
-    set_video_cookies_file_config(None)
-    return removed
-
-
-def migrate_video_cookies_file(store_dir=None, downloads_dir=None) -> List[str]:
-    """Move a cookies file that still lives outside the tool folder into ``cookies\\``.
-
-    - config points to an existing file outside ``cookies\\`` → import it (move)
-    - otherwise, if no usable stored file is configured and
-      ``<Downloads>\\cookies_x.com.txt`` exists → import it and set config
-
-    Returns Chinese log lines (never cookie values). Errors are reported, not raised.
-    """
-    import video_dl
-
-    msgs: List[str] = []
-    cur = get_video_cookies_file_config()
-    src: Optional[Path] = None
-    if cur and Path(cur).is_file() and not video_dl.is_in_cookies_dir(cur, store_dir):
-        src = Path(cur)
-    elif not (cur and Path(cur).is_file()):
-        dl = Path(downloads_dir) if downloads_dir is not None else video_dl.default_download_dir()
-        cand = dl / video_dl.LEGACY_COOKIES_NAME
-        if cand.is_file():
-            src = cand
-    if src is None:
-        return msgs
-    try:
-        res = import_video_cookies_file(src, store_dir)
-    except video_dl.CookiesFileError as e:
-        msgs.append(f"迁移 Cookies 文件失败：{e}")
-        return msgs
-    msgs.append(
-        f"已把 Cookies 文件移入工具文件夹：{src} → {res.stored}（{res.kept} 条）"
-    )
-    if res.warning:
-        msgs.append(res.warning)
-    return msgs
+    return video_dl.delete_stored_cookies(site, store_dir)
 
 
 def get_video_no_playlist_config() -> bool:
@@ -1150,18 +1105,18 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         self.no_playlist_var = tk.BooleanVar(value=get_video_no_playlist_config())
         self.cookies_var = tk.StringVar(value=get_video_cookies_browser_config())
         try:
-            self._cookies_migrate_msgs = migrate_video_cookies_file()
+            self._cookies_migrate_msgs = migrate_video_cookies_store()
         except Exception as e:  # never block the dialog
             self._cookies_migrate_msgs = [f"迁移 Cookies 文件失败：{e}"]
-        self.cookies_file_var = tk.StringVar(value=get_video_cookies_file_config() or "")
         self.cookies_hint_var = tk.StringVar(value="")
         self._cookies_combo = None
+        self._cookies_tree = None
         self.tool_var = tk.StringVar(value="正在检测 yt-dlp / ffmpeg…")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="")
 
         self._build()
-        self._update_cookies_hint()
+        self._refresh_cookies_list()
         for m in self._cookies_migrate_msgs:
             self._log(m)
         self._prefill_from_clipboard()
@@ -1223,12 +1178,22 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         )
         rowc = ttk.Frame(opt_fr, style="Card.TFrame")
         rowc.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(rowc, text="Cookies 文件：", style="Card.TLabel").pack(side=tk.LEFT)
-        ttk.Entry(rowc, textvariable=self.cookies_file_var, state="readonly").pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        ttk.Label(rowc, text="Cookies 文件：", style="Card.TLabel").pack(side=tk.LEFT, anchor=tk.N)
+        tree = ttk.Treeview(
+            rowc, columns=("site", "mtime", "count"), show="headings", height=3, selectmode="browse"
         )
-        ttk.Button(rowc, text="选择…", command=self._choose_cookies_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(rowc, text="清除", command=self._clear_cookies_file).pack(side=tk.LEFT, padx=2)
+        tree.heading("site", text="网站")
+        tree.heading("mtime", text="更新时间")
+        tree.heading("count", text="Cookie 条数")
+        tree.column("site", width=180, anchor=tk.W)
+        tree.column("mtime", width=150, anchor=tk.W)
+        tree.column("count", width=90, anchor=tk.E)
+        tree.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self._cookies_tree = tree
+        cbtns = ttk.Frame(rowc, style="Card.TFrame")
+        cbtns.pack(side=tk.LEFT, anchor=tk.N)
+        ttk.Button(cbtns, text="导入…", command=self._choose_cookies_file).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(cbtns, text="删除所选", command=self._delete_selected_cookies).pack(fill=tk.X)
         rowh = ttk.Frame(opt_fr, style="Card.TFrame")
         rowh.pack(fill=tk.X, pady=(2, 0))
         ttk.Label(
@@ -1344,33 +1309,26 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         out = set_video_download_dir_config(chosen)
         self.out_dir_var.set(str(out))
 
-    def _update_cookies_hint(self) -> None:
-        has_file = bool((self.cookies_file_var.get() or "").strip())
-        if has_file:
-            self.cookies_hint_var.set(
-                f"{self._vd.STORED_COOKIES_NOTE}（{self._vd.tool_cookies_dir()}）。"
-                "已选 Cookies 文件（--cookies），优先于「浏览器 Cookies」（不会同时使用）；"
-                "下载前自动整理为标准 Netscape 格式的临时副本。"
-            )
-        else:
-            self.cookies_hint_var.set(
-                "需要登录才能看的视频（如部分 X/Twitter 推文）：选浏览器扩展导出的 cookies.txt，"
-                "或选「浏览器 Cookies」（Chrome/Edge 需先完全关闭浏览器）。"
-            )
-        if self._cookies_combo is not None:
-            try:
-                self._cookies_combo.configure(state="disabled" if has_file else "readonly")
-            except tk.TclError:
-                pass
+    def _refresh_cookies_list(self) -> None:
+        vd = self._vd
+        items = vd.list_stored_cookies()
+        tree = self._cookies_tree
+        if tree is not None:
+            tree.delete(*tree.get_children())
+            for it in items:
+                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(it.mtime))
+                tree.insert("", tk.END, iid=it.site, values=(it.site, ts, it.count))
+        sites = "、".join(it.site for it in items) if items else "（暂无）"
+        self.cookies_hint_var.set(
+            f"{vd.COOKIES_AUTO_HINT}（已存：{sites}；位置 {vd.tool_cookies_dir()}，按网站分别保存）。"
+            "「导入…」选浏览器扩展导出的 cookies.txt，自动识别网站并移入工具文件夹（同网站覆盖旧文件）。"
+            "没有对应网站的文件时使用「浏览器 Cookies」设置（Chrome/Edge 需先完全关闭浏览器）。"
+        )
 
     def _choose_cookies_file(self) -> None:
-        cur = (self.cookies_file_var.get() or "").strip()
-        if cur and not self._vd.is_in_cookies_dir(cur):
-            init = Path(cur).parent
-        else:
-            init = self._vd.default_download_dir()
+        init = self._vd.default_download_dir()
         chosen = filedialog.askopenfilename(
-            title="选择 Cookies 文件（Netscape 格式 cookies.txt）",
+            title="导入 Cookies 文件（Netscape 格式 cookies.txt）",
             initialdir=str(init) if init.is_dir() else str(Path.home()),
             filetypes=[("Cookies 文件", "*.txt"), ("所有文件", "*.*")],
             parent=self,
@@ -1383,28 +1341,29 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
             messagebox.showerror("Cookies 文件无效", str(e), parent=self)
             self._log(str(e))
             return
-        self.cookies_file_var.set(str(res.stored))
-        self._update_cookies_hint()
+        self._refresh_cookies_list()
         if res.moved:
-            self._log(
-                f"Cookies 文件已移入工具文件夹：{res.stored}（{res.kept} 条，将优先于浏览器 Cookies）。"
-                f"{self._vd.STORED_COOKIES_NOTE}。"
-            )
-            if res.removed_old:
-                self._log(f"已删除旧的 Cookies 文件 {len(res.removed_old)} 个。")
+            verb = "已更新" if res.replaced else "已导入"
+            self._log(f"{verb} {res.site} 的 Cookies 文件：{res.stored.name}（{res.kept} 条，已移入工具文件夹）")
         else:
-            self._log(f"Cookies 文件：{res.stored}（已在工具文件夹中，未改动）")
+            self._log(f"{res.site} 的 Cookies 文件已在工具文件夹中，未改动。")
         if res.warning:
             self._log(res.warning)
 
-    def _clear_cookies_file(self) -> None:
-        removed = clear_video_cookies_file()
-        self.cookies_file_var.set("")
-        self._update_cookies_hint()
-        if removed:
-            self._log(f"已清除 Cookies 文件（已删除工具文件夹中的 {len(removed)} 个文件）。")
+    def _delete_selected_cookies(self) -> None:
+        tree = self._cookies_tree
+        sel = tree.selection() if tree is not None else ()
+        if not sel:
+            messagebox.showinfo("删除 Cookies", "请先在列表里选择一个网站。", parent=self)
+            return
+        site = sel[0]
+        if not messagebox.askyesno("删除 Cookies", f"删除 {site} 的 Cookies 文件？", parent=self):
+            return
+        if delete_video_cookies(site):
+            self._log(f"已删除 {site} 的 Cookies 文件。")
         else:
-            self._log("已清除 Cookies 文件。")
+            self._log(f"删除 {site} 的 Cookies 文件失败（可能已不存在或被占用）。")
+        self._refresh_cookies_list()
 
     def _open_dir(self) -> None:
         d = self._current_out_dir()
@@ -1513,14 +1472,6 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         set_video_download_dir_config(out_dir)
         set_video_no_playlist_config(bool(self.no_playlist_var.get()))
         cookies = set_video_cookies_browser_config(self.cookies_var.get())
-        cookies_file = (self.cookies_file_var.get() or "").strip() or None
-        if cookies_file and not Path(cookies_file).is_file():
-            messagebox.showerror(
-                "找不到 Cookies 文件",
-                f"Cookies 文件不存在：\n{cookies_file}\n\n请重新「选择…」或「清除」。",
-                parent=self,
-            )
-            return
 
         self._runner = vd.DownloadRunner(
             self._ytdlp_base,
@@ -1529,7 +1480,7 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
             no_playlist=bool(self.no_playlist_var.get()),
             cookies_browser=cookies,
             ffmpeg_location=vd.ffmpeg_location_arg(self._ffmpeg),
-            cookies_file=cookies_file,
+            cookies_dir=vd.tool_cookies_dir(),
             on_event=self._emit,
         )
         self._last_file = None

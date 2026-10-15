@@ -32,8 +32,8 @@ YTDLP_PIP_PACKAGE = "yt-dlp"
 NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
 HTTPONLY_PREFIX = "#HttpOnly_"
 COOKIES_NEED_LOGIN_TIP = (
-    "提示：这条推文/视频可能需要登录才能看到。请在「Cookies 文件」点「选择…」，"
-    "选用浏览器扩展导出的 cookies.txt（Netscape 格式）后重试。"
+    "提示：这条推文/视频可能需要登录才能看到。请在「Cookies 文件」点「导入…」，"
+    "导入浏览器扩展导出的该网站 cookies.txt（Netscape 格式）后重试。"
 )
 CHROME_COOKIE_DB_TIP = (
     "提示：无法复制 Chrome/Edge 的 Cookie 数据库（浏览器运行中会锁定该文件）。"
@@ -270,11 +270,10 @@ def write_normalized_cookies(src, dest_dir=None) -> Tuple[Path, int]:
         data = p.read_bytes()
     except OSError as e:
         raise CookiesFileError(f"无法读取 Cookies 文件：{p}（{e.strerror or e}）") from None
-    text, kept = normalize_cookies_text(_decode_cookies_bytes(data))
+    raw_text = _decode_cookies_bytes(data)
+    text, kept = normalize_cookies_text(raw_text)
     if kept == 0:
-        raise CookiesFileError(
-            f"Cookies 文件里没有有效条目：{p}\n需要 Netscape 格式（每行 7 列、Tab 分隔，浏览器扩展导出的 cookies.txt）。"
-        )
+        raise CookiesFileError(cookies_error_message(p, analyze_cookies_text(raw_text)))
     try:
         if dest_dir is not None:
             Path(dest_dir).mkdir(parents=True, exist_ok=True)
@@ -289,12 +288,155 @@ def write_normalized_cookies(src, dest_dir=None) -> Tuple[Path, int]:
     return Path(tmp), kept
 
 
-# ---------------------------------------------------------------- stored cookies (tool folder)
+# ---------------------------------------------------------------- stored cookies (per site)
 
 COOKIES_DIRNAME = "cookies"
-STORED_COOKIES_NAME = "cookies.txt"
-LEGACY_COOKIES_NAME = "cookies_x.com.txt"
-STORED_COOKIES_NOTE = "已移入工具文件夹；更新时重新选择新导出的文件即可"
+LEGACY_STORED_NAME = "cookies.txt"  # single-file layout before per-site storage
+COOKIES_AUTO_HINT = "下载时按链接网站自动使用对应 Cookies"
+
+# well-known video sites: preferred when picking the site key of a cookies file
+KNOWN_VIDEO_SITES = (
+    "youtube.com", "x.com", "bilibili.com", "tiktok.com", "douyin.com", "instagram.com",
+    "facebook.com", "vimeo.com", "twitch.tv", "nicovideo.jp", "reddit.com", "weibo.com",
+    "pixiv.net", "dailymotion.com", "threads.net", "niconico.jp", "iqiyi.com", "youku.com",
+)
+SITE_ALIASES = {
+    "twitter.com": "x.com",
+    "twimg.com": "x.com",
+    "t.co": "x.com",
+    "youtu.be": "youtube.com",
+    "youtube-nocookie.com": "youtube.com",
+    "ytimg.com": "youtube.com",
+    "b23.tv": "bilibili.com",
+    "bilivideo.com": "bilibili.com",
+    "fb.watch": "facebook.com",
+    "nico.ms": "nicovideo.jp",
+    "redd.it": "reddit.com",
+    "weibo.cn": "weibo.com",
+    "instagr.am": "instagram.com",
+}
+# second-level public suffixes → registrable domain keeps three labels
+_MULTI_PART_SUFFIXES = {
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "co.uk", "org.uk", "ac.uk", "gov.uk",
+    "com.cn", "net.cn", "org.cn", "com.tw", "com.hk", "com.au", "net.au", "co.kr",
+    "com.br", "co.in", "co.nz", "com.sg",
+}
+_SITE_KEY_SAFE = re.compile(r"[^a-z0-9.\-]")
+
+
+def registrable_domain(host: Optional[str]) -> Optional[str]:
+    """``.www.Music.YouTube.com`` → ``youtube.com``; ``news.bbc.co.uk`` → ``bbc.co.uk``."""
+    if not host:
+        return None
+    h = str(host).strip().lower()
+    if h.startswith(HTTPONLY_PREFIX.lower()):
+        h = h[len(HTTPONLY_PREFIX):]
+    h = h.split("@")[-1].split(":")[0].strip(".")
+    if h.startswith("www."):
+        h = h[4:]
+    if not h or re.fullmatch(r"[\d.]+", h):
+        return h or None
+    labels = [x for x in h.split(".") if x]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    if ".".join(labels[-2:]) in _MULTI_PART_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def site_key_for_host(host: Optional[str]) -> Optional[str]:
+    """Host / cookie domain → site key with aliases (twitter.com → x.com, youtu.be → youtube.com)."""
+    reg = registrable_domain(host)
+    if not reg:
+        return None
+    return SITE_ALIASES.get(reg, reg)
+
+
+def site_for_url(url: Optional[str]) -> Optional[str]:
+    """``https://m.youtube.com/watch?v=1`` → ``youtube.com``; None if no host."""
+    if not url:
+        return None
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(str(url).strip()).hostname
+    except ValueError:
+        return None
+    return site_key_for_host(host)
+
+
+def detect_cookies_site(domains: Sequence[str]) -> Optional[str]:
+    """Pick the site key for a cookies file from its cookie domains.
+
+    Known video sites win (so ``google.com`` cookies inside a YouTube export do not
+    hijack the key); otherwise the most frequent registrable domain. Ties → alphabetical.
+    """
+    counts: Dict[str, int] = {}
+    for d in domains:
+        k = site_key_for_host(d)
+        if k:
+            counts[k] = counts.get(k, 0) + 1
+    if not counts:
+        return None
+    known = {k: v for k, v in counts.items() if k in KNOWN_VIDEO_SITES}
+    pool = known or counts
+    return sorted(pool.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+
+def safe_site_filename(site: str) -> str:
+    key = _SITE_KEY_SAFE.sub("_", str(site).strip().lower()).strip(".") or "unknown"
+    return key + ".txt"
+
+
+class CookiesInfo:
+    """Parsed summary of a cookies file (never holds cookie values)."""
+
+    def __init__(self, kept: int, domains: List[str], content_lines: int) -> None:
+        self.kept = kept
+        self.domains = domains
+        self.content_lines = content_lines  # non-blank, non-comment lines
+        self.site = detect_cookies_site(domains)
+
+
+def analyze_cookies_text(text: str) -> CookiesInfo:
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    domains: List[str] = []
+    content = 0
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        body = line
+        if body.startswith(HTTPONLY_PREFIX):
+            body = body[len(HTTPONLY_PREFIX):]
+        elif s.startswith("#"):
+            continue
+        content += 1
+        fields = body.rstrip("\r\n").split("\t")
+        if len(fields) == 7 and fields[0].strip():
+            domains.append(fields[0].strip())
+    return CookiesInfo(len(domains), domains, content)
+
+
+def _read_cookies_info(p: Path) -> CookiesInfo:
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        raise CookiesFileError(f"无法读取 Cookies 文件：{p}（{e.strerror or e}）") from None
+    return analyze_cookies_text(_decode_cookies_bytes(data))
+
+
+def cookies_error_message(p, info: CookiesInfo) -> str:
+    """Chinese error for a file without valid cookie lines (empty vs. wrong format)."""
+    if info.content_lines == 0:
+        return (
+            f"这个 Cookies 文件是空的（只有文件头，没有任何 Cookie）。请在已登录该网站的页面上重新导出。\n文件：{p}"
+        )
+    return (
+        f"Cookies 文件格式不对：{p}\n没有找到 7 列、Tab 分隔的 Cookie 行；"
+        "需要 Netscape 格式（浏览器扩展导出的 cookies.txt）。"
+    )
 
 
 def tool_cookies_dir() -> Path:
@@ -302,8 +444,8 @@ def tool_cookies_dir() -> Path:
     return Path(__file__).resolve().parent / COOKIES_DIRNAME
 
 
-def stored_cookies_path(store_dir=None) -> Path:
-    return Path(store_dir if store_dir is not None else tool_cookies_dir()) / STORED_COOKIES_NAME
+def _store(store_dir) -> Path:
+    return Path(store_dir) if store_dir is not None else tool_cookies_dir()
 
 
 def _same_file(a, b) -> bool:
@@ -313,91 +455,69 @@ def _same_file(a, b) -> bool:
         return False
 
 
-def is_in_cookies_dir(path, store_dir=None) -> bool:
-    """True if *path* lives directly inside the tool's cookies folder."""
-    if not path:
-        return False
-    d = Path(store_dir) if store_dir is not None else tool_cookies_dir()
-    return _same_file(Path(path).parent, d)
-
-
 def validate_cookies_file(src) -> int:
     """Return the number of valid cookie lines in *src*; raise :class:`CookiesFileError` if none."""
     p = Path(src)
-    try:
-        data = p.read_bytes()
-    except OSError as e:
-        raise CookiesFileError(f"无法读取 Cookies 文件：{p}（{e.strerror or e}）") from None
-    _text, kept = normalize_cookies_text(_decode_cookies_bytes(data))
-    if kept == 0:
-        raise CookiesFileError(
-            f"Cookies 文件里没有有效条目：{p}\n需要 Netscape 格式（每行 7 列、Tab 分隔，浏览器扩展导出的 cookies.txt）。"
-        )
-    return kept
+    info = _read_cookies_info(p)
+    if info.kept == 0:
+        raise CookiesFileError(cookies_error_message(p, info))
+    return info.kept
 
 
-def _remove_other_stored(store_dir: Path, keep: Optional[Path]) -> List[Path]:
-    """Delete stored cookies files in *store_dir* except *keep*; returns removed paths."""
-    removed: List[Path] = []
-    if not store_dir.is_dir():
-        return removed
-    for f in store_dir.iterdir():
-        if not f.is_file():
-            continue
-        if keep is not None and _same_file(f, keep):
+class StoredCookies:
+    """One stored per-site cookies file: ``site``, ``path``, ``mtime``, ``count``."""
+
+    def __init__(self, site: str, path: Path, mtime: float, count: int) -> None:
+        self.site, self.path, self.mtime, self.count = site, path, mtime, count
+
+
+def stored_cookies_path_for_site(site: str, store_dir=None) -> Path:
+    return _store(store_dir) / safe_site_filename(site)
+
+
+def stored_cookies_for_site(site: Optional[str], store_dir=None) -> Optional[Path]:
+    if not site:
+        return None
+    p = stored_cookies_path_for_site(site, store_dir)
+    return p if p.is_file() else None
+
+
+def list_stored_cookies(store_dir=None) -> List[StoredCookies]:
+    d = _store(store_dir)
+    out: List[StoredCookies] = []
+    if not d.is_dir():
+        return out
+    for f in sorted(d.glob("*.txt")):
+        if not f.is_file() or f.name.startswith(".") or f.name == LEGACY_STORED_NAME:
             continue
         try:
-            f.unlink()
-            removed.append(f)
-        except OSError:
-            pass
-    return removed
+            info = _read_cookies_info(f)
+            mtime = f.stat().st_mtime
+        except (CookiesFileError, OSError):
+            continue
+        out.append(StoredCookies(f.stem, f, mtime, info.kept))
+    return out
 
 
 class CookiesImportResult:
     """Outcome of :func:`import_cookies_file`（不含 cookie 值）。"""
 
-    def __init__(self, stored: Path, kept: int, *, moved: bool, source_deleted: bool,
-                 warning: Optional[str] = None, removed_old: Sequence[Path] = ()) -> None:
+    def __init__(self, site: str, stored: Path, kept: int, *, moved: bool, source_deleted: bool,
+                 replaced: bool = False, warning: Optional[str] = None) -> None:
+        self.site = site
         self.stored = stored
         self.kept = kept
         self.moved = moved  # False = source already was the stored file (no-op)
         self.source_deleted = source_deleted
+        self.replaced = replaced  # an older file for the same site was overwritten
         self.warning = warning
-        self.removed_old = list(removed_old)
 
 
-def import_cookies_file(src, store_dir=None) -> CookiesImportResult:
-    """Move cookies file *src* into the tool's cookies folder (fixed name ``cookies.txt``).
-
-    1. validate (至少一行有效 cookie，用 :func:`normalize_cookies_text` 判断)
-    2. write the original bytes atomically (temp file in the folder → ``os.replace``)
-    3. delete any other previously stored files in that folder
-    4. delete *src* (move semantics); if that fails (locked) keep the stored copy
-       and return a Chinese ``warning``
-
-    If *src* already is the stored file this is a no-op (only validated).
-    Raises :class:`CookiesFileError`; messages never contain cookie values.
-    """
-    sp = Path(src).expanduser()
-    d = Path(store_dir) if store_dir is not None else tool_cookies_dir()
-    dest = d / STORED_COOKIES_NAME
-    if dest.exists() and _same_file(sp, dest):
-        kept = validate_cookies_file(dest)
-        return CookiesImportResult(dest, kept, moved=False, source_deleted=False)
-    try:
-        data = sp.read_bytes()
-    except OSError as e:
-        raise CookiesFileError(f"无法读取 Cookies 文件：{sp}（{e.strerror or e}）") from None
-    _text, kept = normalize_cookies_text(_decode_cookies_bytes(data))
-    if kept == 0:
-        raise CookiesFileError(
-            f"Cookies 文件里没有有效条目：{sp}\n需要 Netscape 格式（每行 7 列、Tab 分隔，浏览器扩展导出的 cookies.txt）。"
-        )
+def _atomic_write(dest: Path, data: bytes) -> None:
     tmp: Optional[str] = None
     try:
-        d.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".import_", suffix=".tmp", dir=str(d))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".import_", suffix=".tmp", dir=str(dest.parent))
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
@@ -407,13 +527,37 @@ def import_cookies_file(src, store_dir=None) -> CookiesImportResult:
                 pass
         os.replace(tmp, dest)
         tmp = None
-    except OSError as e:
-        raise CookiesFileError(f"无法保存 Cookies 文件到工具文件夹：{d}（{e.strerror or e}）") from None
     finally:
         if tmp:
             remove_file_quietly(tmp)
-    removed = _remove_other_stored(d, keep=dest)
-    removed = [r for r in removed if not _same_file(r, sp)]
+
+
+def import_cookies_file(src, store_dir=None) -> CookiesImportResult:
+    """Move cookies file *src* into ``cookies\\<site>.txt`` (site detected from its domains).
+
+    validate → detect site → atomic write (temp + ``os.replace``; overwrites only that
+    site's old file) → delete *src*. If *src* is locked the stored copy is kept and a
+    Chinese ``warning`` is returned. Raises :class:`CookiesFileError` (never cookie values).
+    """
+    sp = Path(src).expanduser()
+    try:
+        data = sp.read_bytes()
+    except OSError as e:
+        raise CookiesFileError(f"无法读取 Cookies 文件：{sp}（{e.strerror or e}）") from None
+    info = analyze_cookies_text(_decode_cookies_bytes(data))
+    if info.kept == 0:
+        raise CookiesFileError(cookies_error_message(sp, info))
+    if not info.site:
+        raise CookiesFileError(f"无法从 Cookies 文件识别网站（域名为空）：{sp}")
+    d = _store(store_dir)
+    dest = d / safe_site_filename(info.site)
+    if dest.exists() and _same_file(sp, dest):
+        return CookiesImportResult(info.site, dest, info.kept, moved=False, source_deleted=False)
+    replaced = dest.exists()
+    try:
+        _atomic_write(dest, data)
+    except OSError as e:
+        raise CookiesFileError(f"无法保存 Cookies 文件到工具文件夹：{d}（{e.strerror or e}）") from None
     warning = None
     deleted = not sp.exists()
     if not deleted:
@@ -425,14 +569,45 @@ def import_cookies_file(src, store_dir=None) -> CookiesImportResult:
                 f"警告：已保存到工具文件夹，但无法删除原 Cookies 文件：{sp}（{e.strerror or e}）。"
                 "可能被其他程序占用，请稍后手动删除（其中含登录凭据）。"
             )
-    return CookiesImportResult(dest, kept, moved=True, source_deleted=deleted,
-                               warning=warning, removed_old=removed)
+    return CookiesImportResult(info.site, dest, info.kept, moved=True, source_deleted=deleted,
+                               replaced=replaced, warning=warning)
 
 
-def clear_stored_cookies(store_dir=None) -> List[Path]:
-    """Delete every stored cookies file in the tool's cookies folder; returns removed paths."""
-    d = Path(store_dir) if store_dir is not None else tool_cookies_dir()
-    return _remove_other_stored(d, keep=None)
+def delete_stored_cookies(site: str, store_dir=None) -> bool:
+    """Delete ``cookies\\<site>.txt`` only; other sites untouched. True if removed."""
+    p = stored_cookies_path_for_site(site, store_dir)
+    try:
+        p.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def migrate_legacy_cookies(store_dir=None) -> List[str]:
+    """``cookies\\cookies.txt`` (old single-file layout) → ``cookies\\<site>.txt``.
+
+    Returns Chinese log lines (never cookie values). Does not raise.
+    """
+    d = _store(store_dir)
+    legacy = d / LEGACY_STORED_NAME
+    msgs: List[str] = []
+    if not legacy.is_file():
+        return msgs
+    try:
+        info = _read_cookies_info(legacy)
+    except CookiesFileError as e:
+        return [f"迁移 Cookies 文件失败：{e}"]
+    if info.kept == 0 or not info.site:
+        return [f"迁移 Cookies 文件跳过：{cookies_error_message(legacy, info)}"]
+    dest = d / safe_site_filename(info.site)
+    if dest.exists():
+        return [f"迁移 Cookies 文件跳过：{dest.name} 已存在，保留旧文件 {legacy.name}（可手动删除）。"]
+    try:
+        os.replace(legacy, dest)
+    except OSError as e:
+        return [f"迁移 Cookies 文件失败：{legacy} → {dest.name}（{e.strerror or e}）"]
+    msgs.append(f"已迁移 Cookies 文件：{legacy.name} → {dest.name}（网站 {info.site}，{info.kept} 条）")
+    return msgs
 
 
 def remove_file_quietly(path) -> None:
@@ -652,6 +827,7 @@ class DownloadRunner:
         ffmpeg_location: Optional[str] = None,
         cookies_file=None,
         cookies_tmp_dir=None,
+        cookies_dir=None,
         on_event: EventCallback,
     ) -> None:
         self.base = list(base)
@@ -662,6 +838,8 @@ class DownloadRunner:
         self.ffmpeg_location = ffmpeg_location
         self.cookies_file = str(cookies_file) if cookies_file else None
         self.cookies_tmp_dir = cookies_tmp_dir
+        # per-site store (cookies\<site>.txt); None disables the automatic lookup
+        self.cookies_dir = Path(cookies_dir) if cookies_dir is not None else None
         self.on_event = on_event
         self._cancel = threading.Event()
         self._lock = threading.Lock()
@@ -687,7 +865,7 @@ class DownloadRunner:
             self.on_event(("log", f"无法创建输出目录：{e}"))
             self.on_event(("finished", 0, n, False))
             return 0, n, False
-        tmp_cookies: Optional[Path] = None
+        tmp_cookies: Optional[Path] = None  # explicit cookies_file override (all URLs)
         browser = normalize_cookies_browser(self.cookies_browser)
         if self.cookies_file:
             try:
@@ -701,20 +879,21 @@ class DownloadRunner:
             )
             if browser:
                 self.on_event(("log", "已选择 Cookies 文件，忽略「浏览器 Cookies」设置（两者不同时使用）。"))
-                browser = None
-        self._has_cookies = bool(tmp_cookies or browser)
+        site_tmp: Dict[str, Optional[Path]] = {}  # site -> normalized temp copy (None = failed)
         try:
             for idx, url in enumerate(self.urls, start=1):
                 if self.cancelled:
                     break
+                cfile, cbrowser = self._cookies_for_url(url, tmp_cookies, browser, site_tmp)
+                self._has_cookies = bool(cfile or cbrowser)
                 cmd = build_command(
                     self.base,
                     url,
                     self.out_dir,
                     no_playlist=self.no_playlist,
-                    cookies_browser=browser,
+                    cookies_browser=cbrowser,
                     ffmpeg_location=self.ffmpeg_location,
-                    cookies_file=tmp_cookies,
+                    cookies_file=cfile,
                 )
                 self.on_event(("start", idx, n, url))
                 self.on_event(("log", "> " + subprocess.list2cmdline(cmd)))
@@ -726,11 +905,40 @@ class DownloadRunner:
                     failed += 1
         finally:
             remove_file_quietly(tmp_cookies)
+            for t in site_tmp.values():
+                remove_file_quietly(t)
         cancelled = self.cancelled
         if cancelled:
             failed = n - ok  # include URLs never started
         self.on_event(("finished", ok, failed, cancelled))
         return ok, failed, cancelled
+
+    def _cookies_for_url(self, url, override, browser, site_tmp):
+        """Return ``(cookies_file, cookies_browser)`` for *url*; logs the site, never values."""
+        if override:
+            return override, None
+        site = site_for_url(url)
+        stored = stored_cookies_for_site(site, self.cookies_dir) if self.cookies_dir else None
+        if stored is not None:
+            if site not in site_tmp:
+                try:
+                    tmp, kept = write_normalized_cookies(stored, self.cookies_tmp_dir)
+                    site_tmp[site] = tmp
+                    self.on_event(("log", f"Cookies：使用 {site} 的 Cookies 文件（{kept} 条，临时副本，运行结束后删除）"))
+                except CookiesFileError as e:
+                    site_tmp[site] = None
+                    self.on_event(("log", f"{site} 的 Cookies 文件不可用：{e}"))
+            else:
+                if site_tmp[site] is not None:
+                    self.on_event(("log", f"Cookies：使用 {site} 的 Cookies 文件"))
+            if site_tmp.get(site) is not None:
+                return site_tmp[site], None
+        if browser:
+            self.on_event(("log", f"Cookies：{site or '该链接'} 没有已存的 Cookies 文件，使用浏览器 Cookies（{browser}）"))
+            return None, browser
+        if self.cookies_dir is not None:
+            self.on_event(("log", f"Cookies：{site or '该链接'} 没有已存的 Cookies 文件，不使用 Cookies"))
+        return None, None
 
     def _run_one(self, cmd: List[str], idx: int, n: int) -> int:
         try:

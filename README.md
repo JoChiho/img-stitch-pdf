@@ -153,11 +153,13 @@ python translate_local.py path\to\image.jpg
 1. 打开时若剪贴板里是 http(s) 链接会自动填入；也可点 **粘贴**。可一次粘贴多个链接（每行一个），会按顺序逐个下载
 2. **保存到**：默认 `%USERPROFILE%\Downloads`；**选择文件夹…** 修改后写入 `config.json` 的 `video_download_dir`；**打开文件夹** 用资源管理器打开
 3. **只下载单个视频（--no-playlist）** 默认勾选；**浏览器 Cookies**（无 / chrome / edge / firefox）用于需要登录的网站（`--cookies-from-browser`）
-   - **Cookies 文件**：点 **选择…** 选浏览器扩展导出的 `cookies.txt`（Netscape 格式）。校验至少有一行有效 cookie 后，文件会被**移入工具文件夹** `<程序目录>\cookies\cookies.txt`（先写临时文件再 `os.replace` 原子替换；删除该文件夹里旧的 cookies 文件；再删除原文件，即“移动”）。原文件被占用删不掉时保留已存副本并在日志里给出中文警告。界面显示存放路径并提示“已移入工具文件夹；更新时重新选择新导出的文件即可”。**清除** 删除已存的 cookies 文件并清空配置。路径记在 `config.json` 的 `video_cookies_file`。设置后传 `--cookies`，**优先于浏览器 Cookies**（两者不会同时传）
+   - **Cookies 文件（按网站保存）**：列表显示已存的网站、更新时间（文件修改时间）与 Cookie 条数。点 **导入…** 选浏览器扩展导出的 `cookies.txt`（Netscape 格式）：校验后按文件里的 Cookie 域名**自动识别网站**（去掉开头 `.`、`#HttpOnly_`、`www.`；别名 `twitter.com`→`x.com`，`youtu.be` / `m.youtube.com` / `music.youtube.com`→`youtube.com` 等；常见视频网站优先，所以 YouTube 导出里混入的 `google.com` 不会抢走网站名；否则取出现最多的主域名，`co.jp` / `co.uk` 等保留三段），**移入** `<程序目录>\cookies\<网站>.txt`（如 `x.com.txt`、`youtube.com.txt`；临时文件 + `os.replace` 原子写入，再删除原文件；原文件被占用时保留已存副本并给出中文警告）。同一网站再次导入只覆盖该网站的旧文件，其它网站不动。**删除所选** 只删除选中网站的文件
+   - **下载时按链接网站自动使用对应 Cookies**：每个链接按域名（同样的别名规则）找 `cookies\<网站>.txt`，有则传 `--cookies <整理后的临时副本>`；没有则用「浏览器 Cookies」设置（若已选）；都没有则不带 Cookies。X 与 YouTube 混合的队列会逐个链接选择。日志只写用了哪个网站的 Cookies，不写 Cookie 值
+   - 错误提示：文件只有文件头注释、没有任何 Cookie 行时提示「这个 Cookies 文件是空的（只有文件头，没有任何 Cookie）。请在已登录该网站的页面上重新导出。」（通常是在未登录状态下导出）；有内容但没有 7 列 Tab 分隔行时提示格式不对
    - `cookies/` 与 `*cookies*.txt` 已写入 `.gitignore`，cookies（=登录凭据）**永远不会被提交**
-   - 迁移：打开「下载视频」时，若配置仍指向工具文件夹外的 cookies 文件（如 `%USERPROFILE%\Downloads\cookies_x.com.txt`），会自动按上述方式移入 `cookies\`；若未配置可用的 cookies 文件但 `Downloads\cookies_x.com.txt` 存在，也会导入并写入配置
+   - 迁移：旧版的单个 `cookies\cookies.txt` 会在打开「下载视频」时按内容识别网站并改名为 `cookies\<网站>.txt`，并从 `config.json` 删除旧的 `video_cookies_file`。不再自动从 `Downloads` 导入文件
    - 扩展导出的文件常有格式问题（如 `.x.com\tFALSE\t/…`：域名以 `.` 开头但第 2 列是 `FALSE`），yt-dlp 会报 `invalid Netscape format cookies file`。程序每次下载前会在 `%TEMP%` 写一份**整理后的临时副本**（补 `# Netscape HTTP Cookie File` 头；只保留 7 列 Tab 分隔的行，含 `#HttpOnly_` 行；第 2 列按域名是否以 `.` 开头改为 `TRUE`/`FALSE`；兼容 UTF-8 BOM 与 CRLF），传给 yt-dlp，运行结束即删除；已存的 cookies 文件不改动，日志不打印 cookie 值
-   - 日志出现 `No video could be found`（且未设置 Cookies）时会提示：该推文可能需要登录，请选择 Cookies 文件；Chrome/Edge 的 `--cookies-from-browser` 报 `Could not copy Chrome cookie database` 时会提示先完全关闭浏览器，或改用 Cookies 文件
+   - 日志出现 `No video could be found`（且未设置 Cookies）时会提示：该推文可能需要登录，请「导入…」该网站的 Cookies 文件；Chrome/Edge 的 `--cookies-from-browser` 报 `Could not copy Chrome cookie database` 时会提示先完全关闭浏览器，或改用 Cookies 文件
 4. 点 **下载**：进度条与日志实时显示（解析 `yt-dlp --newline` 输出的百分比、速度、剩余时间）；**取消** 会结束 yt-dlp 及其子进程（如 ffmpeg）
 
 实际执行的命令（每个链接一条，日志里会打印）：
@@ -218,8 +220,7 @@ yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整�
   "ocr_downscale_max_long_side": 1600,
   "video_download_dir": "C:\Users\你\Downloads",
   "video_no_playlist": true,
-  "video_cookies_browser": "无",
-  "video_cookies_file": "D:\…\img-stitch-pdf\cookies\cookies.txt"
+  "video_cookies_browser": "无"
 }
 ```
 
@@ -227,7 +228,7 @@ yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整�
 `include_subfolders`（布尔，默认 `true`）控制「添加文件夹…」是否递归子目录，与界面勾选「包含子文件夹」同步。
 `ocr_downscale`（布尔，默认 `false`）与 `ocr_downscale_max_long_side`（整数，默认 `1600`）：GUI「OCR降采样」勾选写入；开启后 OCR 文本导出与本地翻译在调用 Paddle/EasyOCR 前将图片最长边缩小到该值（检测框坐标会映射回原图尺寸）。
 `video_download_dir` / `video_no_playlist` / `video_cookies_browser`：「下载视频」窗口的保存目录（默认 `%USERPROFILE%\Downloads`）、是否 `--no-playlist`（默认 `true`）、`--cookies-from-browser` 浏览器（`无` / `chrome` / `edge` / `firefox`）。
-`video_cookies_file`：「Cookies 文件」已存路径（`<程序目录>\cookies\cookies.txt`；`--cookies`，优先于 `video_cookies_browser`；点「清除」后删除该文件并从配置中移除）。
+Cookies 文件不写入配置：按网站保存在 `<程序目录>\cookies\<网站>.txt`（`video_cookies_browser` 仅在链接网站没有已存文件时使用）。
 
 首次启动若尚未配置导出目录，会自动创建 `文档/PDF导出`（或 `~/Documents/PDF导出`）并写入该文件。
 
