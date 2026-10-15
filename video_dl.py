@@ -33,6 +33,10 @@ DENO_INSTALL_HINT = "winget install DenoLand.Deno"
 # YouTube 的 n/sig JS 挑战需要 deno + 求解脚本；允许 yt-dlp 从 GitHub 拉取求解脚本
 YOUTUBE_REMOTE_COMPONENTS = "ejs:github"
 YOUTUBE_SITES = ("youtube.com", "youtu.be")
+# 年龄限制视频：默认客户端只给 360p（18），web_creator/web/mweb 的 https 格式又需要 GVS PO Token；
+# web_safari 提供 HLS（m3u8）格式，带登录 Cookies 时无需 PO Token 即可拿到 1080p。
+YOUTUBE_PLAYER_CLIENTS = "default,web_safari"
+YOUTUBE_EXTRACTOR_ARGS = f"youtube:player_client={YOUTUBE_PLAYER_CLIENTS}"
 DENO_MISSING_TIP = (
     f"提示：未找到 deno，YouTube 的 JS 挑战（n challenge）可能无法求解、格式缺失。"
     f"请在 PowerShell 运行：{DENO_INSTALL_HINT}，然后重启本工具。"
@@ -46,7 +50,8 @@ N_CHALLENGE_TIP = (
     f"（{DENO_INSTALL_HINT}）；本工具已自动加 --remote-components {YOUTUBE_REMOTE_COMPONENTS}。"
 )
 PO_TOKEN_TIP = (
-    "提示：部分 YouTube 客户端格式需要 PO Token，已被跳过（通常仍能下载其它格式）；"
+    "提示（通常可忽略）：本工具已自动加 --extractor-args "
+    f"{YOUTUBE_EXTRACTOR_ARGS}（web_safari HLS 格式无需 PO Token）。部分 YouTube 客户端格式需要 PO Token，已被跳过（通常仍能下载其它格式）；"
     "若全部失败，请更新 yt-dlp 并重新导出 YouTube Cookies。"
 )
 BOT_CHECK_TIP = (
@@ -736,6 +741,7 @@ def build_command(
         cmd += ["--ffmpeg-location", str(ffmpeg_location)]
     if is_youtube_url(url):
         cmd += ["--remote-components", YOUTUBE_REMOTE_COMPONENTS]
+        cmd += ["--extractor-args", YOUTUBE_EXTRACTOR_ARGS]
         if deno_path:
             cmd += ["--js-runtimes", f"deno:{deno_path}"]
     cmd.append(url)

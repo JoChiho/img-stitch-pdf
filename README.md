@@ -168,12 +168,13 @@ python translate_local.py path\to\image.jpg
    - **YouTube JS 挑战**：YouTube 要求用 JS 运行时求解 n/sig 挑战。YouTube 链接自动加 `--remote-components ejs:github`（常量 `YOUTUBE_REMOTE_COMPONENTS`），允许 yt-dlp 拉取求解脚本；需要安装 **deno**（`winget install DenoLand.Deno`）。启动时检测 deno（PATH 或 WinGet 安装目录），不在 PATH 时自动传 `--js-runtimes deno:<路径>`，找不到则在日志提示安装命令
    - YouTube 日志提示：`age-restricted` + `age-verification` → 账号需在 YouTube 完成年龄验证，或 Cookies 未登录/已失效，建议用无痕窗口登录后导出并关闭窗口（YouTube 会轮换打开中标签页的 Cookies）；`n challenge solving failed` → 更新 yt-dlp / 安装 deno；`PO Token` → 部分格式被跳过；`Sign in to confirm you’re not a bot` → 重新导出 YouTube Cookies
    - 年龄限制视频：账号未完成 YouTube 年龄验证时，yt-dlp 无法绕过，通常只能拿到少量格式（如 360p 的 18 号格式）或直接报 `Sorry, this content is age-restricted`
+   - **年龄限制视频只有 360p 的修复**：yt-dlp 默认客户端对年龄限制视频只返回 18 号格式（360p），web_creator/web/mweb 的 https 格式又需要 GVS PO Token。本工具对 YouTube 自动加 `--extractor-args youtube:player_client=default,web_safari`（`YOUTUBE_EXTRACTOR_ARGS`）：web_safari 的 HLS（m3u8）格式在带登录 Cookies 时无需 PO Token，实测可下 1080p。日志里仍会出现 `age-restricted` / `web_creator ... PO Token` 警告，可忽略。前提：Cookies 已登录且账号能在浏览器里直接播放该视频。
 4. 点 **下载**：进度条与日志实时显示（解析 `yt-dlp --newline` 输出的百分比、速度、剩余时间）；**取消** 会结束 yt-dlp 及其子进程（如 ffmpeg）
 
 实际执行的命令（每个链接一条，日志里会打印）：
 
 ```text
-yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整理后的临时副本> | --cookies-from-browser X] [--remote-components ejs:github [--js-runtimes deno:<路径>]（仅 YouTube）] <URL>
+yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整理后的临时副本> | --cookies-from-browser X] [--remote-components ejs:github --extractor-args youtube:player_client=default,web_safari [--js-runtimes deno:<路径>]（仅 YouTube）] <URL>
 ```
 
 - **yt-dlp 定位**：优先 PATH 上的 `yt-dlp`，否则用当前 Python 的 `python -m yt_dlp`；都没有时提示一键 `pip install yt-dlp`。窗口里的 **更新 yt-dlp** 执行 `pip install -U "yt-dlp[default]"`（含 yt-dlp-ejs 求解脚本）（网站改版导致下载失败时先更新）

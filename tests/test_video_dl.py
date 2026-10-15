@@ -793,3 +793,15 @@ def test_youtube_output_hints():
         assert h(bot, has_cookies=False) == video_dl.BOT_CHECK_TIP
     assert h("ERROR: [youtube] X: Sorry, this content is age-restricted", has_cookies=True) is None
     assert "DenoLand.Deno" in video_dl.DENO_MISSING_TIP
+
+
+def test_build_command_youtube_adds_web_safari_client(tmp_path):
+    cmd = video_dl.build_command(["yt-dlp"], "https://www.youtube.com/watch?v=dOaJ2_SJAmc", tmp_path)
+    i = cmd.index("--extractor-args")
+    assert cmd[i + 1] == "youtube:player_client=default,web_safari"
+    assert cmd[-1].startswith("https://www.youtube.com/")
+
+
+def test_build_command_non_youtube_has_no_extractor_args(tmp_path):
+    cmd = video_dl.build_command(["yt-dlp"], "https://x.com/a/status/1", tmp_path)
+    assert "--extractor-args" not in cmd
