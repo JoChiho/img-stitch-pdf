@@ -9,7 +9,7 @@
 可选：本地 EN→ZH 图片翻译（EasyOCR + Ollama / Argos），将中文绘制到
 原图目录下新建子文件夹 ``translated_zh/``（不与原图同级混放，便于清理），再走同一套多页 PDF 导出。
 
-另附「下载视频」窗口：粘贴链接 → yt-dlp 下载（逻辑见 ``video_dl.py``）。
+另附「下载视频」窗口：粘贴链接 → yt-dlp 下载（逻辑见 `video_dl.py`）；「下载图集」窗口：gallery-dl 下载 E-Hentai/ExHentai 等（逻辑见 `gallery_fetch.py`）。
 """
 
 from __future__ import annotations
@@ -1677,6 +1677,553 @@ class VideoDownloadDialog(tk.Toplevel if tk is not None else object):  # type: i
         self.destroy()
 
 
+# ---------------------------------------------------------------- gallery download (gallery-dl)
+
+
+def get_gallery_download_dir_config() -> Path:
+    """Return persisted ``gallery_download_dir`` (default %USERPROFILE%\\Downloads)."""
+    import video_dl
+
+    raw = load_config().get("gallery_download_dir")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return Path(raw).expanduser()
+        except Exception:
+            pass
+    return video_dl.default_download_dir()
+
+
+def set_gallery_download_dir_config(path: Union[str, Path]) -> Path:
+    """Persist ``gallery_download_dir`` in config.json."""
+    out = Path(path).expanduser()
+    data = load_config()
+    data["gallery_download_dir"] = str(out)
+    save_config(data)
+    return out
+
+
+def get_gallery_convert_webp_config() -> bool:
+    """Return persisted ``gallery_convert_webp`` (default True)."""
+    raw = load_config().get("gallery_convert_webp")
+    if raw is None:
+        return True
+    return bool(raw)
+
+
+def set_gallery_convert_webp_config(value: bool) -> bool:
+    flag = bool(value)
+    data = load_config()
+    data["gallery_convert_webp"] = flag
+    save_config(data)
+    return flag
+
+
+def get_gallery_cookies_browser_config() -> str:
+    """Reuse video cookies-browser preference (无/chrome/edge/firefox)."""
+    return get_video_cookies_browser_config()
+
+
+class GalleryDownloadDialog(tk.Toplevel if tk is not None else object):  # type: ignore[misc]
+    """「下载图集」窗口：粘贴 E-Hentai/ExHentai 等链接 → gallery-dl 顺序下载。
+
+    后台线程只往 ``self._events`` 放元组；Tk 只在主线程经 ``after()`` 轮询处理。
+    """
+
+    POLL_MS = 100
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app)
+        import gallery_fetch
+        import video_dl
+
+        self._gf = gallery_fetch
+        self._vd = video_dl
+        self.app = app
+        self.title("下载图集（gallery-dl）")
+        self.geometry("820x560")
+        self.minsize(640, 420)
+        self.transient(app)
+        try:
+            self.configure(background=app.UI_BG)
+        except tk.TclError:
+            pass
+
+        self._events: "queue.Queue[tuple]" = queue.Queue()
+        self._runner = None
+        self._busy = False
+        self._pip_cancel = threading.Event()
+        self._gdl_base: Optional[List[str]] = None
+        self._asked_install = False
+        self._poll_job: Optional[str] = None
+        self._last_file: Optional[str] = None
+        self._converted_n = 0
+
+        self.out_dir_var = tk.StringVar(value=str(get_gallery_download_dir_config()))
+        self.convert_webp_var = tk.BooleanVar(value=get_gallery_convert_webp_config())
+        self.cookies_var = tk.StringVar(value=get_gallery_cookies_browser_config())
+        self.cookies_hint_var = tk.StringVar(value="")
+        self._cookies_tree = None
+        self.tool_var = tk.StringVar(value="正在检测 gallery-dl…")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="")
+
+        self._build()
+        self._refresh_cookies_list()
+        self._prefill_from_clipboard()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._poll_job = self.after(self.POLL_MS, self._poll_events)
+        self._probe_tools_async()
+
+    def _build(self) -> None:
+        app = self.app
+        pad = {"padx": 8, "pady": 4}
+        root = ttk.Frame(self)
+        root.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        url_outer, url_fr = app._make_section(root, "图集链接（每行一个，按顺序下载）")
+        url_outer.pack(fill=tk.X, **pad)
+        txt_fr = ttk.Frame(url_fr, style="Card.TFrame")
+        txt_fr.pack(fill=tk.X)
+        self.url_text = tk.Text(txt_fr, height=5, wrap=tk.NONE, undo=True)
+        self.url_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        url_btns = ttk.Frame(txt_fr, style="Card.TFrame")
+        url_btns.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0))
+        ttk.Button(url_btns, text="粘贴", command=self._paste).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(url_btns, text="清空", command=self._clear_urls).pack(fill=tk.X)
+
+        opt_outer, opt_fr = app._make_section(root, "选项")
+        opt_outer.pack(fill=tk.X, **pad)
+        row1 = ttk.Frame(opt_fr, style="Card.TFrame")
+        row1.pack(fill=tk.X)
+        ttk.Label(row1, text="保存到：", style="Card.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(row1, textvariable=self.out_dir_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        )
+        ttk.Button(row1, text="选择文件夹…", command=self._choose_dir).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="打开文件夹", command=self._open_dir).pack(side=tk.LEFT, padx=2)
+        row2 = ttk.Frame(opt_fr, style="Card.TFrame")
+        row2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Checkbutton(
+            row2,
+            text="边下边把 webp 转成 jpg（并删除 webp）",
+            variable=self.convert_webp_var,
+            command=lambda: set_gallery_convert_webp_config(bool(self.convert_webp_var.get())),
+        ).pack(side=tk.LEFT)
+        ttk.Label(row2, text="浏览器 Cookies：", style="Card.TLabel").pack(
+            side=tk.LEFT, padx=(16, 0)
+        )
+        combo = ttk.Combobox(
+            row2,
+            textvariable=self.cookies_var,
+            values=list(self._vd.COOKIE_BROWSERS),
+            width=10,
+            state="readonly",
+        )
+        combo.pack(side=tk.LEFT)
+        combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: set_video_cookies_browser_config(self.cookies_var.get()),
+        )
+        rowc = ttk.Frame(opt_fr, style="Card.TFrame")
+        rowc.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(rowc, text="Cookies 文件：", style="Card.TLabel").pack(side=tk.LEFT, anchor=tk.N)
+        tree = ttk.Treeview(
+            rowc, columns=("site", "mtime", "count"), show="headings", height=3, selectmode="browse"
+        )
+        tree.heading("site", text="网站")
+        tree.heading("mtime", text="更新时间")
+        tree.heading("count", text="Cookie 条数")
+        tree.column("site", width=180, anchor=tk.W)
+        tree.column("mtime", width=150, anchor=tk.W)
+        tree.column("count", width=90, anchor=tk.E)
+        tree.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self._cookies_tree = tree
+        cbtns = ttk.Frame(rowc, style="Card.TFrame")
+        cbtns.pack(side=tk.LEFT, anchor=tk.N)
+        ttk.Button(cbtns, text="导入…", command=self._choose_cookies_file).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(cbtns, text="删除所选", command=self._delete_selected_cookies).pack(fill=tk.X)
+        rowh = ttk.Frame(opt_fr, style="Card.TFrame")
+        rowh.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(
+            rowh, textvariable=self.cookies_hint_var, style="Muted.TLabel", wraplength=760, justify=tk.LEFT
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        row3 = ttk.Frame(opt_fr, style="Card.TFrame")
+        row3.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(row3, textvariable=self.tool_var, style="Muted.TLabel").pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        self._install_btn = ttk.Button(
+            row3, text="安装 gallery-dl", command=lambda: self._pip_gdl(upgrade=False)
+        )
+        self._update_btn = ttk.Button(
+            row3, text="更新 gallery-dl", command=lambda: self._pip_gdl(upgrade=True)
+        )
+        self._update_btn.pack(side=tk.RIGHT, padx=2)
+
+        run_outer, run_fr = app._make_section(root, "下载", export=True)
+        run_outer.pack(fill=tk.BOTH, expand=True, **pad)
+        prow = ttk.Frame(run_fr, style="Card.TFrame")
+        prow.pack(fill=tk.X)
+        ttk.Progressbar(
+            prow, variable=self.progress_var, maximum=100.0, mode="determinate"
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(prow, textvariable=self.progress_text_var, style="Card.TLabel", width=46).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        log_fr = ttk.Frame(run_fr, style="Card.TFrame")
+        log_fr.pack(fill=tk.BOTH, expand=True, pady=(6, 4))
+        self.log_text = tk.Text(log_fr, height=10, wrap=tk.WORD, state=tk.DISABLED)
+        log_scroll = ttk.Scrollbar(log_fr, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        brow = ttk.Frame(run_fr, style="Card.TFrame")
+        brow.pack(fill=tk.X)
+        self._download_btn = ttk.Button(brow, text="下载", command=self._start_download)
+        self._download_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._cancel_btn = ttk.Button(
+            brow, text="取消", command=self._cancel, state=tk.DISABLED
+        )
+        self._cancel_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Button(brow, text="关闭", command=self._on_close).pack(side=tk.RIGHT)
+
+    def _log(self, msg: str) -> None:
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, msg + "\n")
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > 2000:
+            self.log_text.delete("1.0", f"{lines - 2000}.0")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _emit(self, event: tuple) -> None:
+        self._events.put(event)
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._download_btn.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self._cancel_btn.configure(state=tk.NORMAL if busy else tk.DISABLED)
+        st = tk.DISABLED if busy else tk.NORMAL
+        self._update_btn.configure(state=st)
+        self._install_btn.configure(state=st)
+
+    def _read_clipboard(self) -> str:
+        try:
+            return self.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    def _prefill_from_clipboard(self) -> None:
+        clip = self._read_clipboard()
+        urls = self._gf.split_urls(clip)
+        if urls:
+            self.url_text.insert("1.0", "\n".join(urls) + "\n")
+
+    def _paste(self) -> None:
+        clip = self._read_clipboard()
+        urls = self._gf.split_urls(clip)
+        if not urls:
+            messagebox.showinfo("提示", "剪贴板里没有 http(s) 链接。", parent=self)
+            return
+        existing = self._gf.split_urls(self.url_text.get("1.0", tk.END))
+        new = [u for u in urls if u not in existing]
+        cur = self.url_text.get("1.0", "end-1c")
+        prefix = "\n" if cur.strip() and not cur.endswith("\n") else ""
+        if new:
+            self.url_text.insert(tk.END, prefix + "\n".join(new) + "\n")
+        self.url_text.see(tk.END)
+
+    def _clear_urls(self) -> None:
+        self.url_text.delete("1.0", tk.END)
+
+    def _current_out_dir(self) -> Path:
+        raw = (self.out_dir_var.get() or "").strip()
+        return Path(raw).expanduser() if raw else self._gf.default_download_dir()
+
+    def _choose_dir(self) -> None:
+        cur = self._current_out_dir()
+        chosen = filedialog.askdirectory(
+            title="选择图集保存文件夹",
+            initialdir=str(cur) if cur.is_dir() else str(Path.home()),
+            parent=self,
+        )
+        if not chosen:
+            return
+        out = set_gallery_download_dir_config(chosen)
+        self.out_dir_var.set(str(out))
+
+    def _refresh_cookies_list(self) -> None:
+        vd = self._vd
+        items = vd.list_stored_cookies()
+        tree = self._cookies_tree
+        if tree is not None:
+            tree.delete(*tree.get_children())
+            for it in items:
+                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(it.mtime))
+                tree.insert("", tk.END, iid=it.site, values=(it.site, ts, it.count))
+        sites = "、".join(it.site for it in items) if items else "（暂无）"
+        self.cookies_hint_var.set(
+            f"原图需要登录：导入 e-hentai.org / exhentai.org 的 Cookies（与「下载视频」共用 "
+            f"{vd.tool_cookies_dir()}）。未登录时多为预览 webp，可勾选上方自动转 jpg。"
+            f"已存：{sites}。"
+        )
+
+    def _choose_cookies_file(self) -> None:
+        init = self._vd.default_download_dir()
+        chosen = filedialog.askopenfilename(
+            title="导入 Cookies 文件（Netscape 格式 cookies.txt）",
+            initialdir=str(init) if init.is_dir() else str(Path.home()),
+            filetypes=[("Cookies 文件", "*.txt"), ("所有文件", "*.*")],
+            parent=self,
+        )
+        if not chosen:
+            return
+        try:
+            res = import_video_cookies_file(chosen)
+        except self._vd.CookiesFileError as e:
+            messagebox.showerror("Cookies 文件无效", str(e), parent=self)
+            self._log(str(e))
+            return
+        self._refresh_cookies_list()
+        if res.moved:
+            verb = "已更新" if res.replaced else "已导入"
+            self._log(f"{verb} {res.site} 的 Cookies 文件：{res.stored.name}（{res.kept} 条）")
+        else:
+            self._log(f"{res.site} 的 Cookies 文件已在工具文件夹中，未改动。")
+        if res.warning:
+            self._log(res.warning)
+
+    def _delete_selected_cookies(self) -> None:
+        tree = self._cookies_tree
+        sel = tree.selection() if tree is not None else ()
+        if not sel:
+            messagebox.showinfo("删除 Cookies", "请先在列表里选择一个网站。", parent=self)
+            return
+        site = sel[0]
+        if not messagebox.askyesno("删除 Cookies", f"删除 {site} 的 Cookies 文件？", parent=self):
+            return
+        if delete_video_cookies(site):
+            self._log(f"已删除 {site} 的 Cookies 文件。")
+        else:
+            self._log(f"删除 {site} 的 Cookies 文件失败（可能已不存在或被占用）。")
+        self._refresh_cookies_list()
+
+    def _open_dir(self) -> None:
+        d = self._current_out_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            open_folder_in_explorer(d)
+        except Exception as e:
+            messagebox.showerror("打开失败", str(e), parent=self)
+
+    def _probe_tools_async(self) -> None:
+        gf = self._gf
+
+        def worker() -> None:
+            try:
+                info = gf.probe_tools()
+            except Exception as e:  # pragma: no cover
+                info = {"gallery_dl": None, "gallery_dl_version": None, "error": str(e)}
+            self._emit(("tools", info))
+
+        threading.Thread(target=worker, daemon=True, name="gdl-probe").start()
+
+    def _apply_tools(self, info: dict) -> None:
+        self._gdl_base = info.get("gallery_dl")  # type: ignore[assignment]
+        if self._gdl_base:
+            how = "PATH" if len(self._gdl_base) == 1 else "python -m gallery_dl"
+            ver = info.get("gallery_dl_version") or "版本未知"
+            self.tool_var.set(f"gallery-dl {ver}（{how}）")
+            self._install_btn.pack_forget()
+        else:
+            self.tool_var.set("未找到 gallery-dl")
+            if not self._install_btn.winfo_manager():
+                self._install_btn.pack(side=tk.RIGHT, padx=2)
+            self._log("未找到 gallery-dl。点「安装 gallery-dl」可一键 pip install gallery-dl。")
+            if not self._busy and not self._asked_install:
+                self._asked_install = True
+                if messagebox.askyesno(
+                    "未找到 gallery-dl",
+                    "没有找到 gallery-dl。\n现在用 pip 安装吗？（pip install gallery-dl）",
+                    parent=self,
+                ):
+                    self._pip_gdl(upgrade=False)
+
+    def _pip_gdl(self, upgrade: bool) -> None:
+        if self._busy:
+            return
+        gf = self._gf
+        cmd = gf.pip_install_command(upgrade=upgrade)
+        self._set_busy(True)
+        self._pip_cancel.clear()
+        self.progress_text_var.set("正在更新 gallery-dl…" if upgrade else "正在安装 gallery-dl…")
+        self._log("> " + subprocess.list2cmdline(cmd))
+
+        def worker() -> None:
+            try:
+                rc = gf.stream_command(
+                    cmd, lambda line: self._emit(("log", line)), self._pip_cancel
+                )
+            except Exception as e:
+                self._emit(("log", f"pip 失败：{e}"))
+                rc = -1
+            self._emit(("pip_done", rc, upgrade))
+
+        threading.Thread(target=worker, daemon=True, name="gdl-pip").start()
+
+    def _start_download(self) -> None:
+        if self._busy:
+            return
+        gf = self._gf
+        urls = gf.split_urls(self.url_text.get("1.0", tk.END))
+        if not urls:
+            messagebox.showwarning("提示", "请先粘贴图集链接（http/https，每行一个）。", parent=self)
+            return
+        if not self._gdl_base:
+            if messagebox.askyesno(
+                "未找到 gallery-dl", "没有找到 gallery-dl，现在用 pip 安装吗？", parent=self
+            ):
+                self._pip_gdl(upgrade=False)
+            return
+        out_dir = self._current_out_dir()
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("目录错误", f"无法创建保存目录：{e}", parent=self)
+            return
+        set_gallery_download_dir_config(out_dir)
+        set_gallery_convert_webp_config(bool(self.convert_webp_var.get()))
+        cookies = set_video_cookies_browser_config(self.cookies_var.get())
+
+        self._runner = gf.DownloadRunner(
+            self._gdl_base,
+            urls,
+            out_dir,
+            cookies_browser=cookies,
+            cookies_dir=self._vd.tool_cookies_dir(),
+            convert_webp=bool(self.convert_webp_var.get()),
+            on_event=self._emit,
+        )
+        self._last_file = None
+        self._converted_n = 0
+        self.progress_var.set(0.0)
+        self.progress_text_var.set(f"准备下载 {len(urls)} 个图集…")
+        self._set_busy(True)
+        self._log(f"开始下载 {len(urls)} 个图集 → {out_dir}")
+        runner = self._runner
+
+        def worker() -> None:
+            try:
+                runner.run()
+            except Exception as e:
+                self._emit(("log", f"下载出错：{e}"))
+                self._emit(("finished", 0, len(urls), runner.cancelled))
+
+        threading.Thread(target=worker, daemon=True, name="gdl-download").start()
+        self.app._set_status(f"图集下载中（{len(urls)} 个链接）…")
+
+    def _cancel(self) -> None:
+        if not self._busy:
+            return
+        self.progress_text_var.set("正在取消…")
+        self._pip_cancel.set()
+        runner = self._runner
+        if runner is not None:
+            threading.Thread(target=runner.cancel, daemon=True, name="gdl-cancel").start()
+
+    def _poll_events(self) -> None:
+        try:
+            for _ in range(500):
+                ev = self._events.get_nowait()
+                try:
+                    self._handle_event(ev)
+                except Exception:
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        try:
+            self._poll_job = self.after(self.POLL_MS, self._poll_events)
+        except tk.TclError:
+            self._poll_job = None
+
+    def _handle_event(self, ev: tuple) -> None:
+        kind = ev[0]
+        if kind == "log":
+            self._log(str(ev[1]))
+        elif kind == "tools":
+            self._apply_tools(ev[1])
+        elif kind == "start":
+            _, idx, n, url = ev
+            self.progress_var.set(0.0)
+            self.progress_text_var.set(f"[{idx}/{n}] 正在解析…")
+            self._log(f"—— [{idx}/{n}] {url}")
+        elif kind == "progress":
+            _, idx, n, info = ev
+            self.progress_var.set(float(info.get("percent") or 0.0))
+            self.progress_text_var.set(f"[{idx}/{n}] {self._gf.format_progress(info)}")
+        elif kind == "file":
+            self._last_file = str(ev[3])
+            name = Path(str(ev[3])).name
+            self.progress_text_var.set(f"[{ev[1]}/{ev[2]}] {name}")
+        elif kind == "converted":
+            self._converted_n += 1
+            if self._converted_n == 1 or self._converted_n % 20 == 0:
+                self._log(f"已转换 {self._converted_n} 张 webp→jpg（最新：{Path(str(ev[3])).name}）")
+        elif kind == "item_done":
+            _, idx, n, url, rc = ev
+            if rc == 0:
+                self.progress_var.set(100.0)
+                self._log(f"✓ [{idx}/{n}] 完成")
+            elif self._runner is not None and self._runner.cancelled:
+                self._log(f"✗ [{idx}/{n}] 已取消")
+            else:
+                self._log(f"✗ [{idx}/{n}] 失败（退出码 {rc}）")
+        elif kind == "finished":
+            _, ok, failed, cancelled = ev
+            self._runner = None
+            self._set_busy(False)
+            extra = f"；已转 jpg {self._converted_n} 张" if self._converted_n else ""
+            if cancelled:
+                msg = f"已取消。成功 {ok} 个，未完成 {failed} 个{extra}。"
+            else:
+                msg = f"下载结束：成功 {ok} 个，失败 {failed} 个{extra}。"
+            self.progress_text_var.set(msg)
+            self._log(msg)
+            self.app._set_status(f"图集{msg}")
+            self._refresh_cookies_list()
+        elif kind == "pip_done":
+            _, rc, upgrade = ev
+            self._set_busy(False)
+            what = "更新" if upgrade else "安装"
+            if rc == 0:
+                self.progress_text_var.set(f"gallery-dl {what}完成")
+                self._log(f"gallery-dl {what}完成，重新检测…")
+            else:
+                self.progress_text_var.set(f"gallery-dl {what}失败（{rc}）")
+                self._log(f"gallery-dl {what}失败（退出码 {rc}）")
+            self.tool_var.set("正在检测 gallery-dl…")
+            self._probe_tools_async()
+
+    def _on_close(self) -> None:
+        if self._busy:
+            if not messagebox.askyesno(
+                "正在下载", "仍有任务在运行，取消并关闭窗口吗？", parent=self
+            ):
+                return
+            self._pip_cancel.set()
+            runner = self._runner
+            if runner is not None:
+                threading.Thread(target=runner.cancel, daemon=True, name="gdl-cancel").start()
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except tk.TclError:
+                pass
+            self._poll_job = None
+        self.app._gallery_dialog = None
+        self.destroy()
+
+
 class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
     """桌面 GUI：分区操作、列表/缩略图视图、多页 PDF 导出与本地翻译。"""
 
@@ -1702,6 +2249,7 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         self._ocr_translate_btn: Optional[ttk.Button] = None
         self._last_ocr_en_txt: Optional[Path] = None
         self._video_dialog: Optional["VideoDownloadDialog"] = None
+        self._gallery_dialog: Optional["GalleryDownloadDialog"] = None
         self.output_dir: Path = ensure_default_output_dir()
         self.direct_export_var: Optional[tk.BooleanVar] = None
         self.translate_then_export_var: Optional[tk.BooleanVar] = None
@@ -2057,6 +2605,9 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
         ).pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Button(
             settings_fr, text="下载视频…", command=self.open_video_download
+        ).pack(side=tk.LEFT, padx=4, pady=2)
+        ttk.Button(
+            settings_fr, text="下载图集…", command=self.open_gallery_download
         ).pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Button(
             settings_fr, text="创建桌面快捷方式", command=self.create_shortcut
@@ -3649,6 +4200,24 @@ class App(tk.Tk if tk is not None else object):  # type: ignore[misc]
             traceback.print_exc()
             self._video_dialog = None
             messagebox.showerror("打开失败", f"无法打开下载视频窗口：{e}")
+
+    def open_gallery_download(self) -> None:
+        """打开「下载图集」窗口（gallery-dl：粘贴链接 → 下载）；已打开则置前。"""
+        dlg = self._gallery_dialog
+        if dlg is not None:
+            try:
+                if dlg.winfo_exists():
+                    dlg.lift()
+                    dlg.focus_force()
+                    return
+            except tk.TclError:
+                self._gallery_dialog = None
+        try:
+            self._gallery_dialog = GalleryDownloadDialog(self)
+        except Exception as e:
+            self._gallery_dialog = None
+            messagebox.showerror("打开失败", f"无法打开下载图集窗口：{e}")
+
 
     def create_shortcut(self) -> None:
         try:

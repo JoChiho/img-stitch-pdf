@@ -20,7 +20,8 @@
 - 导出在**后台线程**进行，界面可继续操作；状态栏显示进度（如 `3/98`）；导出中禁用「生成 PDF」按钮
 - **本地翻译后导出**：勾选或点「本地翻译后导出」→ 对列表中的图片做 **EN→ZH**（PaddleOCR（默认）/ EasyOCR 回退 + Ollama / Argos）。每张图：OCR 阅读顺序后把**全部英文拼成一段**，**只翻译一次**，在原图**下方追加**那一条中文译文条带（自动换行、CJK 字体）；写入 `translated_zh/*_zh`（**不覆盖原图**），再导出多页 PDF（跳过 PDF / GIF）。界面提供 **Ollama 模型下拉框**（`ollama list`），选择写入 `config.json` 的 `ollama_model`。
 - **OCR 文本导出 / 本地翻译 / 译文导入**：点「导出英文OCR文本」对列表图片做 OCR，生成带机器稳定键 `===PAGE NNN===` 的 UTF-8 `.txt`（含 `path:` 行）；可点「本地翻译OCR文本」（Ollama 按页）或外部译成中文后点「导入译文并生成图/PDF」，按页序号映射回列表，在原图下方追加中文译文条写入 `translated_zh/`，可选再导出 PDF。Ollama 本地翻译路径保持不变。
-- **下载视频（yt-dlp）**：「设定」区点「下载视频…」，粘贴链接（可多行，按顺序排队）→ 下载；等价于 `yt-dlp -f "bv*+ba/b" -P "%USERPROFILE%\Downloads" "<URL>"`，带进度条、实时日志与取消
+- **下载视频（yt-dlp）**：「设定」区点「下载视频…」
+- **下载图集（gallery-dl）**：「设定」区点「下载图集…」，粘贴 E-Hentai / ExHentai 等图集链接；未登录多为预览 webp，可勾选边下边转 jpg；原图需导入对应网站 Cookies（与视频下载共用 `cookies/`）
 - 底部状态栏提示进度与结果
 
 ## 环境要求
@@ -181,6 +182,24 @@ yt-dlp -f bv*+ba/b -P <保存目录> --newline [--no-playlist] [--cookies <整�
 - **ffmpeg**：`bv*+ba` 需要 ffmpeg 合并音视频。未找到时窗口会中文提示，安装：`winget install Gyan.FFmpeg`（装好后重开程序；刚装完 PATH 未刷新时也会自动在 WinGet 目录里找到并传 `--ffmpeg-location`）
 - 下载在后台线程 + 子进程（Windows 无黑框）运行，界面不卡；后台线程只通过队列把进度交给 Tk 主线程（`after()` 轮询），不直接操作界面
 - 逻辑在 `video_dl.py`（无 Tk 依赖，有单元测试）；请只下载你有权保存的内容
+
+
+## 下载图集（gallery-dl）
+
+主窗口「设定」区点 **下载图集…** 打开窗口（与 PDF / 视频下载互不影响）：
+
+1. 粘贴 E-Hentai / ExHentai 图集链接（可多行，按顺序排队）；打开时若剪贴板有链接会自动填入
+2. **保存到**：默认 %USERPROFILE%\Downloads（gallery-dl 会在其下建 exhentai/<GID 标题>/ 等子目录），写入 config.json 的 gallery_download_dir
+3. **边下边把 webp 转成 jpg**：默认勾选。未登录时多为网页预览 .webp，工具会转成同名 .jpg（Pillow，质量 95，透明底铺白）并删除原 webp；登录后原图一般已是 jpg/png，此选项无害
+4. **Cookies**：与「下载视频」共用 <程序目录>\cookies\。导入 e-hentai.org / exhentai.org 的 Netscape cookies.txt 后，下载该站链接会自动使用。未登录时日志会提示只能下到预览图
+5. 未找到 gallery-dl 时可点「安装 gallery-dl」（pip install gallery-dl）
+
+命令行等价：
+
+`ash
+gallery-dl -d "%USERPROFILE%\Downloads" [--cookies cookies\e-hentai.org.txt] "https://e-hentai.org/g/..."
+`
+
 
 ## 本地 MT（Ollama）
 

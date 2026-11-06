@@ -328,6 +328,7 @@ KNOWN_VIDEO_SITES = (
     "youtube.com", "x.com", "bilibili.com", "tiktok.com", "douyin.com", "instagram.com",
     "facebook.com", "vimeo.com", "twitch.tv", "nicovideo.jp", "reddit.com", "weibo.com",
     "pixiv.net", "dailymotion.com", "threads.net", "niconico.jp", "iqiyi.com", "youku.com",
+    "e-hentai.org", "exhentai.org",
 )
 SITE_ALIASES = {
     "twitter.com": "x.com",
