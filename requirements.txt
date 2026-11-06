@@ -14,3 +14,5 @@ argostranslate>=1.9.0
 # deep-translator>=1.11.0
 # Optional: more reliable Windows OLE drag-drop (falls back to built-in hook)
 # tkinterdnd2>=0.3.0
+# Optional: E-Hentai/ExHentai gallery download (GUI「下载图集」)
+# gallery-dl>=1.27.0
